@@ -24,6 +24,7 @@ from typing import AsyncIterator, Optional
 import structlog
 
 from companybrain.store.base import BrainStore, BrainEntity
+from companybrain.store.identity import parse_urn
 
 log = structlog.get_logger(__name__)
 
@@ -50,7 +51,10 @@ class JsonFileBrainStore(BrainStore):
 
     async def write(self, entity: BrainEntity, *, run_id: str, workspace_id: str) -> None:
         async with self._lock:
-            entity_file = self._entity_path(entity.entity_type, entity.qualified_name)
+            if entity.id.startswith("urn:cb:"):
+                entity_file = self._entity_path_from_id(entity.id)
+            else:
+                entity_file = self._entity_path(entity.entity_type, entity.qualified_name)
             entity_file.parent.mkdir(parents=True, exist_ok=True)
             entity_file.write_text(json.dumps(entity.to_dict(), indent=2, sort_keys=True))
             self._update_index(entity.id, entity_file.relative_to(self.root))
@@ -88,6 +92,27 @@ class JsonFileBrainStore(BrainStore):
 
     def _entity_path(self, entity_type: str, qname: str) -> Path:
         return self.root / entity_type / f"{_qname_to_filename(qname)}.json"
+
+    def _entity_path_from_id(self, entity_id: str) -> Path:
+        """
+        Derive the filesystem path from an entity id.
+
+        If the id is a canonical URN (urn:cb:...), parse it to extract
+        entity_type and qualified_name so the file lands under the correct
+        type subdirectory.  Falls back to the legacy entity_type / qname
+        convention from BrainEntity fields.
+        """
+        if entity_id.startswith("urn:cb:"):
+            try:
+                parts = parse_urn(entity_id)
+                return self._entity_path(parts.entity_type, parts.qualified_name)
+            except ValueError:
+                pass
+        # Legacy fallback: id is repo::type::qname
+        segments = entity_id.split("::", 2)
+        if len(segments) == 3:
+            return self._entity_path(segments[1], segments[2])
+        return self._entity_path("component", entity_id)
 
     def _load_index(self) -> dict:
         if not self._index_path.exists():

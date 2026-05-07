@@ -201,19 +201,22 @@ public class PipelineService {
                         dto.getEntityType(),
                         extId,
                         dto.getName(),
-                        toJson(meta)
+                        toJson(meta),
+                        dto.getUrn()    // canonical URN per ADR-0013; may be null during transition
                 });
             }
 
             // 1 batch INSERT … ON CONFLICT DO UPDATE
             // The ON CONFLICT guard covers re-runs: same (workspace, type, extId) → upsert.
+            // nodes.urn is written when the AI service supplies it (ADR-0013 transition).
             jdbc.batchUpdate("""
-                    INSERT INTO nodes (id, workspace_id, node_type, external_id, name, metadata)
-                    VALUES (?::uuid, ?::uuid, ?, ?, ?, ?::jsonb)
+                    INSERT INTO nodes (id, workspace_id, node_type, external_id, name, metadata, urn)
+                    VALUES (?::uuid, ?::uuid, ?, ?, ?, ?::jsonb, ?)
                     ON CONFLICT (workspace_id, node_type, external_id)
                     DO UPDATE SET
                         name     = EXCLUDED.name,
-                        metadata = EXCLUDED.metadata
+                        metadata = EXCLUDED.metadata,
+                        urn      = COALESCE(EXCLUDED.urn, nodes.urn)
                     """, rows);
 
             entityCount = rows.size();

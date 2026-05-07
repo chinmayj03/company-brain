@@ -1,0 +1,266 @@
+version: "3.9"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Company Brain — Infrastructure Stack
+#
+# Run this NOW to get all databases and the local LLM server up:
+#   docker compose -f docker-compose.infra.yml up -d
+#
+# Then pull the models (one-time, takes a few minutes):
+#   docker compose -f docker-compose.infra.yml --profile pull-models up model-puller
+#
+# What's in here:
+#   postgres     → PostgreSQL 16      (port 5432)
+#   redis        → Redis 7            (port 6379)
+#   localstack   → SQS emulation      (port 4566)
+#   ollama       → Local LLM server   (port 11434)  — OpenAI-compatible API
+#   model-puller → Downloads models into Ollama on first run (profile: pull-models)
+# ══════════════════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── PostgreSQL 16 ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: cb-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: companybrain
+      POSTGRES_USER: companybrain
+      POSTGRES_PASSWORD: companybrain
+      # Enable pg_trgm (fuzzy search) and pgcrypto (encryption) extensions on init
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres-init.sql:/docker-entrypoint-initdb.d/01-extensions.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U companybrain -d companybrain"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cb-network
+
+  # ── Redis 7 ────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: cb-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --save 60 1
+      --loglevel warning
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - cb-network
+
+  # ── LocalStack (SQS) ───────────────────────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3
+    container_name: cb-localstack
+    restart: unless-stopped
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs,kms
+      DEFAULT_REGION: us-east-1
+      PERSISTENCE: 1
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/localstack-init.sh:/etc/localstack/init/ready.d/01-init.sh:ro
+    networks:
+      - cb-network
+
+  # ── Ollama — Local LLM Server ──────────────────────────────────────────────
+  #
+  # Exposes an OpenAI-compatible API at http://localhost:11434/v1
+  # Models are stored in a named volume so they survive container restarts.
+  #
+  # GPU support:
+  #   NVIDIA: uncomment the `deploy` block below
+  #   Apple Silicon: run Ollama natively instead (see Makefile → make ollama-native)
+  #                  and comment out this service — the AI service will connect to
+  #                  host.docker.internal:11434 instead.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cb-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama   # Models persist across restarts
+    environment:
+      OLLAMA_HOST: 0.0.0.0
+      OLLAMA_KEEP_ALIVE: 24h          # Keep models loaded in memory
+      OLLAMA_NUM_PARALLEL: 2          # Concurrent inference requests
+
+    # ── Uncomment for NVIDIA GPU ──────────────────────────────────
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - cb-network
+
+  # ── Qdrant — vector store for code embeddings ─────────────────────────────
+  # Used for voyage-code-3 code embeddings with scalar quantization.
+  # REST API at http://localhost:6333, gRPC at localhost:6334.
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    container_name: cb-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: 6333
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cb-network
+
+  # ── Neo4j — graph database for code knowledge graph ───────────────────────
+  # Used by the TypeScript tRPC API (port 8090) and Python neo4j_writer.
+  # Browser UI at http://localhost:7474 (user: neo4j / pass: password)
+  neo4j:
+    image: neo4j:5.18-community
+    container_name: cb-neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # HTTP browser
+      - "7687:7687"   # Bolt protocol
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    environment:
+      NEO4J_AUTH: neo4j/password
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_memory_pagecache_size: 512M
+      NEO4J_dbms_memory_heap_initial__size: 512M
+      NEO4J_dbms_memory_heap_max__size: 1G
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7474"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - cb-network
+
+  # ── Langfuse — LLM observability (self-hosted) ────────────────────────────
+  # Tracks every LLM call: tokens, cost, latency, prompt versions.
+  # Dashboard at http://localhost:3001
+  # Default credentials: admin@company-brain.local / changeme
+  langfuse-db:
+    image: postgres:16-alpine
+    container_name: cb-langfuse-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: langfuse
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+    volumes:
+      - langfuse_db_data:/var/lib/postgresql/data
+    networks:
+      - cb-network
+
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: cb-langfuse
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_started
+    ports:
+      - "3001:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_SECRET: "company-brain-secret-change-in-prod"
+      NEXTAUTH_URL: "http://localhost:3001"
+      SALT: "company-brain-salt-change-in-prod"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+      TELEMETRY_ENABLED: "false"
+    networks:
+      - cb-network
+
+  # ── Model Puller — downloads models into Ollama ────────────────────────────
+  #
+  # Only runs when you explicitly ask for it:
+  #   docker compose -f docker-compose.infra.yml --profile pull-models up model-puller
+  #
+  # Models pulled (configurable in ollama/models.yaml):
+  #   deepseek-r1:14b       — reasoning, context synthesis  (~8 GB)
+  #   deepseek-coder-v2:16b — code understanding            (~9 GB)
+  #   llama3.1:8b           — fast structured extraction    (~4.7 GB)
+  #
+  # Pull only what fits your hardware. Minimum: llama3.1:8b (runs on 8 GB RAM).
+  model-puller:
+    image: curlimages/curl:latest
+    container_name: cb-model-puller
+    profiles: [pull-models]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./ollama/pull-models.sh:/pull-models.sh:ro
+    entrypoint: ["/bin/sh", "/pull-models.sh"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    networks:
+      - cb-network
+
+# ── Volumes ────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    name: cb-postgres-data
+  redis_data:
+    name: cb-redis-data
+  localstack_data:
+    name: cb-localstack-data
+  ollama_models:
+    name: cb-ollama-models   # Persist downloaded models — don't delete this!
+  qdrant_data:
+    name: cb-qdrant-data
+  neo4j_data:
+    name: cb-neo4j-data
+  neo4j_logs:
+    name: cb-neo4j-logs
+  langfuse_db_data:
+    name: cb-langfuse-db-data
+
+# ── Network ────────────────────────────────────────────────────────────────
+networks:
+  cb-network:
+    name: cb-network
+    driver: bridge

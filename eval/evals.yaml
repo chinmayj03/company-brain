@@ -1,0 +1,366 @@
+# Company Brain — Eval Harness
+# Format: each eval has:
+#   id:       unique identifier
+#   question: natural-language query (for documentation)
+#   tool:     the tool procedure name to call
+#   input:    the typed tool input
+#   expect:   assertions about the output
+#     result_not_null: true  → result must not be null
+#     result_null: true      → result must be null (absence test)
+#     reason: "..."          → absence reason must match
+#     min_confidence: 0.8    → confidence must be >= value
+#     result_contains_key: "fieldName"  → result object has this key
+#     result_array_min_length: N        → result array has >= N items
+#     result_item_field: { field: "xxx", value: "yyy" }  → at least one item has field=value
+
+version: "0.1"
+scope: "{{CB_SCOPE}}"  # replaced at runtime from CB_SCOPE env var
+
+evals:
+
+  # ── Structural: find by name ─────────────────────────────────────────────
+
+  - id: find-billing-class
+    question: "Is there a class called BillingService in the codebase?"
+    tool: findSymbol
+    input:
+      scope: "{{scope}}"
+      pattern: "BillingService"
+      kind: "Class"
+    expect:
+      result_not_null: true
+      result_array_min_length: 1
+      min_confidence: 0.85
+
+  - id: find-nonexistent-symbol
+    question: "Is there a class called XYZWidget123 in the codebase?"
+    tool: findSymbol
+    input:
+      scope: "{{scope}}"
+      pattern: "XYZWidget123"
+    expect:
+      result_null: true
+      reason: "no_match"
+
+  - id: find-charge-method
+    question: "Find all methods named 'charge' across the codebase."
+    tool: findSymbol
+    input:
+      scope: "{{scope}}"
+      pattern: "charge"
+      kind: "Method"
+    expect:
+      result_not_null: true
+      result_array_min_length: 1
+      min_confidence: 0.85
+
+  # ── Call graph ───────────────────────────────────────────────────────────
+
+  - id: callers-of-billing-charge
+    question: "Who calls BillingService.charge?"
+    tool: findCallers
+    input:
+      scope: "{{scope}}"
+      symbolIdOrName: "BillingService.charge"
+    expect:
+      result_not_null: true
+      min_confidence: 0.70
+
+  - id: callees-of-billing-charge
+    question: "What does BillingService.charge call internally?"
+    tool: findCallees
+    input:
+      scope: "{{scope}}"
+      symbolIdOrName: "BillingService.charge"
+    expect:
+      result_not_null: true
+      min_confidence: 0.70
+
+  # ── Function signatures ───────────────────────────────────────────────────
+
+  - id: signature-billing-charge
+    question: "What is the signature of BillingService.charge?"
+    tool: getFunctionSignature
+    input:
+      scope: "{{scope}}"
+      symbolIdOrName: "BillingService.charge"
+    expect:
+      result_not_null: true
+      result_contains_key: "paramNames"
+      min_confidence: 0.85
+
+  - id: signature-nonexistent
+    question: "What is the signature of a function that doesn't exist?"
+    tool: getFunctionSignature
+    input:
+      scope: "{{scope}}"
+      symbolIdOrName: "nonExistentFunctionXYZ"
+    expect:
+      result_null: true
+      reason: "no_match"
+
+  # ── File summary ──────────────────────────────────────────────────────────
+
+  - id: file-summary-billing
+    question: "What does the billing handler file export?"
+    tool: getFileSummary
+    input:
+      scope: "{{scope}}"
+      filePath: "src/billing.ts"
+    expect:
+      result_not_null: true
+      result_contains_key: "exports"
+      min_confidence: 0.85
+
+  - id: file-summary-nonexistent
+    question: "Summarize a file that doesn't exist."
+    tool: getFileSummary
+    input:
+      scope: "{{scope}}"
+      filePath: "src/does_not_exist_xyz.ts"
+    expect:
+      result_null: true
+      reason: "no_match"
+
+  # ── List files ────────────────────────────────────────────────────────────
+
+  - id: list-src-files
+    question: "What TypeScript files are in the src directory?"
+    tool: listFilesIn
+    input:
+      scope: "{{scope}}"
+      directory: "src"
+      recursive: false
+    expect:
+      result_not_null: true
+      result_array_min_length: 1
+      min_confidence: 0.85
+
+  # ── Repo map ──────────────────────────────────────────────────────────────
+
+  - id: repo-map-small-budget
+    question: "Give me a 500-token overview of the repo structure."
+    tool: getRepoMap
+    input:
+      scope: "{{scope}}"
+      tokenBudget: 500
+    expect:
+      result_not_null: true
+      result_contains_key: "text"
+
+  - id: repo-map-standard
+    question: "Give me a full repo map with 4000 token budget."
+    tool: getRepoMap
+    input:
+      scope: "{{scope}}"
+      tokenBudget: 4000
+    expect:
+      result_not_null: true
+      result_contains_key: "filesIncluded"
+
+  # ── Health ────────────────────────────────────────────────────────────────
+
+  - id: health-check
+    question: "Is the graph populated with any data?"
+    tool: health
+    input:
+      scope: "{{scope}}"
+    expect:
+      result_not_null: true
+      result_contains_key: "nodeCount"
+
+  # ── Contract: get endpoint by path+method ────────────────────────────────
+
+  - id: contract-get-billing-charge
+    question: "What is the API contract for POST /billing/charge?"
+    tool: getContractForEndpoint
+    input:
+      scope: "{{scope}}"
+      path: "/billing/charge"
+      method: "POST"
+    expect:
+      result_not_null: true
+      result_contains_key: "operationId"
+      min_confidence: 0.80
+
+  - id: contract-get-list-users
+    question: "What is the API contract for GET /users?"
+    tool: getContractForEndpoint
+    input:
+      scope: "{{scope}}"
+      path: "/users"
+      method: "GET"
+    expect:
+      result_not_null: true
+      result_contains_key: "tags"
+      min_confidence: 0.80
+
+  - id: contract-get-nonexistent-endpoint
+    question: "Is there a contract for DELETE /nonexistent?"
+    tool: getContractForEndpoint
+    input:
+      scope: "{{scope}}"
+      path: "/nonexistent"
+      method: "DELETE"
+    expect:
+      result_null: true
+      reason: "no_match"
+
+  # ── Contract: list implementations ───────────────────────────────────────
+
+  - id: contract-list-implementations
+    question: "What routes implement the POST /billing/charge contract?"
+    tool: listEndpointsImplementingContract
+    input:
+      scope: "{{scope}}"
+      contractId: "chargeUser"
+      limit: 10
+    expect:
+      result_not_null: true
+      result_array_min_length: 1
+      min_confidence: 0.80
+
+  # ── Database: table lookup ────────────────────────────────────────────────
+
+  - id: db-table-user
+    question: "What columns does the User table have?"
+    tool: getTableForEntity
+    input:
+      scope: "{{scope}}"
+      entityName: "User"
+    expect:
+      result_not_null: true
+      result_contains_key: "columns"
+      min_confidence: 0.80
+
+  - id: db-table-order
+    question: "What columns does the Order table have?"
+    tool: getTableForEntity
+    input:
+      scope: "{{scope}}"
+      entityName: "Order"
+    expect:
+      result_not_null: true
+      result_contains_key: "columns"
+      min_confidence: 0.80
+
+  - id: db-table-nonexistent
+    question: "Is there a table called WidgetXYZ?"
+    tool: getTableForEntity
+    input:
+      scope: "{{scope}}"
+      entityName: "WidgetXYZ"
+    expect:
+      result_null: true
+      reason: "no_match"
+
+  # ── Database: column search ───────────────────────────────────────────────
+
+  - id: db-columns-id-pattern
+    question: "Which columns end in _id across all tables?"
+    tool: findColumnsWithPattern
+    input:
+      scope: "{{scope}}"
+      pattern: "*_id"
+      limit: 50
+    expect:
+      result_not_null: true
+      result_array_min_length: 1
+      min_confidence: 0.90
+
+  - id: db-columns-created-at
+    question: "Which tables have a created_at column?"
+    tool: findColumnsWithPattern
+    input:
+      scope: "{{scope}}"
+      pattern: "created_at"
+      limit: 20
+    expect:
+      result_not_null: true
+      result_array_min_length: 1
+      min_confidence: 0.90
+
+  # ── Database: foreign keys ────────────────────────────────────────────────
+
+  - id: db-foreign-keys-order
+    question: "What foreign keys does the Order table have?"
+    tool: getForeignKeys
+    input:
+      scope: "{{scope}}"
+      tableName: "Order"
+    expect:
+      result_not_null: true
+      result_array_min_length: 1
+      min_confidence: 0.90
+
+  # ── Drift signals ─────────────────────────────────────────────────────────
+
+  - id: drift-all-signals
+    question: "Are there any API drift signals in this codebase?"
+    tool: getDriftSignals
+    input:
+      scope: "{{scope}}"
+      limit: 20
+    expect:
+      result_contains_key: "urn"
+      min_confidence: 0.60
+
+  - id: drift-breaking-only
+    question: "Are there any breaking API drift signals?"
+    tool: getDriftSignals
+    input:
+      scope: "{{scope}}"
+      severity: "breaking"
+      limit: 10
+    expect:
+      min_confidence: 0.60
+
+  # ── Database: SQL DDL (universal) ─────────────────────────────────────────
+
+  - id: db-sql-table-users
+    question: "What columns does the SQL-migrated users table have?"
+    tool: getTableForEntity
+    input:
+      scope: "{{scope}}"
+      entityName: "users"
+    expect:
+      result_not_null: true
+      result_contains_key: "columns"
+      min_confidence: 0.80
+
+  - id: db-sql-foreign-keys-users
+    question: "What foreign keys does the users table have from SQL migrations?"
+    tool: getForeignKeys
+    input:
+      scope: "{{scope}}"
+      tableName: "users"
+    expect:
+      result_not_null: true
+      result_array_min_length: 1
+      min_confidence: 0.85
+
+  # ── Database: JPA entities ────────────────────────────────────────────────
+
+  - id: db-jpa-table-user
+    question: "What does the JPA User entity map to in the database?"
+    tool: getTableForEntity
+    input:
+      scope: "{{scope}}"
+      entityName: "User"
+    expect:
+      result_not_null: true
+      result_contains_key: "columns"
+      min_confidence: 0.75
+
+  # ── Database: SQLAlchemy models ───────────────────────────────────────────
+
+  - id: db-sqlalchemy-table-user
+    question: "What columns does the SQLAlchemy User model have?"
+    tool: getTableForEntity
+    input:
+      scope: "{{scope}}"
+      entityName: "User"
+    expect:
+      result_not_null: true
+      result_contains_key: "columns"
+      min_confidence: 0.70

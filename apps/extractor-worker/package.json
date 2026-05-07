@@ -1,0 +1,20 @@
+{
+  "name": "@company-brain/extractor-worker",
+  "version": "0.1.0", "private": true, "type": "module",
+  "main": "./src/index.ts",
+  "scripts": { "dev": "bun run src/index.ts", "typecheck": "tsc --noEmit" },
+  "dependencies": {
+    "@company-brain/schema":                           "workspace:*",
+    "@company-brain/graph":                            "workspace:*",
+    "@company-brain/extractor-git":                    "workspace:*",
+    "@company-brain/extractor-core-ts":                "workspace:*",
+    "@company-brain/extractor-framework-next":         "workspace:*",
+    "@company-brain/extractor-framework-prisma":       "workspace:*",
+    "@company-brain/extractor-framework-openapi":      "workspace:*",
+    "@company-brain/extractor-framework-sql":          "workspace:*",
+    "@company-brain/extractor-framework-jpa":          "workspace:*",
+    "@company-brain/extractor-framework-sqlalchemy":   "workspace:*",
+    "@company-brain/drift-detector":                   "workspace:*"
+  },
+  "devDependencies": { "typescript": "^5.4.0" }
+}

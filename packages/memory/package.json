@@ -1,0 +1,26 @@
+{
+  "name": "@company-brain/memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test":      "vitest run"
+  },
+  "dependencies": {
+    "@company-brain/schema": "workspace:*",
+    "@company-brain/graph":  "workspace:*",
+    "@company-brain/tools":  "workspace:*",
+    "zod":                   "^3.23.0",
+    "js-yaml":               "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "typescript":     "^5.4.0",
+    "vitest":         "^1.6.0"
+  }
+}

@@ -1,0 +1,73 @@
+// eval/fixtures/prisma-simple/prisma/schema.prisma
+// Fixture for framework-prisma extractor tests.
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt      @map("updated_at")
+
+  orders    Order[]
+  profile   UserProfile?
+
+  @@map("users")
+}
+
+model UserProfile {
+  id         String  @id @default(cuid())
+  userId     String  @unique @map("user_id")
+  avatarUrl  String? @map("avatar_url")
+  bio        String?
+
+  user       User    @relation(fields: [userId], references: [id])
+
+  @@map("user_profiles")
+}
+
+model Order {
+  id          String      @id @default(cuid())
+  userId      String      @map("user_id")
+  totalAmount Float       @map("total_amount")
+  currency    String      @default("USD")
+  status      OrderStatus @default(PENDING)
+  createdAt   DateTime    @default(now()) @map("created_at")
+
+  user        User        @relation(fields: [userId], references: [id])
+  lineItems   LineItem[]
+
+  @@index([userId])
+  @@index([status, createdAt])
+  @@map("orders")
+}
+
+model LineItem {
+  id        String  @id @default(cuid())
+  orderId   String  @map("order_id")
+  productId String  @map("product_id")
+  quantity  Int
+  unitPrice Float   @map("unit_price")
+
+  order     Order   @relation(fields: [orderId], references: [id])
+
+  @@map("line_items")
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  SHIPPED
+  DELIVERED
+  CANCELLED
+
+  @@map("order_status")
+}

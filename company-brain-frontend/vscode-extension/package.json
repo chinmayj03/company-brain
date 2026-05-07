@@ -1,0 +1,69 @@
+{
+  "name": "company-brain",
+  "displayName": "Company Brain",
+  "description": "Dependency intelligence — understand blast radius, business context, and code history without leaving your editor",
+  "version": "0.1.0",
+  "publisher": "company-brain",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "companyBrain.showBlastRadius",
+        "title": "Company Brain: Show Blast Radius"
+      },
+      {
+        "command": "companyBrain.showContext",
+        "title": "Company Brain: Show Business Context"
+      },
+      {
+        "command": "companyBrain.annotateCommit",
+        "title": "Company Brain: Annotate This Commit"
+      },
+      {
+        "command": "companyBrain.ask",
+        "title": "Company Brain: Ask a Question"
+      }
+    ],
+    "configuration": {
+      "title": "Company Brain",
+      "properties": {
+        "companyBrain.apiUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "Company Brain API base URL"
+        },
+        "companyBrain.aiApiUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "Company Brain AI API base URL"
+        },
+        "companyBrain.token": {
+          "type": "string",
+          "default": "",
+          "description": "Authentication token (set via Company Brain: Sign In)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "lint": "eslint src --ext .ts"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.5",
+    "@vscode/vsce": "^2.26.1",
+    "eslint": "^8.57.0",
+    "@typescript-eslint/parser": "^7.11.0",
+    "@typescript-eslint/eslint-plugin": "^7.11.0"
+  },
+  "dependencies": {
+    "axios": "^1.7.2"
+  }
+}

@@ -1,0 +1,56 @@
+#!/bin/sh
+# Maven Wrapper script — downloads Maven 3.9.6 on first run if not already cached.
+# Equivalent to running `mvn` but self-contained — no system Maven required.
+
+set -e
+
+# Determine the script directory
+MAVEN_PROJECTBASEDIR=$(cd "$(dirname "$0")" && pwd)
+MAVEN_WRAPPER_PROPERTIES="$MAVEN_PROJECTBASEDIR/.mvn/wrapper/maven-wrapper.properties"
+
+# Read wrapper URL and distribution URL
+DISTRIBUTION_URL=$(grep distributionUrl "$MAVEN_WRAPPER_PROPERTIES" | cut -d= -f2-)
+WRAPPER_JAR_URL=$(grep wrapperUrl "$MAVEN_WRAPPER_PROPERTIES" | cut -d= -f2-)
+
+# Maven home: use MAVEN_USER_HOME or default
+if [ -z "$MAVEN_USER_HOME" ]; then
+  MAVEN_USER_HOME="$HOME/.m2"
+fi
+
+# Derive local Maven installation path from distribution URL
+DISTRIBUTION_FILENAME="${DISTRIBUTION_URL##*/}"
+DISTRIBUTION_NAME="${DISTRIBUTION_FILENAME%.zip}"
+MAVEN_HOME="$MAVEN_USER_HOME/wrapper/dists/$DISTRIBUTION_NAME"
+MVN_CMD="$MAVEN_HOME/bin/mvn"
+
+# Download Maven if not already installed
+if [ ! -f "$MVN_CMD" ]; then
+  echo "Downloading Maven from $DISTRIBUTION_URL ..."
+  mkdir -p "$MAVEN_HOME"
+  TEMP_FILE="$MAVEN_HOME/$DISTRIBUTION_FILENAME"
+
+  if command -v curl > /dev/null 2>&1; then
+    curl -fsSL "$DISTRIBUTION_URL" -o "$TEMP_FILE"
+  elif command -v wget > /dev/null 2>&1; then
+    wget -q "$DISTRIBUTION_URL" -O "$TEMP_FILE"
+  else
+    echo "ERROR: curl or wget is required to download Maven."
+    exit 1
+  fi
+
+  # Unzip into the maven home directory (strip the top-level dir)
+  unzip -q "$TEMP_FILE" -d "$MAVEN_HOME"
+  rm -f "$TEMP_FILE"
+
+  # Move contents up if there's a single top-level directory
+  INNER_DIR=$(ls "$MAVEN_HOME" | grep -v "$DISTRIBUTION_FILENAME" | head -1)
+  if [ -d "$MAVEN_HOME/$INNER_DIR" ]; then
+    mv "$MAVEN_HOME/$INNER_DIR"/* "$MAVEN_HOME/"
+    rmdir "$MAVEN_HOME/$INNER_DIR"
+  fi
+
+  chmod +x "$MVN_CMD"
+  echo "Maven installed to $MAVEN_HOME"
+fi
+
+exec "$MVN_CMD" "$@"

@@ -1,0 +1,13 @@
+{
+  "name": "@company-brain/cli",
+  "version": "0.1.0", "private": true, "type": "module",
+  "main": "./src/index.ts",
+  "bin": { "cb": "./src/index.ts" },
+  "scripts": { "dev": "bun run src/index.ts", "typecheck": "tsc --noEmit" },
+  "dependencies": {
+    "@company-brain/schema":  "workspace:*",
+    "@company-brain/graph":   "workspace:*",
+    "@company-brain/tools":   "workspace:*"
+  },
+  "devDependencies": { "typescript": "^5.4.0" }
+}

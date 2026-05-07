@@ -1,0 +1,1270 @@
+"""
+Pipeline Orchestrator — runs the multi-pass LLM extraction for one API endpoint.
+
+Stages:
+  0a. Code tracing     — find handler → services → repos → models (live source)
+  0b. Git collection   — commit history for context synthesis (non-fatal)
+  1.  Entity extraction from live code (one LLM call per class)
+  2.  Relationship extraction
+  3.  Business context synthesis (uses git history as "why" signal)
+  4.  Gap detection
+  5.  Graph population
+
+Progress logging:
+  run_pipeline() accepts an optional `on_progress` async callback.
+  It is called after every significant step with a structured dict so the
+  pipeline route can push live updates to Redis and the frontend can poll them.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path as _Path
+from typing import Awaitable, Callable, Optional
+
+import httpx
+import structlog
+
+# ── Integration bridge (ADR-0008) ─────────────────────────────────────────────
+# After LLM pipeline completes, trigger the TypeScript structural extractor via
+# the cb-api service so that Neo4j structural nodes are always in sync with the
+# Postgres semantic graph.
+CB_API_URL = os.getenv("CB_API_URL", "http://cb-api:8090")
+
+from companybrain.collectors.code_tracer import CodeTracer
+from companybrain.collectors.git_collector import GitCollector, CollectorConfig
+from companybrain.pipeline.entity_extractor import EntityExtractor
+from companybrain.pipeline.intent_synthesizer import IntentSynthesizer, function_context_to_dict
+from companybrain.pipeline.import_graph import ImportGraphAnalyzer
+from companybrain.pipeline.memory_tokenizer import MemoryTokenizer, memory_tokens_to_metadata
+from companybrain.pipeline.relationship_extractor import RelationshipExtractor
+from companybrain.pipeline.context_synthesizer import ContextSynthesizer
+from companybrain.pipeline.gap_detector import GapDetector
+from companybrain.pipeline.entity_filter import filter_entities
+from companybrain.pipeline.context_hierarchy import L2SharedContext
+from companybrain.pipeline.context_manager_agent import ContextManagerAgent
+from companybrain.pipeline.shared_context_accumulator import SharedContextAccumulator
+from companybrain.graph.java_client import JavaGraphClient, ArtifactFreshnessResult
+from companybrain.models.entities import PipelineStartRequest, ExtractedEntity
+from companybrain.pipeline.concurrency import (
+    get_extraction_concurrency,
+    get_extraction_semaphore,
+    is_parallel_safe,
+)
+
+log = structlog.get_logger(__name__)
+
+# Callback type: async fn(stage, emoji, message, extra_data)
+ProgressFn = Callable[[str, str, str, dict], Awaitable[None]]
+
+
+@dataclass
+class PipelineResult:
+    job_id: str
+    workspace_id: str
+    endpoint_path: str
+    entity_count: int
+    edge_count: int
+    gap_count: int
+    status: str = "completed"
+    error: str | None = None
+    # Rich detail for the UI
+    code_units_found: int = 0
+    git_commits_found: int = 0
+    files_traced: list[str] = field(default_factory=list)
+    stages_summary: list[dict] = field(default_factory=list)
+
+
+async def run_pipeline(
+    request: PipelineStartRequest,
+    annotations: list[dict] | None = None,
+    on_progress: Optional[ProgressFn] = None,
+    java_callback_url: Optional[str] = None,
+    java_callback_key: Optional[str] = None,
+) -> PipelineResult:
+    # Use the job_id provided by Java (via AiRunRequest) so the same ID appears
+    # in every log line AND in the final callback to /v1/internal/pipeline-result.
+    # Fall back to a fresh UUID only for direct/test invocations that don't
+    # come from the Java job scheduler.
+    job_id = getattr(request, "job_id", None) or str(uuid.uuid4())
+    annotations = annotations or []
+    stages_summary: list[dict] = []
+
+    async def progress(stage: str, emoji: str, message: str, data: dict | None = None, **kwargs):
+        """Emit a structured progress event — logs it AND calls the callback."""
+        merged = {**(data or {}), **kwargs}
+        log.info(f"[{stage}] {message}", **merged)
+        if on_progress:
+            await on_progress(stage, emoji, message, merged)
+
+    # Reset the per-run usage tracker so each run starts clean
+    from companybrain.llm.base import get_usage_tracker
+    _run_tracker = get_usage_tracker()
+    _run_tracker.reset()
+
+    log.info(
+        "━━━ Pipeline started ━━━",
+        job_id=job_id,
+        endpoint=request.endpoint_path,
+        method=request.http_method,
+        repos=[r.local_path or r.url for r in request.repos],
+        workspace=request.workspace_id,
+    )
+
+    try:
+        repos = [_repo_dict(r) for r in request.repos]
+
+        # ── Stages 0a + 0b: run in parallel ───────────────────────────────────
+        # Code tracing (CPU/regex + 1 LLM call) and git collection (I/O) are
+        # fully independent.  Running them together saves the full git-collect time.
+        await progress("0a", "🔍", "Code tracing + git history — scanning in parallel")
+
+        # ADR-005: hold a reference to the collector so we can call collect_as_artifacts()
+        _git_collector: list = []   # mutable cell trick — holds [GitCollector] after init
+
+        async def _collect_git():
+            git_config = CollectorConfig(
+                endpoint_path=request.endpoint_path,
+                http_method=request.http_method,
+                branch=request.branch,
+            )
+            collector = GitCollector(git_config, repos)
+            _git_collector.append(collector)
+            return await collector.collect()
+
+        tracer = CodeTracer()
+        focal_context, git_result = await asyncio.gather(
+            tracer.trace(
+                endpoint=request.endpoint_path,
+                method=request.http_method,
+                repos=repos,
+            ),
+            _collect_git(),
+            return_exceptions=True,
+        )
+
+        # Unpack git result (may be an exception if collection failed)
+        git_clusters: list = []
+        git_commits = 0
+        if isinstance(git_result, Exception):
+            log.warning("Stage 0b — git collection failed (non-fatal)", error=str(git_result))
+            stages_summary.append({"stage": "0b", "label": "Git History",
+                                    "skipped": True, "reason": str(git_result)})
+            await progress("0b", "⚠️", f"Git history unavailable — continuing without it",
+                           error=str(git_result))
+        else:
+            git_clusters = git_result
+            git_commits  = sum(len(c.commits) for c in git_clusters)
+            stages_summary.append({"stage": "0b", "label": "Git History",
+                                    "clusters": len(git_clusters), "commits": git_commits})
+            await progress("0b", "✅",
+                           f"Collected {git_commits} commits across {len(git_clusters)} clusters",
+                           clusters=len(git_clusters), commits=git_commits)
+
+        files_traced = [u.file_path for u in focal_context.code_units]
+        stages_summary.append({"stage": "0a", "label": "Code Tracing",
+                                "code_units": len(focal_context.code_units), "files": files_traced})
+
+        # ── ADR-005: Collect artifacts from git collector ─────────────────────
+        # Re-use the already-run GitCollector to project clusters into Artifacts.
+        # This is cheap — collect_as_artifacts() reads from the clusters that were
+        # already computed; it does NOT re-run git or the GitHub API.
+        pipeline_artifacts = []
+        if _git_collector:
+            try:
+                pipeline_artifacts = await _git_collector[0].collect_as_artifacts(
+                    workspace_id=request.workspace_id,
+                )
+                await progress(
+                    "0b", "📦",
+                    f"Collected {len(pipeline_artifacts)} artifacts "
+                    f"({sum(1 for a in pipeline_artifacts if a.kind=='source_file')} source files, "
+                    f"{sum(1 for a in pipeline_artifacts if a.kind=='commit')} commits, "
+                    f"{sum(1 for a in pipeline_artifacts if a.kind=='pr')} PRs)",
+                    artifact_count=len(pipeline_artifacts),
+                )
+            except Exception as e:
+                log.warning("Artifact collection failed (non-fatal)", error=str(e))
+
+        # Also add source_file artifacts from code tracer units not already covered
+        traced_file_ext_ids = {a.external_id for a in pipeline_artifacts if a.kind == "source_file"}
+        from companybrain.models.entities import Artifact as _Artifact
+        for unit in focal_context.code_units:
+            ext_id = f"{unit.repo_name}/{unit.file_path}"
+            if ext_id not in traced_file_ext_ids:
+                pipeline_artifacts.append(_Artifact(
+                    kind="source_file",
+                    external_id=ext_id,
+                    content=unit.content[:16000] if unit.content else "",
+                    metadata={"repo": unit.repo_name, "file_path": unit.file_path, "role": unit.role},
+                ))
+
+        if focal_context.is_empty():
+            await progress(
+                "0a", "⚠️",
+                "No handler found — will fall back to git diff extraction",
+                endpoint=request.endpoint_path,
+            )
+        else:
+            await progress(
+                "0a", "✅",
+                f"Found {len(focal_context.code_units)} code units",
+                units=[f"{u.role}: {u.class_name or u.file_path}" for u in focal_context.code_units],
+                files=files_traced,
+            )
+
+        # ── Pre-flight: Freshness check — skip LLM for unchanged files ────────
+        # Build the graph client early so we can call check_freshness before Stage 1.
+        # This is the single biggest speed win: on average 80-90% of files are unchanged
+        # between pipeline runs so we skip LLM inference for those entirely.
+        # `job_id` is already the resolved canonical ID at this point:
+        # either Java-provided via request.job_id, a fresh UUID for standalone
+        # runs, or restored from checkpoint above.  Use it directly so logs
+        # and the final pipeline-result callback all reference the same value.
+        _graph_client_for_freshness = JavaGraphClient(
+            workspace_id=request.workspace_id,
+            job_id=job_id,
+            callback_url=java_callback_url,
+            callback_key=java_callback_key,
+        )
+
+        freshness_map: dict[str, ArtifactFreshnessResult] = {}
+        fresh_entities: list[ExtractedEntity] = []
+        dirty_units = list(focal_context.code_units)
+
+        if not focal_context.is_empty():
+            await progress("0c", "⚡", "Freshness pre-flight — checking which files changed since last run")
+            freshness_map = await _graph_client_for_freshness.check_freshness(focal_context.code_units)
+
+            fresh_units = []
+            dirty_units = []
+            for unit in focal_context.code_units:
+                ext_id = f"{unit.repo_name}/{unit.file_path}"
+                result = freshness_map.get(ext_id)
+                if result and result.fresh and result.existing_entities:
+                    fresh_units.append(unit)
+                else:
+                    dirty_units.append(unit)
+
+            # Reconstruct ExtractedEntity objects from fresh node projections
+            # so relationship extraction / synthesis can reference them.
+            for unit in fresh_units:
+                ext_id = f"{unit.repo_name}/{unit.file_path}"
+                for ee in freshness_map[ext_id].existing_entities:
+                    meta = ee.metadata or {}
+                    fresh_entities.append(ExtractedEntity(
+                        entity_type=ee.node_type,
+                        name=ee.name,
+                        file=meta.get("file", unit.file_path),
+                        repo=meta.get("repo", unit.repo_name),
+                        signature=meta.get("signature", ""),
+                        last_modified_commit=meta.get("lastModifiedCommit", ""),
+                        confidence=float(meta.get("confidence", 0.9)),
+                        first_appeared_commit=meta.get("firstAppearedCommit"),
+                        code_snippet=meta.get("codeSnippet"),
+                        query_text=meta.get("queryText"),
+                    ))
+
+            stages_summary.append({
+                "stage": "0c", "label": "Freshness Check",
+                "total": len(focal_context.code_units),
+                "fresh": len(fresh_units),
+                "dirty": len(dirty_units),
+                "reused_entities": len(fresh_entities),
+            })
+            await progress(
+                "0c", "✅",
+                f"Freshness: {len(fresh_units)} fresh (reused {len(fresh_entities)} entities), "
+                f"{len(dirty_units)} dirty (LLM required)",
+                fresh=len(fresh_units),
+                dirty=len(dirty_units),
+                reused=len(fresh_entities),
+            )
+        else:
+            # No code units found — dirty_units stays empty, git diff fallback runs in Stage 1
+            pass
+
+        # ── Stage 1: Entity extraction with hierarchical context ──────────────
+        # ── Resume from checkpoint if a previous run left one ─────────────────
+        # stage_reached tracks the highest stage completed:
+        #   "1"   → entity extraction done, intent synthesis + import graph still needed
+        #   "1.5" → entity extraction + intent synthesis done, import graph still needed
+        #   "1.6" → full Stage 1 done, skip everything through Stage 1
+        #
+        # code_units are also stored so code tracing is skipped on resume.
+        _ckpt = _checkpoint_load(request)
+        entities: list = []
+        structural_rels: list = []
+        _stage1_from_checkpoint = False      # full Stage 1 skip (stage_reached == "1.6")
+        _skip_extraction        = False      # partial skip: extraction done but 1.5/1.6 still needed
+        _skip_intent_synthesis  = False      # 1.5 already done
+
+        if _ckpt:
+            entities        = _ckpt["entities"]
+            structural_rels = _ckpt["structural_rels"]
+            stage_reached   = _ckpt["stage_reached"]
+
+            # Restore code_units into focal_context so code tracing is skipped
+            ckpt_units = _ckpt.get("code_units", [])
+            if ckpt_units and focal_context.is_empty():
+                focal_context.code_units = ckpt_units
+                log.info("Restored code_units from checkpoint", count=len(ckpt_units))
+
+            # Restore job_id so the same Java job ID flows through every log line
+            # and into the final POST to /v1/internal/pipeline-result.
+            # Only override if the current request doesn't already carry a job_id
+            # (the Java-initiated path always provides one; standalone calls don't).
+            ckpt_job_id = _ckpt.get("job_id", "")
+            if ckpt_job_id and not getattr(request, "job_id", ""):
+                try:
+                    request.job_id = ckpt_job_id
+                    job_id = ckpt_job_id
+                    log.info("Restored job_id from checkpoint", job_id=job_id)
+                except Exception:
+                    pass  # request object may be frozen; non-fatal
+
+            if stage_reached >= "1.6":
+                _stage1_from_checkpoint = True
+                _skip_extraction        = True
+                _skip_intent_synthesis  = True
+            elif stage_reached >= "1.5":
+                _skip_extraction       = True
+                _skip_intent_synthesis = True
+            elif stage_reached >= "1":
+                _skip_extraction = True
+
+            log.info(
+                "Resuming from checkpoint",
+                stage_reached=stage_reached,
+                entities=len(entities),
+                code_units=len(ckpt_units),
+                skip_extraction=_skip_extraction,
+                skip_intent_synthesis=_skip_intent_synthesis,
+                full_stage1_skip=_stage1_from_checkpoint,
+            )
+            await progress(
+                "1", "⚡",
+                f"Resuming from checkpoint (stage {stage_reached}) — "
+                f"{len(entities)} entities, {len(ckpt_units)} code units already extracted",
+            )
+
+        if not _skip_extraction:
+            await progress("1", "🧠", "Entity extraction — L1/L2 context hierarchy + CM Agent (one class at a time)")
+
+        extractor   = EntityExtractor()
+        cm_agent    = ContextManagerAgent()
+        accumulator = SharedContextAccumulator()
+        l2          = L2SharedContext()
+
+        if not _skip_extraction and not focal_context.is_empty():
+            concurrency = get_extraction_concurrency()
+            parallel    = is_parallel_safe() and len(dirty_units) > 1
+
+            await progress(
+                "1", "📄",
+                f"Extracting {len(dirty_units)} dirty units — "
+                f"{'parallel (concurrency=' + str(concurrency) + ')' if parallel else 'sequential (Ollama)'} "
+                f"— skipping {len(fresh_entities)} reused from fresh cache",
+                mode="code-based + L2 shared context",
+                units=len(dirty_units),
+                skipped=len(fresh_entities),
+                concurrency=concurrency,
+                parallel=parallel,
+            )
+
+            context_assemblies: dict = {}
+
+            if parallel:
+                # ── Parallel extraction (cloud APIs: OpenAI / Anthropic) ──────
+                #
+                # Phase A (sequential): CM Agent pre-assembles context for every unit
+                #   using the *initial* L2 state.  This is a cheap in-memory pass —
+                #   no LLM call — so staying sequential preserves context ordering.
+                #
+                # Phase B (concurrent): All LLM extraction calls run under a semaphore.
+                #   asyncio.gather fans them out; the semaphore caps active calls.
+                #
+                # Phase C (sequential): L2 is updated from all results.
+                #   L2 won't have per-unit incremental enrichment during batch extraction
+                #   (acceptable tradeoff — on next run those units will be fresh).
+
+                # Phase A — pre-assemble CM contexts
+                assemblies_in_order = []
+                for unit in dirty_units:
+                    assembly = await cm_agent.assemble(
+                        unit=unit,
+                        l2=l2,
+                        endpoint=request.endpoint_path,
+                        method=request.http_method,
+                    )
+                    context_assemblies[unit.file_path] = assembly
+                    assemblies_in_order.append((unit, assembly))
+
+                # Phase B — concurrent LLM extraction
+                sem = get_extraction_semaphore()
+
+                async def _extract_unit(unit, assembly):
+                    async with sem:
+                        try:
+                            unit_entities = await extractor._extract_from_code_unit(
+                                unit, focal_context, assembly
+                            )
+                            return unit, unit_entities
+                        except Exception as exc:
+                            log.error("Unit extraction failed",
+                                      unit=unit.file_path, error=str(exc))
+                            return unit, []
+
+                results = await asyncio.gather(
+                    *[_extract_unit(unit, asm) for unit, asm in assemblies_in_order]
+                )
+
+                # Phase C — collect and update L2 sequentially
+                for unit, unit_entities in results:
+                    entities.extend(unit_entities)
+                    accumulator.update(l2, unit_entities, unit)
+                    if unit_entities:
+                        await progress(
+                            "1", "📄",
+                            f"{unit.class_name or unit.file_path}: {len(unit_entities)} entities",
+                            role=unit.role,
+                            entities=[f"{e.entity_type}:{e.name}" for e in unit_entities[:5]],
+                        )
+
+            else:
+                # ── Sequential extraction (Ollama — single-threaded local GPU) ─
+                # CM Agent assembles context → LLM extracts → L2 updates (incremental).
+                # This is the original high-quality path: each unit sees L2 enriched
+                # by all previously processed units.
+                for unit in dirty_units:
+                    assembly = await cm_agent.assemble(
+                        unit=unit,
+                        l2=l2,
+                        endpoint=request.endpoint_path,
+                        method=request.http_method,
+                    )
+                    context_assemblies[unit.file_path] = assembly
+
+                    if assembly.system_prompt_patch:
+                        await progress(
+                            "1", "🎯",
+                            f"CM Agent patched prompt for {unit.class_name or unit.file_path}",
+                            patch=assembly.system_prompt_patch[:120],
+                            confidence_prior=assembly.confidence_prior,
+                        )
+
+                    try:
+                        unit_entities = await extractor._extract_from_code_unit(
+                            unit, focal_context, assembly
+                        )
+                        entities.extend(unit_entities)
+                        await progress(
+                            "1", "📄",
+                            f"{unit.class_name or unit.file_path}: {len(unit_entities)} entities",
+                            role=unit.role,
+                            entities=[f"{e.entity_type}:{e.name}" for e in unit_entities[:5]],
+                        )
+                    except Exception as exc:
+                        log.error("Unit extraction failed", unit=unit.file_path, error=str(exc))
+                        await progress("1", "⚠️", f"Unit {unit.file_path} failed: {exc}")
+                        # Save partial progress so retry resumes here
+                        _checkpoint_save(request, entities, [], focal_context, stage_reached="1")
+                        continue
+
+                    accumulator.update(l2, unit_entities, unit)
+                    # Save after every unit so any crash/rate-limit is resumable
+                    _checkpoint_save(request, entities, [], focal_context, stage_reached="1")
+
+            # Merge fresh (reused) entities + newly extracted dirty entities, then deduplicate.
+            # Fresh entities come first so their existing external_ids win dedup ties.
+            entities = extractor._deduplicate(fresh_entities + entities)
+
+            await progress(
+                "1", "📊",
+                f"L2 context after extraction: {l2.compact_summary()}",
+            )
+
+        else:
+            await progress(
+                "1", "📄",
+                f"Fallback: sending {len(git_clusters)} git diff chunks to LLM",
+                mode="diff-based (fallback)",
+            )
+            api_snapshot = {"path": request.endpoint_path, "method": request.http_method, "handler_code": ""}
+            entities = await extractor.extract_from_clusters(git_clusters, api_snapshot)
+
+        # ── Stage 1 post-processing: relevance filter ─────────────────────────
+        # Strips diff-artifact constants, test classes, and noise-suffix classes
+        # (e.g. JsonKeyMapping, *Constants) before they enter any LLM stage.
+        # Only endpoint-relevant code units (controllers, services, repos, DB queries)
+        # are forwarded, keeping context tight and reducing token spend.
+        raw_entity_count = len(entities)
+        entities = filter_entities(entities, endpoint=request.endpoint_path, max_entities=25)
+
+        entity_names = [f"{e.entity_type}:{e.name}" for e in entities[:10]]
+        stage_1 = {
+            "stage": "1",
+            "label": "Entity Extraction",
+            "entities": len(entities),
+            "raw_entities": raw_entity_count,
+            "filtered_out": raw_entity_count - len(entities),
+            "sample": entity_names,
+            "l2_snapshot": l2.snapshot() if not l2.is_empty() else {},
+        }
+        stages_summary.append(stage_1)
+
+        await progress(
+            "1", "✅",
+            f"Extracted {raw_entity_count} entities → {len(entities)} after relevance filter "
+            f"(L2: {len(l2.domain_glossary)} glossary terms, {len(l2.service_registry)} services)",
+            entities=entity_names,
+            total=len(entities),
+            filtered_out=raw_entity_count - len(entities),
+        )
+
+        # ── Stage 1.4: LLM-guided dependency expansion ───────────────────────────
+        # Skipped when resuming from checkpoint (expansion already happened in prior run).
+        # The navigator is given MAX_TURNS to trace the call chain. When a
+        # RepositoryImpl or Service delegates to further dependencies (other repos,
+        # clients, caches) the navigator may have run out of turns before exploring
+        # them. This stage asks a focused LLM call: "given what we extracted so far,
+        # which class names were mentioned but never actually visited?" and then
+        # runs a targeted second navigator pass for each one — capped at 3 to
+        # avoid runaway expansion.
+        #
+        # The LLM decides whether expansion is worth it based on the entity signal:
+        # - "CompetitivenessPlanRepository: only interface methods seen, no queries" → expand
+        # - "NiqAPIRequest: DTO with field names only" → skip
+        # - "VIEW_BY: enum type" → skip
+        already_traced = {str(u.file_path) for u in focal_context.code_units}
+        expansion_candidates = [] if _skip_extraction else _llm_suggest_expansions(entities, focal_context.code_units)
+        if expansion_candidates:
+            await progress(
+                "1.4", "🔍",
+                f"Dependency expansion — {len(expansion_candidates)} unresolved collaborators: "
+                f"{expansion_candidates}",
+            )
+            for candidate_class in expansion_candidates[:5]:   # cap at 5
+                # Find the file for this class across all repos
+                candidate_file = _resolve_class_to_file(candidate_class, request.repos)
+                if not candidate_file or str(candidate_file) in already_traced:
+                    continue
+                try:
+                    # Determine repo root for this file
+                    repo_root = str(candidate_file.parent)
+                    repo_name = candidate_class
+                    for repo_cfg in request.repos:
+                        if repo_cfg.local_path and str(candidate_file).startswith(repo_cfg.local_path):
+                            repo_root = repo_cfg.local_path
+                            repo_name = repo_cfg.name or candidate_class
+                            break
+
+                    # Direct read + extract — no navigator needed when we already know
+                    # the file path.  The navigator's job is *finding* unknown files;
+                    # here we already found the file.
+                    content = candidate_file.read_text(errors="replace")
+                    from companybrain.collectors.code_tracer import CodeUnit as _CU
+                    role = (
+                        "repository" if any(
+                            candidate_class.endswith(s)
+                            for s in ("Repository", "DAO", "Store", "Persistence", "RepositoryImpl")
+                        ) else
+                        "service" if any(
+                            candidate_class.endswith(s)
+                            for s in ("Service", "ServiceImpl", "Engine", "Processor", "Handler")
+                        ) else
+                        "model"
+                    )
+                    nu = _CU(
+                        file_path=str(candidate_file),
+                        repo_name=repo_name,
+                        role=role,
+                        class_name=candidate_class,
+                        content=content,
+                        language="java" if str(candidate_file).endswith(".java") else
+                                 "kotlin" if str(candidate_file).endswith(".kt") else
+                                 "python" if str(candidate_file).endswith(".py") else
+                                 "typescript",
+                    )
+                    focal_context.code_units.append(nu)
+                    already_traced.add(str(candidate_file))
+                    sec_entities = await extractor._extract_from_code_unit(nu, focal_context)
+                    sec_entities = extractor._deduplicate(sec_entities)
+                    entities = extractor._deduplicate(entities + sec_entities)
+                    accumulator.update(l2, sec_entities, nu)
+                    await progress(
+                        "1.4", "✅",
+                        f"Expanded {candidate_class}: {len(sec_entities)} entities added",
+                    )
+                except Exception as exc:
+                    log.warning("Dependency expansion failed", candidate=candidate_class, error=str(exc))
+
+        # ── Stage 1.5: Intent synthesis — FunctionContext for each function ─────
+        # Transforms structural entities into business-meaningful descriptions.
+        # Runs AFTER entity dedup so we don't synthesise the same function twice.
+        # Runs BEFORE relationship extraction so RelationshipExtractor can use
+        # the richer entity metadata when scoring edge candidates.
+        await progress("1.5", "💡", "Intent synthesis — extracting business meaning from code functions")
+
+        intent_contexts: dict = {}
+        if entities and not _skip_intent_synthesis:
+            intent_contexts = await IntentSynthesizer().synthesise_all(entities, focal_context)
+
+            # Attach FunctionContext to each entity's metadata so ContextAssemblerService
+            # can include it in T2 blocks and the pipeline result carries it to Java.
+            for entity in entities:
+                if entity.external_id in intent_contexts:
+                    ctx = intent_contexts[entity.external_id]
+                    # Augment entity metadata — accessed downstream by RelationshipExtractor
+                    # and serialised into graph node metadata by PipelineService in Java.
+                    if not hasattr(entity, '_extra_metadata'):
+                        object.__setattr__(entity, '_extra_metadata', {}) if hasattr(entity, '__dataclass_fields__') else None
+                    # Store on the entity's existing code_snippet field as a supplement —
+                    # the authoritative store is in the Java node metadata via pipeline_meta.
+                    pass   # Java side reads intent_contexts from the payload (see below)
+
+            stage_15 = {
+                "stage":         "1.5",
+                "label":         "Intent Synthesis",
+                "synthesised":   len(intent_contexts),
+                "candidates":    sum(1 for e in entities if e.entity_type in {"Function", "CodeFunction", "ApiEndpoint", "Service"}),
+                "intent_sample": [
+                    {"entity": eid, "purpose": ctx.purpose[:80]}
+                    for eid, ctx in list(intent_contexts.items())[:3]
+                ],
+            }
+            stages_summary.append(stage_15)
+            await progress(
+                "1.5", "✅",
+                f"Synthesised intent for {len(intent_contexts)} functions "
+                f"({sum(1 for c in intent_contexts.values() if c.change_risk == 'high')} high-risk)",
+                synthesised=len(intent_contexts),
+                high_risk=sum(1 for c in intent_contexts.values() if c.change_risk == "high"),
+            )
+            # Save checkpoint so retry skips extraction + intent synthesis
+            _checkpoint_save(request, entities, [], focal_context, stage_reached="1.5")
+        else:
+            stages_summary.append({"stage": "1.5", "label": "Intent Synthesis", "skipped": True, "reason": "no entities"})
+
+        # ── Stage 1.6: Import-graph CALLS edges (deterministic, zero LLM cost) ──
+        # Scans @Autowired / constructor injection / import statements to produce
+        # structural CALLS edges before the LLM relationship pass. These are merged
+        # with LLM results so Stage 2 sees the full edge set and avoids duplicates.
+        if not _stage1_from_checkpoint:   # stage_reached < "1.6"
+            import_analyzer = ImportGraphAnalyzer()
+            import_edges    = import_analyzer.analyze(focal_context.code_units, entities)
+            structural_rels = import_analyzer.to_relationships(import_edges, entities)
+
+            stages_summary.append({
+                "stage": "1.6", "label": "Import-Graph Edges",
+                "structural_edges": len(structural_rels),
+            })
+            await progress(
+                "1.6", "🔌",
+                f"Detected {len(structural_rels)} structural CALLS edges from import/DI analysis",
+                structural=len(structural_rels),
+            )
+
+            # ── Checkpoint: save Stage 1 result so a retry can skip extraction ─────
+            # Written to /tmp/cb_checkpoint_<job_key>.json where job_key is a stable
+            # hash of (workspace_id, endpoint_path, http_method).  On retry, the
+            # orchestrator detects the file and jumps straight to Stage 2.
+            _checkpoint_save(request, entities, structural_rels, focal_context, stage_reached="1.6")
+
+        # ── Stage 2: Relationship extraction ──────────────────────────────────
+        await progress("2", "🔗", "Relationship extraction — mapping CALLS / READS / RENDERS edges")
+
+        llm_relationships = await RelationshipExtractor().extract(
+            entities,
+            git_clusters,
+            {"path": request.endpoint_path, "method": request.http_method},
+        )
+
+        # Merge structural (import-graph) + LLM relationships.
+        # Structural edges come first so their external_ids win dedup when LLM finds the same edge.
+        relationships = _dedup_relationships(structural_rels + llm_relationships)
+
+        stage_2 = {
+            "stage": "2", "label": "Relationship Extraction",
+            "edges": len(relationships),
+            "structural": len(structural_rels),
+            "llm": len(llm_relationships),
+        }
+        stages_summary.append(stage_2)
+        await progress(
+            "2", "✅",
+            f"Found {len(relationships)} relationships ({len(structural_rels)} structural + {len(llm_relationships)} LLM)",
+            total=len(relationships), structural=len(structural_rels), llm=len(llm_relationships),
+        )
+
+        # ── Stage 3: Business context synthesis ───────────────────────────────
+        await progress("3", "📖", "Context synthesis — explaining WHY each entity exists (using git history)")
+
+        contexts = await ContextSynthesizer().synthesise_all(entities, git_clusters, annotations)
+        stage_3 = {"stage": "3", "label": "Context Synthesis", "contexts": len(contexts)}
+        stages_summary.append(stage_3)
+        await progress("3", "✅", f"Synthesised context for {len(contexts)} entities")
+
+        # ── Stage 3.5: Memory tokenization — T0/T1 tokens from synthesised contexts ──
+        # Generates compact memory tokens deterministically from BusinessContext objects.
+        # T0 (~15 tok): one-liner for "I've heard of this"
+        # T1 (~100 tok): summary for "I know what this does"
+        # Tokens are stored in node metadata so ContextAssemblerService can render
+        # T0/T1 blocks without extra LLM calls during Ask queries.
+        memory_tokens = MemoryTokenizer().tokenize_all(entities, contexts)
+        serialized_tokens = memory_tokens_to_metadata(memory_tokens)
+
+        stages_summary.append({
+            "stage": "3.5", "label": "Memory Tokenization",
+            "tokens": len(memory_tokens),
+            "t0_sample": [tok.t0 for tok in list(memory_tokens.values())[:2]],
+        })
+        await progress(
+            "3.5", "🧩",
+            f"Generated T0/T1 memory tokens for {len(memory_tokens)} entities",
+            tokens=len(memory_tokens),
+        )
+
+        # ── Stage 4: Gap detection ─────────────────────────────────────────────
+        await progress("4", "🔎", "Gap detection — finding unexplained behaviour and missing owners")
+
+        gaps = await GapDetector().detect(entities, git_clusters, annotations, contexts)
+        stage_4 = {"stage": "4", "label": "Gap Detection", "gaps": len(gaps)}
+        stages_summary.append(stage_4)
+        await progress("4", "✅", f"Detected {len(gaps)} gaps")
+
+        # ── Stage 5: Graph population — POST to Java backend ─────────────────
+        # Java owns all DB writes. The AI service sends back structured results;
+        # Java applies them through its service layer (RLS, caching, audit).
+        await progress("5", "💾", "Graph population — posting results to Java backend for persistence")
+
+        # Reuse the graph client we already created for the freshness check
+        graph_client = _graph_client_for_freshness
+
+        # Serialize FunctionContexts so Java can store them in node metadata.
+        # Java's PipelineService reads "intentContexts" from pipeline_meta and
+        # writes each one into the matching node's JSONB metadata under "functionContext".
+        serialized_intent = {
+            eid: function_context_to_dict(ctx)
+            for eid, ctx in intent_contexts.items()
+        }
+
+        pipeline_meta = {
+            "code_units_found":  len(focal_context.code_units),
+            "git_commits_found": git_commits,
+            "files_traced":      files_traced,
+            "stages_summary":    stages_summary,
+            "progress_logs":     log_entries if 'log_entries' in dir() else [],
+            "intent_contexts":   serialized_intent,    # ADR-003: FunctionContext per entity
+            "memory_tokens":     serialized_tokens,    # ADR-004: T0/T1 per entity
+        }
+
+        await graph_client.flush(
+            entities=entities,
+            relationships=relationships,
+            contexts=contexts,
+            pipeline_meta=pipeline_meta,
+            artifacts=pipeline_artifacts,
+            intent_contexts=serialized_intent,
+        )
+
+        stage_5 = {"stage": "5", "label": "Graph Population", "status": "done"}
+        stages_summary.append(stage_5)
+        await progress(
+            "5", "🎉",
+            "Pipeline complete — results posted to Java backend",
+            entity_count=len(entities),
+            edge_count=len(relationships),
+            gap_count=len(gaps),
+        )
+
+        # ── ADR-0008: Trigger TypeScript structural extraction ─────────────
+        # After LLM pipeline completes, kick off the Neo4j structural extractor
+        # so that typed graph nodes complement the Postgres semantic context.
+        # Failure is non-fatal — the LLM pipeline result is already persisted.
+        repo_path_for_structural = (
+            request.repos[0].local_path or request.repos[0].url
+            if request.repos else ""
+        )
+        if repo_path_for_structural:
+            await _trigger_structural_extraction(
+                repo_path=repo_path_for_structural,
+                scope=request.workspace_id,  # workspace_id doubles as graph scope
+                commit_sha=commitSha if 'commitSha' in dir() else "HEAD",
+            )
+
+        # ── Usage summary ─────────────────────────────────────────────────────
+        _run_tracker.log_summary(log, label=request.endpoint_path)
+
+        log.info(
+            "━━━ Pipeline complete ━━━",
+            job_id=job_id,
+            endpoint=request.endpoint_path,
+            entities=len(entities),
+            edges=len(relationships),
+            gaps=len(gaps),
+            code_units=len(focal_context.code_units),
+            git_commits=git_commits,
+        )
+
+        # Pipeline completed successfully — clear checkpoint so next run is fresh
+        _checkpoint_clear(request)
+
+        return PipelineResult(
+            job_id=job_id,
+            workspace_id=request.workspace_id,
+            endpoint_path=request.endpoint_path,
+            entity_count=len(entities),
+            edge_count=len(relationships),
+            gap_count=len(gaps),
+            code_units_found=len(focal_context.code_units),
+            git_commits_found=git_commits,
+            files_traced=files_traced,
+            stages_summary=stages_summary,
+        )
+
+    except Exception as e:
+        _run_tracker.log_summary(log, label=f"{request.endpoint_path} [FAILED]")
+        log.error("━━━ Pipeline failed ━━━", job_id=job_id, error=str(e), exc_info=True)
+        await progress("error", "❌", f"Pipeline failed: {e}", error=str(e))
+        return PipelineResult(
+            job_id=job_id, workspace_id=request.workspace_id,
+            endpoint_path=request.endpoint_path,
+            entity_count=0, edge_count=0, gap_count=0,
+            status="failed", error=str(e),
+            stages_summary=stages_summary,
+        )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _trigger_structural_extraction(
+    repo_path: str,
+    scope: str,
+    commit_sha: str = "HEAD",
+) -> None:
+    """
+    After LLM pipeline completes, trigger the TypeScript structural extractor
+    via the cb-api service. This populates Neo4j with typed structural nodes
+    that complement the LLM-extracted semantic context in Postgres.
+
+    See ADR-0008: integration bridge.
+
+    Never raises — structural extraction failure must not abort the LLM pipeline.
+    The 300 s timeout is generous because large monorepos can take a while.
+    """
+    url = f"{CB_API_URL}/extract"
+    payload = {
+        "repoPath":  repo_path,
+        "scope":     scope,
+        "commitSha": commit_sha,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            log.info(
+                "Structural extraction triggered successfully (ADR-0008)",
+                scope=scope,
+                repo_path=repo_path,
+                status=resp.status_code,
+            )
+    except httpx.HTTPStatusError as exc:
+        log.warning(
+            "Structural extraction returned non-2xx status (non-fatal)",
+            scope=scope,
+            status=exc.response.status_code,
+            detail=exc.response.text[:200],
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Structural extraction could not be triggered (non-fatal) — "
+            "Neo4j graph may be out of sync until next cb index run",
+            scope=scope,
+            error=str(exc),
+        )
+
+
+def _dedup_relationships(rels: list) -> list:
+    """
+    Deduplicate relationships by (from_entity, edge_type, to_entity).
+    First occurrence wins (structural edges come first → they win ties).
+    """
+    seen: set[tuple] = set()
+    out: list = []
+    for r in rels:
+        key = (r.from_entity, r.edge_type, r.to_entity)
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def _repo_dict(r) -> dict:
+    """
+    Normalise a RepoConfig into the plain dict that collectors expect.
+    Per-repo branch is preserved so GitCollector can use the right branch
+    for each repo independently.
+    """
+    git_path = r.local_path or r.url
+    github_url = (
+        r.url
+        if r.url and r.url.startswith(("http://", "https://", "git@"))
+        else None
+    )
+    return {
+        "path": git_path,
+        "type": r.type.value,
+        "github_url": github_url,
+        "branch": r.branch,      # per-repo branch — used by GitCollector
+    }
+
+
+# ── Stage 1.4 helpers ─────────────────────────────────────────────────────────
+
+def _llm_suggest_expansions(
+    entities: list,
+    traced_units: list,
+) -> list[str]:
+    """
+    Codebase-agnostic dependency expansion: find every custom class name that
+    appears in the extracted entity graph but was never visited as a code unit.
+
+    Works for ANY naming convention — PlanFinder, NiqEngine, MetricsAggregator,
+    DataFetcher, QueryHandler — not just *Repository or *Service suffixes.
+
+    Strategy (no extra LLM call — uses already-extracted signal):
+      1. Collect ALL CamelCase type references from entity snippets/signatures.
+      2. Remove standard library types (java.*, javax.*, Spring, Lombok,
+         Python builtins, TypeScript lib types, common primitives).
+      3. Remove class names whose source files are already in traced_units.
+      4. Score by how likely the type is a collaborator (Impl=3,
+         known-data-access-suffix=2, everything-else=1).
+      5. Return top candidates for the caller to resolve + visit.
+    """
+    import re as _re
+
+    # ── 1. Build the "already visited" set ────────────────────────────────────
+    already_visited: set[str] = set()
+    for unit in traced_units:
+        if unit.class_name:
+            already_visited.add(unit.class_name)
+        fp = str(unit.file_path or "")
+        if fp:
+            already_visited.add(_Path(fp).stem)
+
+    # ── 2. Standard-library / framework types to ignore ───────────────────────
+    # These appear frequently in code but live in external packages — there is
+    # no source file in the repo for them.
+    _STD_PREFIXES = (
+        # Java / Kotlin stdlib & common frameworks
+        "String", "Integer", "Long", "Double", "Float", "Boolean", "Byte",
+        "Short", "Character", "Object", "Number", "Void", "Class",
+        "List", "Map", "Set", "Collection", "Optional", "Stream",
+        "ArrayList", "HashMap", "HashSet", "LinkedList", "LinkedHashMap",
+        "Iterator", "Iterable", "Comparator", "Comparable",
+        "Thread", "Runnable", "Callable", "Future", "CompletableFuture",
+        "Exception", "RuntimeException", "Error", "Throwable",
+        "Override", "Deprecated", "SuppressWarnings", "FunctionalInterface",
+        "System", "Math", "Arrays", "Collections", "Objects",
+        # Spring / Jakarta / Lombok
+        "Autowired", "Component", "Service", "Repository", "Controller",
+        "RestController", "RequestMapping", "GetMapping", "PostMapping",
+        "PutMapping", "DeleteMapping", "PathVariable", "RequestBody",
+        "ResponseEntity", "HttpStatus", "Bean", "Configuration",
+        "Transactional", "Slf4j", "Data", "Builder", "AllArgsConstructor",
+        "NoArgsConstructor", "RequiredArgsConstructor", "Value", "Getter",
+        "Setter", "ToString", "EqualsAndHashCode",
+        "EntityManager", "JpaRepository", "CrudRepository",
+        "PagingAndSortingRepository", "Pageable", "Page", "Sort",
+        "Entity", "Table", "Column", "Id", "GeneratedValue",
+        "Column", "OneToMany", "ManyToOne", "ManyToMany", "OneToOne",
+        "JoinColumn", "FetchType", "CascadeType",
+        # Python builtins / typing
+        "None", "True", "False", "Type", "Any", "Dict", "Tuple",
+        "Union", "Literal", "ClassVar", "Final", "Protocol",
+        "BaseModel", "Field", "validator", "root_validator",
+        "Enum", "IntEnum", "StrEnum",
+        # TypeScript / JS lib
+        "Promise", "Array", "Record", "Partial", "Required", "Readonly",
+        "Pick", "Omit", "Exclude", "Extract", "NonNullable",
+        "ReturnType", "InstanceType", "Parameters", "ConstructorParameters",
+        "Date", "RegExp", "Error", "TypeError", "RangeError",
+        "HTMLElement", "Event", "MouseEvent", "KeyboardEvent",
+        "React", "Component", "useState", "useEffect", "useContext",
+        "Props", "State", "FC", "ReactNode", "JSX",
+        # Go stdlib
+        "Context", "Error", "WaitGroup", "Mutex", "RWMutex",
+        # Generic annotation / metadata tokens
+        "Inject", "Named", "Singleton", "Prototype", "Scope",
+        "NotNull", "NonNull", "Nullable", "Valid", "Size", "Min", "Max",
+    )
+    _STD_SET = frozenset(_STD_PREFIXES)
+
+    # Also skip single-letter type params (T, E, K, V, R, etc.)
+    _TYPE_PARAM = _re.compile(r'^[A-Z]$')
+
+    # ── 2b. Leaf types that carry no call-chain value ─────────────────────────
+    # DTOs, request/response wrappers, JPA entities, config beans, exception
+    # classes — these have fields but no injected collaborators, so expanding
+    # them yields no additional queries or business logic.  Skip them.
+    _LEAF_SUFFIX = frozenset((
+        "DTO", "Dto", "Request", "Response", "Payload", "Wrapper",
+        "Entity", "Model", "Config", "Configuration", "Properties",
+        "Exception", "Error", "Event", "Message",
+        "Enum", "Constants", "Utils", "Util", "Helper", "Helpers",
+        "Mapper", "Converter", "Builder",
+    ))
+
+    def _is_leaf(name: str) -> bool:
+        for s in _LEAF_SUFFIX:
+            if name.endswith(s):
+                return True
+        return False
+
+    # ── 3. Extract ALL CamelCase identifiers from entity text ─────────────────
+    # Matches bare class names: MyClass, PlanFinder, NiqEngine, etc.
+    # Also picks up qualified refs like foo.BarBaz (takes "BarBaz").
+    _CAMEL = _re.compile(r'\b([A-Z][a-zA-Z0-9]{2,})\b')
+
+    candidates: dict[str, int] = {}   # name → score
+
+    for entity in entities:
+        text_sources = [
+            entity.name or "",
+            entity.code_snippet or "",
+            entity.signature or "",
+            getattr(entity, "structural_purpose", "") or "",
+            getattr(entity, "description", "") or "",
+        ]
+        for text in text_sources:
+            for m in _CAMEL.finditer(text):
+                name = m.group(1)
+                if (
+                    name in already_visited
+                    or name in _STD_SET
+                    or _TYPE_PARAM.match(name)
+                    or _is_leaf(name)
+                ):
+                    continue
+                # Score: Impl suffix = likely has real implementation
+                #        known data-access / business suffix = high value
+                #        anything else = worth checking (score 1)
+                _HIGH_SUFFIX = (
+                    "Repository", "DAO", "Store", "Persistence",
+                    "Client", "Gateway", "Adapter", "Connector",
+                    "Provider", "Finder", "Fetcher", "Loader",
+                    "Engine", "Calculator", "Processor", "Handler",
+                    "Aggregator", "Resolver", "Dispatcher",
+                )
+                score = (
+                    3 if name.endswith("Impl") else
+                    2 if any(name.endswith(s) for s in _HIGH_SUFFIX) else
+                    1
+                )
+                candidates[name] = max(candidates.get(name, 0), score)
+
+    # ── 4. Rank and return ────────────────────────────────────────────────────
+    # Primary sort: score desc.  Secondary: longer names first (more specific).
+    ranked = sorted(
+        candidates,
+        key=lambda n: (candidates[n], len(n)),
+        reverse=True,
+    )
+    return ranked[:8]   # caller caps at 3 expansions, but surface 8 so it can skip already-resolved ones
+
+
+def _resolve_class_to_file(class_name: str, repos: list) -> "_Path | None":
+    """
+    Find the source file that defines `class_name` across all repo roots.
+
+    Search order:
+      1. {class_name}Impl.{ext}  — concrete implementation (has the real logic)
+      2. {class_name}.{ext}      — exact match (could be abstract class or interface)
+
+    Works for any naming convention — no suffix filtering applied.
+    """
+    exts = (".java", ".kt", ".py", ".ts", ".tsx", ".go", ".rb", ".cs")
+
+    impl_candidates: list[_Path] = []
+    exact_candidates: list[_Path] = []
+
+    for repo_cfg in repos:
+        root = repo_cfg.local_path
+        if not root:
+            continue
+        root_path = _Path(root)
+        for ext in exts:
+            # Try Impl variant first (higher signal)
+            if not class_name.endswith("Impl"):
+                for match in root_path.rglob(f"{class_name}Impl{ext}"):
+                    impl_candidates.append(match)
+            # Exact match
+            for match in root_path.rglob(f"{class_name}{ext}"):
+                exact_candidates.append(match)
+
+    # Impl wins, then exact, then nothing
+    if impl_candidates:
+        return impl_candidates[0]
+    if exact_candidates:
+        # Among exact matches, prefer one that has "Impl" anywhere in its stem
+        for c in exact_candidates:
+            if "Impl" in c.stem:
+                return c
+        return exact_candidates[0]
+    return None
+
+
+# ── Pipeline checkpoint helpers ───────────────────────────────────────────────
+#
+# Checkpoints are stored as JSON files in /tmp so they survive process restarts
+# but are cleaned up by the OS on reboot.  The key is a stable hash of the
+# pipeline request so the same endpoint retried an hour later hits the same
+# checkpoint.  Checkpoints expire after 24 hours so stale data never poisons
+# a fresh run.
+
+import hashlib as _hashlib
+import json as _json_mod
+import time as _time_mod
+
+
+def _checkpoint_key(request) -> str:
+    raw = f"{request.workspace_id}::{request.http_method}::{request.endpoint_path}"
+    return _hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def _checkpoint_path(request) -> "_Path":
+    return _Path(f"/tmp/cb_checkpoint_{_checkpoint_key(request)}.json")
+
+
+def _checkpoint_save(
+    request,
+    entities: list,
+    structural_rels: list,
+    focal_context,
+    stage_reached: str = "1.6",
+    job_id: str | None = None,
+) -> None:
+    """
+    Serialise pipeline progress to /tmp so a retry can resume where it left off.
+
+    Saves:
+      - entities extracted so far (may be partial if called mid-Stage-1)
+      - structural_rels (empty list if called before Stage 1.6)
+      - focal_context.code_units so code tracing is skipped on resume
+      - stage_reached: highest stage completed ("1", "1.5", "1.6")
+
+    Called:
+      - After each sequential extraction unit (stage_reached="1", partial)
+      - After intent synthesis (stage_reached="1.5")
+      - After import-graph analysis (stage_reached="1.6", full Stage 1)
+    """
+    try:
+        import dataclasses as _dc
+
+        code_units_raw = []
+        if focal_context is not None:
+            for u in getattr(focal_context, "code_units", []):
+                try:
+                    code_units_raw.append(_dc.asdict(u) if _dc.is_dataclass(u) else u.__dict__)
+                except Exception:
+                    pass
+
+        payload = {
+            "saved_at":      _time_mod.time(),
+            "endpoint":      request.endpoint_path,
+            # Store the canonical job_id so checkpoint resumes post back to the
+            # same Java job rather than an empty/mismatched ID.
+            "job_id":        job_id or getattr(request, "job_id", None) or "",
+            "stage_reached": stage_reached,
+            "entities":      [_dc.asdict(e) for e in entities],
+            "structural_rels": [
+                (r if isinstance(r, dict) else _dc.asdict(r))
+                for r in structural_rels
+            ],
+            "code_units":    code_units_raw,
+        }
+        _checkpoint_path(request).write_text(_json_mod.dumps(payload))
+        log.debug(
+            "Checkpoint saved",
+            stage=stage_reached,
+            entities=len(entities),
+            code_units=len(code_units_raw),
+            path=str(_checkpoint_path(request)),
+        )
+    except Exception as exc:
+        log.debug("Checkpoint save failed (non-fatal)", error=str(exc))
+
+
+def _checkpoint_load(request) -> "dict | None":
+    """
+    Load a checkpoint if it exists and is < 24 hours old.
+    Returns dict with keys: entities, structural_rels, code_units, stage_reached.
+    Returns None if no valid checkpoint exists.
+    """
+    try:
+        p = _checkpoint_path(request)
+        if not p.exists():
+            return None
+        payload = _json_mod.loads(p.read_text())
+        age_hours = (_time_mod.time() - payload.get("saved_at", 0)) / 3600
+        if age_hours > 24:
+            p.unlink(missing_ok=True)
+            log.debug("Checkpoint expired", age_hours=round(age_hours, 1))
+            return None
+
+        from companybrain.models.entities import ExtractedEntity as _EE
+        from companybrain.collectors.code_tracer import CodeUnit as _CU
+        import dataclasses as _dc
+
+        # Restore entities
+        raw_entities = payload.get("entities", [])
+        valid_ee_fields = {f.name for f in _dc.fields(_EE)}
+        entities = [
+            _EE(**{k: v for k, v in e.items() if k in valid_ee_fields})
+            for e in raw_entities
+        ]
+
+        # Restore code_units
+        raw_units = payload.get("code_units", [])
+        valid_cu_fields = {f.name for f in _dc.fields(_CU)}
+        code_units = [
+            _CU(**{k: v for k, v in u.items() if k in valid_cu_fields})
+            for u in raw_units
+        ]
+
+        structural_rels  = payload.get("structural_rels", [])
+        stage_reached    = payload.get("stage_reached", "1.6")
+        checkpoint_job_id = payload.get("job_id", "")
+
+        log.info(
+            "Checkpoint loaded",
+            stage_reached=stage_reached,
+            age_hours=round(age_hours, 2),
+            entities=len(entities),
+            code_units=len(code_units),
+            endpoint=payload.get("endpoint"),
+            job_id=checkpoint_job_id or "(none)",
+        )
+        return {
+            "entities":        entities,
+            "structural_rels": structural_rels,
+            "code_units":      code_units,
+            "stage_reached":   stage_reached,
+            # Restored so the pipeline posts back to the same Java job on resume.
+            "job_id":          checkpoint_job_id,
+        }
+    except Exception as exc:
+        log.debug("Checkpoint load failed (non-fatal)", error=str(exc))
+        return None
+
+
+def _checkpoint_clear(request) -> None:
+    """Delete the checkpoint for a request (call after successful pipeline completion)."""
+    try:
+        _checkpoint_path(request).unlink(missing_ok=True)
+    except Exception:
+        pass

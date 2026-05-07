@@ -1,0 +1,12 @@
+{
+  "name": "@company-brain/extractor-framework-openapi",
+  "version": "0.1.0", "private": true, "type": "module",
+  "main": "./src/index.ts", "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc --noEmit" },
+  "dependencies": {
+    "@company-brain/schema": "workspace:*",
+    "@company-brain/graph": "workspace:*",
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": { "typescript": "^5.4.0" }
+}

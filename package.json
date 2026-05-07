@@ -1,0 +1,20 @@
+{
+  "name": "company-brain",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "packages/extractors/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build":     "bun run --filter '*' build",
+    "test":      "bun run --filter '*' test",
+    "typecheck": "bun run --filter '*' typecheck",
+    "cb":        "bun run apps/cli/src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.4.0",
+    "vitest":     "^1.6.0"
+  }
+}

@@ -1,0 +1,595 @@
+# Company Brain — Graph Schema Source of Truth
+# Version: 0.1.0
+#
+# This YAML file is the canonical definition of all node types, edge types,
+# and their required/optional properties.
+#
+# Codegen: `bun run codegen` in packages/schema/ generates:
+#   - src/generated/node-types.ts  (TypeScript enums + type guards)
+#   - src/generated/edge-types.ts
+#   - src/generated/validators.ts  (Zod schemas for NodeEnvelope + EdgeEnvelope)
+#
+# Never hand-edit the generated files. Edit this YAML and re-run codegen.
+#
+# Derivation confidence rubric (ADR-0001):
+#   1.0  — ast / lsp (deterministic from parser)
+#   0.95 — framework_parser (heuristic, high confidence)
+#   0.85 — static_analysis (inferred from patterns)
+#   0.70 — llm_with_evidence (LLM + citation)
+#   0.50 — llm_inference_only (LLM without grounding)
+
+schema_version: "0.1.0"
+
+# ── Confidence levels (referenced by extractors) ──────────────────────────────
+confidence_rubric:
+  ast: 1.0
+  lsp: 1.0
+  framework_parser: 0.95
+  config: 0.95
+  static_analysis: 0.85
+  llm_with_evidence: 0.70
+  llm_inference_only: 0.50
+  human: 1.0
+  api: 0.95
+
+# ── Node Types ────────────────────────────────────────────────────────────────
+# Each type is a label in Neo4j. Every node also gets the 'CBNode' label.
+# Required common properties (NodeEnvelope) are NOT repeated here — they
+# are enforced by the GraphClient at write time.
+#
+# 'attributes' lists TYPE-SPECIFIC properties beyond the common envelope.
+# 'required_attributes' are enforced at write time (GraphClient throws if missing).
+
+node_types:
+
+  # ── VCS & Project Structure ──────────────────────────────────────────────
+  - name: Organization
+    description: A GitHub org, GitLab group, or Bitbucket workspace.
+    attributes:
+      - { name: vcs_host,     type: string,   required: true }
+      - { name: url,          type: string,   required: true }
+    extractor: git
+
+  - name: Repository
+    description: A single git repository.
+    attributes:
+      - { name: default_branch,    type: string,   required: true }
+      - { name: vcs_url,           type: string,   required: true }
+      - { name: primary_language,  type: string,   required: false }
+      - { name: license,           type: string,   required: false }
+      - { name: languages,         type: "string[]", required: false }
+    extractor: git
+
+  - name: Branch
+    description: A git branch.
+    attributes:
+      - { name: head_commit,   type: string, required: true }
+      - { name: base_branch,   type: string, required: false }
+      - { name: is_default,    type: boolean, required: false }
+    extractor: git
+
+  - name: Commit
+    description: A single git commit.
+    attributes:
+      - { name: sha,           type: string, required: true }
+      - { name: parent_shas,   type: "string[]", required: true }
+      - { name: author_name,   type: string, required: false }
+      - { name: author_email,  type: string, required: false }
+      - { name: message,       type: string, required: true }
+      - { name: committed_at,  type: string, required: true }  # ISO-8601
+      - { name: tree_sha,      type: string, required: false }
+    extractor: git
+
+  - name: PullRequest
+    description: A pull request / merge request.
+    attributes:
+      - { name: number,         type: number,   required: true }
+      - { name: title,          type: string,   required: true }
+      - { name: body,           type: string,   required: false }
+      - { name: state,          type: string,   required: true }  # open|closed|merged
+      - { name: base_branch,    type: string,   required: true }
+      - { name: head_branch,    type: string,   required: true }
+      - { name: merged_commit,  type: string,   required: false }
+      - { name: labels,         type: "string[]", required: false }
+      - { name: draft,          type: boolean,  required: false }
+    extractor: git
+
+  # ── File System ──────────────────────────────────────────────────────────
+  - name: Directory
+    description: A directory in the repository.
+    attributes:
+      - { name: path,   type: string, required: true }
+    extractor: core-ts
+
+  - name: File
+    description: A source file.
+    attributes:
+      - { name: path,          type: string, required: true }
+      - { name: language,      type: string, required: false }  # typescript|python|java|go|...
+      - { name: size_bytes,    type: number, required: false }
+      - { name: content_hash,  type: string, required: false }  # sha256
+      - { name: line_count,    type: number, required: false }
+    extractor: core-ts
+
+  # ── Module System ────────────────────────────────────────────────────────
+  - name: Module
+    description: A TypeScript/Python/Go module.
+    attributes:
+      - { name: kind,          type: string, required: true }   # esm|cjs|ts-namespace|python|go-pkg
+      - { name: file_path,     type: string, required: true }
+    extractor: core-ts
+
+  - name: ExternalDependency
+    description: An npm/pip/go dependency declared in a manifest.
+    attributes:
+      - { name: package_name,      type: string, required: true }
+      - { name: registry,          type: string, required: false }
+      - { name: declared_version,  type: string, required: false }
+      - { name: resolved_version,  type: string, required: false }
+      - { name: is_dev,            type: boolean, required: false }
+    extractor: core-ts
+
+  # ── Type System ──────────────────────────────────────────────────────────
+  - name: Interface
+    description: A TypeScript interface or abstract type declaration.
+    attributes:
+      - { name: generics,      type: "string[]", required: false }
+      - { name: definition_text, type: string, required: false }
+    extractor: core-ts
+
+  - name: TypeAlias
+    description: A TypeScript type alias.
+    attributes:
+      - { name: target_type,   type: string, required: false }
+    extractor: core-ts
+
+  # ── Code Structure ───────────────────────────────────────────────────────
+  - name: Class
+    description: A class declaration.
+    attributes:
+      - { name: generics,      type: "string[]", required: false }
+      - { name: is_abstract,   type: boolean,  required: false }
+      - { name: modifiers,     type: "string[]", required: false }
+      - { name: docstring,     type: string,   required: false }
+    extractor: core-ts
+
+  - name: Function
+    description: A top-level function or standalone arrow function.
+    attributes:
+      - { name: signature,     type: string, required: false }
+      - { name: is_async,      type: boolean, required: false }
+      - { name: is_generator,  type: boolean, required: false }
+      - { name: line_start,    type: number, required: false }
+      - { name: line_end,      type: number, required: false }
+      - { name: body_hash,     type: string, required: false }
+      - { name: docstring,     type: string, required: false }
+    extractor: core-ts
+
+  - name: Method
+    description: A method on a class.
+    attributes:
+      - { name: signature,     type: string, required: false }
+      - { name: is_async,      type: boolean, required: false }
+      - { name: is_static,     type: boolean, required: false }
+      - { name: visibility,    type: string, required: false }   # public|protected|private
+      - { name: line_start,    type: number, required: false }
+      - { name: line_end,      type: number, required: false }
+      - { name: body_hash,     type: string, required: false }
+    extractor: core-ts
+
+  - name: Constant
+    description: A top-level constant or enum value.
+    attributes:
+      - { name: value_text,    type: string, required: false }
+      - { name: inferred_type, type: string, required: false }
+      - { name: exported,      type: boolean, required: false }
+    extractor: core-ts
+
+  - name: Decorator
+    description: A decorator or annotation applied to a class, method, or property.
+    attributes:
+      - { name: args_text,     type: string, required: false }
+      - { name: target_kind,   type: string, required: false }   # class|method|property
+    extractor: core-ts
+
+  # ── Frontend (UI) ────────────────────────────────────────────────────────
+  - name: Route
+    description: A URL route (file-based or app-router, or framework-defined).
+    attributes:
+      - { name: url_pattern,      type: string,   required: true }
+      - { name: http_method,      type: string,   required: false }
+      - { name: dynamic_segments, type: "string[]", required: false }
+    extractor: framework-next
+
+  - name: Screen
+    description: A screen or page rendered at a route.
+    attributes:
+      - { name: ssr,            type: boolean, required: false }
+      - { name: ssg,            type: boolean, required: false }
+      - { name: permissions,    type: "string[]", required: false }
+    extractor: framework-next
+
+  - name: Component
+    description: A React/Vue/Svelte/Angular component.
+    attributes:
+      - { name: is_server_component,  type: boolean, required: false }
+      - { name: is_client_component,  type: boolean, required: false }
+      - { name: exported,             type: boolean, required: false }
+    extractor: framework-next
+
+  - name: APIRoute
+    description: A Next.js API route handler (app/router route.ts or pages/api/*.ts).
+    attributes:
+      - { name: http_methods,     type: "string[]", required: true }   # ["GET","POST",...]
+      - { name: path_pattern,     type: string,     required: true }   # normalized route path
+      - { name: dynamic_segments, type: "string[]", required: false }
+      - { name: is_catch_all,     type: boolean,    required: false }
+      - { name: router_type,      type: string,     required: true }   # app|pages
+    extractor: framework-next
+
+  - name: Layout
+    description: A Next.js layout component wrapping a route segment.
+    attributes:
+      - { name: path_pattern,    type: string,  required: true }
+      - { name: is_root,         type: boolean, required: false }
+    extractor: framework-next
+
+  # ── Backend ──────────────────────────────────────────────────────────────
+  - name: HTTPEndpoint
+    description: An HTTP endpoint exposed by a backend service.
+    attributes:
+      - { name: http_method,    type: string, required: true }
+      - { name: path_pattern,   type: string, required: true }
+      - { name: auth_required,  type: boolean, required: false }
+      - { name: deprecated,     type: boolean, required: false }
+    extractor: core-ts
+
+  # ── Database ─────────────────────────────────────────────────────────────
+  - name: DatabaseSchema
+    description: A Prisma schema file or SQL schema definition.
+    attributes:
+      - { name: provider,      type: string, required: false }  # postgresql|mysql|sqlite
+    extractor: framework-prisma
+
+  - name: DatabaseTable
+    description: A database table or Prisma model.
+    attributes:
+      - { name: schema_name,   type: string, required: false }
+    extractor: framework-prisma
+
+  - name: DatabaseColumn
+    description: A column in a database table.
+    attributes:
+      - { name: data_type,     type: string, required: false }
+      - { name: nullable,      type: boolean, required: false }
+      - { name: is_primary_key, type: boolean, required: false }
+      - { name: is_foreign_key, type: boolean, required: false }
+      - { name: default_value, type: string, required: false }
+    extractor: framework-prisma
+
+  - name: DatabaseIndex
+    description: An index on a database table.
+    attributes:
+      - { name: fields,       type: "string[]", required: true }
+      - { name: is_unique,    type: boolean,    required: false }
+      - { name: index_type,   type: string,     required: false }   # btree|hash|gin|gist
+    extractor: framework-prisma
+
+  - name: DatabaseEnum
+    description: An enum type defined in a Prisma schema or SQL enum.
+    attributes:
+      - { name: values,       type: "string[]", required: true }
+    extractor: framework-prisma
+
+  # ── Contracts ────────────────────────────────────────────────────────────
+  - name: ContractDocument
+    description: An OpenAPI spec, GraphQL SDL, or Protobuf file.
+    attributes:
+      - { name: format,        type: string, required: true }   # openapi|graphql|protobuf
+      - { name: spec_version,  type: string, required: false }  # e.g. "3.1.0"
+    extractor: framework-openapi
+
+  - name: ContractEndpoint
+    description: A single operation in an OpenAPI or GraphQL contract.
+    attributes:
+      - { name: http_method,    type: string, required: false }
+      - { name: path,           type: string, required: false }
+      - { name: operation_id,   type: string, required: false }
+      - { name: summary,        type: string, required: false }
+      - { name: tags,           type: "string[]", required: false }
+      - { name: deprecated,     type: boolean, required: false }
+    extractor: framework-openapi
+
+  - name: ContractRequestSchema
+    description: The request body schema for a contract endpoint.
+    attributes:
+      - { name: content_type,   type: string, required: false }   # application/json
+      - { name: schema_json,    type: string, required: false }   # JSON-stringified schema
+      - { name: required,       type: boolean, required: false }
+    extractor: framework-openapi
+
+  - name: ContractResponseSchema
+    description: A response schema for a specific status code of a contract endpoint.
+    attributes:
+      - { name: status_code,    type: string,  required: true }   # "200", "404", "default"
+      - { name: content_type,   type: string,  required: false }
+      - { name: schema_json,    type: string,  required: false }  # JSON-stringified schema
+      - { name: description,    type: string,  required: false }
+    extractor: framework-openapi
+
+  # ── Drift Detection ──────────────────────────────────────────────────────
+  - name: DriftSignal
+    description: >
+      Detected divergence between an implementation node and a contract node.
+    attributes:
+      - { name: severity,             type: string,     required: true }   # breaking|warning|info
+      - { name: description,          type: string,     required: true }
+      - { name: implementation_urn,   type: string,     required: true }
+      - { name: contract_urn,         type: string,     required: true }
+      - { name: detected_fields,      type: "string[]", required: false }
+    extractor: drift-detector
+
+  # ── Business Context ─────────────────────────────────────────────────────
+  - name: PRDSection
+    description: A section of a Product Requirements Document.
+    attributes:
+      - { name: heading,       type: string, required: true }
+      - { name: body,          type: string, required: false }
+    extractor: docs-md
+
+  - name: ADR
+    description: An Architecture Decision Record.
+    attributes:
+      - { name: status,        type: string, required: true }   # proposed|accepted|superseded|deprecated
+      - { name: decision,      type: string, required: false }
+      - { name: rationale,     type: string, required: false }
+    extractor: docs-md
+
+  - name: Ticket
+    description: A Linear, Jira, or GitHub issue.
+    attributes:
+      - { name: external_id,   type: string, required: true }   # e.g. "LIN-4821"
+      - { name: title,         type: string, required: true }
+      - { name: state,         type: string, required: false }
+      - { name: assignee,      type: string, required: false }
+      - { name: url,           type: string, required: false }
+    extractor: linear
+
+  - name: GlossaryTerm
+    description: A domain concept defined in the glossary.
+    attributes:
+      - { name: definition,    type: string, required: true }
+      - { name: aliases,       type: "string[]", required: false }
+    extractor: docs-md
+
+  # ── Narrative (LLM/human authored, anchored to graph nodes) ──────────────
+  - name: NarrativeNote
+    description: A human or LLM authored note anchored to a graph entity.
+    attributes:
+      - { name: body,          type: string, required: true }
+      - { name: author_type,   type: string, required: true }   # human|llm
+      - { name: anchor_id,     type: string, required: true }   # URN of the anchored entity
+    extractor: narrative
+
+# ── Edge Types ────────────────────────────────────────────────────────────────
+# Each edge is directed: source → target.
+# 'from' and 'to' are the allowed node type pairs.
+# '*' means any node type.
+
+edge_types:
+
+  # Structural containment
+  - name: contains
+    description: Parent contains child (directory→file, file→module, class→method).
+    from: ["Directory", "File", "Module", "Class"]
+    to:   ["File", "Module", "Class", "Function", "Method", "Constant", "Interface"]
+    cardinality: "1-n"
+
+  - name: declared_in
+    description: Symbol is declared in file.
+    from: ["Function", "Class", "Interface", "TypeAlias", "Constant"]
+    to:   ["File"]
+    cardinality: "n-1"
+
+  # Dependencies
+  - name: imports
+    description: Source imports from target.
+    from: ["File", "Module"]
+    to:   ["File", "Module", "ExternalDependency"]
+    cardinality: "n-n"
+
+  - name: calls
+    description: Caller invokes callee.
+    from: ["Function", "Method"]
+    to:   ["Function", "Method"]
+    cardinality: "n-n"
+
+  - name: extends
+    description: Class extends / interface extends interface.
+    from: ["Class", "Interface"]
+    to:   ["Class", "Interface"]
+    cardinality: "n-n"
+
+  - name: implements
+    description: Class implements interface.
+    from: ["Class"]
+    to:   ["Interface"]
+    cardinality: "n-n"
+
+  # Frontend graph
+  - name: renders
+    description: Screen renders component.
+    from: ["Screen", "Component"]
+    to:   ["Component"]
+    cardinality: "n-n"
+
+  - name: routes_to
+    description: Route resolves to screen.
+    from: ["Route"]
+    to:   ["Screen"]
+    cardinality: "n-1"
+
+  - name: child_of
+    description: Layout or screen is nested under a parent layout.
+    from: ["Screen", "Layout", "APIRoute"]
+    to:   ["Layout"]
+    cardinality: "n-1"
+
+  - name: implemented_by
+    description: Framework node (APIRoute, Screen, DatabaseTable) is implemented by a code symbol.
+    from: ["APIRoute", "Screen", "DatabaseTable"]
+    to:   ["Function", "Method", "Class"]
+    cardinality: "n-1"
+
+  # Backend graph
+  - name: handles
+    description: Function/method handles HTTP endpoint.
+    from: ["Function", "Method"]
+    to:   ["HTTPEndpoint"]
+    cardinality: "n-1"
+
+  - name: calls_endpoint
+    description: Client code calls an HTTP endpoint.
+    from: ["Function", "Method", "Component"]
+    to:   ["HTTPEndpoint"]
+    cardinality: "n-n"
+
+  # Database
+  - name: reads_table
+    description: Function/method reads from database table.
+    from: ["Function", "Method"]
+    to:   ["DatabaseTable"]
+    cardinality: "n-n"
+
+  - name: writes_table
+    description: Function/method writes to database table.
+    from: ["Function", "Method"]
+    to:   ["DatabaseTable"]
+    cardinality: "n-n"
+
+  - name: maps_to_table
+    description: ORM class maps to database table.
+    from: ["Class"]
+    to:   ["DatabaseTable"]
+    cardinality: "1-1"
+
+  - name: has_column
+    description: Table has column.
+    from: ["DatabaseTable"]
+    to:   ["DatabaseColumn"]
+    cardinality: "1-n"
+
+  - name: has_table
+    description: Schema contains table.
+    from: ["DatabaseSchema"]
+    to:   ["DatabaseTable"]
+    cardinality: "1-n"
+
+  - name: has_index
+    description: Table has index.
+    from: ["DatabaseTable"]
+    to:   ["DatabaseIndex"]
+    cardinality: "1-n"
+
+  - name: foreign_key
+    description: Column references another table's column (foreign key constraint).
+    from: ["DatabaseColumn"]
+    to:   ["DatabaseTable"]
+    cardinality: "n-1"
+    attributes:
+      - { name: referenced_field, type: string, required: false }
+      - { name: on_delete,        type: string, required: false }  # cascade|set_null|restrict
+
+  # Contracts
+  - name: implements_contract
+    description: Endpoint implements a contract operation.
+    from: ["HTTPEndpoint", "APIRoute"]
+    to:   ["ContractEndpoint"]
+    cardinality: "n-1"
+
+  - name: defines_endpoint
+    description: Contract document defines an endpoint operation.
+    from: ["ContractDocument"]
+    to:   ["ContractEndpoint"]
+    cardinality: "1-n"
+
+  - name: has_request_schema
+    description: Contract endpoint has a request body schema.
+    from: ["ContractEndpoint"]
+    to:   ["ContractRequestSchema"]
+    cardinality: "1-1"
+
+  - name: has_response_schema
+    description: Contract endpoint has a response schema for a status code.
+    from: ["ContractEndpoint"]
+    to:   ["ContractResponseSchema"]
+    cardinality: "1-n"
+
+  - name: references_schema
+    description: Schema node references another schema via $ref.
+    from: ["ContractRequestSchema", "ContractResponseSchema"]
+    to:   ["ContractRequestSchema", "ContractResponseSchema"]
+    cardinality: "n-n"
+
+  # VCS
+  - name: authored_commit
+    description: Person authored commit.
+    from: ["Commit"]
+    to:   ["*"]
+    cardinality: "n-1"
+
+  - name: merged_in
+    description: PR merged a set of commits.
+    from: ["PullRequest"]
+    to:   ["Commit"]
+    cardinality: "n-n"
+
+  - name: belongs_to_branch
+    description: Commit belongs to branch.
+    from: ["Commit"]
+    to:   ["Branch"]
+    cardinality: "n-n"
+
+  # Business context
+  - name: documented_in
+    description: Node is documented in a PRD section or ADR.
+    from: ["*"]
+    to:   ["PRDSection", "ADR", "NarrativeNote"]
+    cardinality: "n-n"
+
+  - name: decided_in
+    description: Architectural decision governs a code node.
+    from: ["ADR"]
+    to:   ["*"]
+    cardinality: "n-n"
+
+  - name: references_ticket
+    description: PR or commit references a ticket.
+    from: ["PullRequest", "Commit"]
+    to:   ["Ticket"]
+    cardinality: "n-n"
+
+  - name: embodies_concept
+    description: Code node embodies a domain concept.
+    from: ["Function", "Method", "Class", "Constant"]
+    to:   ["GlossaryTerm"]
+    cardinality: "n-n"
+    attributes:
+      - { name: confidence, type: number, required: true }
+
+  # Drift signals
+  - name: has_drift
+    description: Node has a detected drift signal vs. documentation.
+    from: ["*"]
+    to:   ["NarrativeNote"]
+    cardinality: "n-n"
+    attributes:
+      - { name: severity,     type: string, required: true }    # info|warning|critical
+      - { name: drift_kind,   type: string, required: true }    # stale_narrative|missing_contract|...
+      - { name: detected_at_commit, type: string, required: true }
+
+  - name: signals_drift
+    description: DriftSignal points to the implementation or contract node where drift was detected.
+    from: ["DriftSignal"]
+    to:   ["APIRoute", "Function", "Method", "ContractEndpoint"]
+    cardinality: "n-n"

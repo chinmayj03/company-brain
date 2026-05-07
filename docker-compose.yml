@@ -1,0 +1,173 @@
+"""
+Root docker-compose — boots the full Company Brain stack locally.
+
+Services:
+  postgres    PostgreSQL 16 — shared by backend + AI
+  redis       Redis 7 — query cache for backend
+  localstack  AWS SQS emulation — ingestion queue
+  backend     Java Spring Boot REST API (port 8080)
+  ai          Python FastAPI LLM pipeline (port 8000)
+  frontend    React dashboard (port 5173, dev mode)
+"""
+
+version: "3.9"
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: companybrain
+      POSTGRES_USER: companybrain
+      POSTGRES_PASSWORD: companybrain
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U companybrain"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --save 60 1
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  # ── Neo4j (Company Brain knowledge graph) ──────────────────────────
+  neo4j:
+    image: neo4j:5-community
+    ports:
+      - "7474:7474"   # Neo4j Browser (HTTP)
+      - "7687:7687"   # Bolt protocol (driver)
+    environment:
+      NEO4J_AUTH: neo4j/companybrain
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1G
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: sqs,kms
+      DEFAULT_REGION: us-east-1
+    volumes:
+      - localstack_data:/var/lib/localstack
+
+  # ── Application services ────────────────────────────────────────
+  backend:
+    build:
+      context: ./company-brain-backend
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: companybrain
+      DB_USER: companybrain
+      DB_PASSWORD: companybrain
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-in-production}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  ai:
+    build:
+      context: ./company-brain-ai
+    ports:
+      - "8000:8000"
+    environment:
+      ENV: development
+      DATABASE_URL: postgresql+asyncpg://companybrain:companybrain@postgres:5432/companybrain
+      REDIS_URL: redis://redis:6379/0
+      SQS_ENDPOINT: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-in-production}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Integration bridge (ADR-0008) — URLs for cross-service triggers
+      JAVA_API_URL: http://backend:8080
+      CB_API_URL: http://cb-api:8090
+      # LLM model overrides — set to whichever model you have pulled in Ollama
+      # Default BALANCED=deepseek-coder-v2:16b; override here if using a smaller model
+      OLLAMA_MODEL_BALANCED: ${OLLAMA_MODEL_BALANCED:-qwen2.5-coder:7b}
+      OLLAMA_MODEL_FAST: ${OLLAMA_MODEL_FAST:-llama3.1:8b}
+      OLLAMA_MODEL_SYNTHESIS: ${OLLAMA_MODEL_SYNTHESIS:-qwen2.5-coder:7b}
+      OLLAMA_MODEL_REASONING: ${OLLAMA_MODEL_REASONING:-qwen2.5-coder:7b}
+      OLLAMA_MODEL_QUERY: ${OLLAMA_MODEL_QUERY:-qwen2.5-coder:7b}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Company Brain graph API (tRPC tool surface) ─────────────────────────
+  cb-api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    ports:
+      - "8090:8090"
+    environment:
+      PORT: 8090
+      NEO4J_URL:      bolt://neo4j:7687
+      NEO4J_USER:     neo4j
+      NEO4J_PASSWORD: companybrain
+      # Hybrid query support — cb-api can delegate to Java backend for Postgres data
+      JAVA_API_URL:   http://backend:8080
+      TRPC_API_URL:   http://cb-api:8090/trpc
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
+  localstack_data:
+  neo4j_data:
+  neo4j_logs:

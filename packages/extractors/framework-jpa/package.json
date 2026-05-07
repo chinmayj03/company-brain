@@ -1,0 +1,11 @@
+{
+  "name": "@company-brain/extractor-framework-jpa",
+  "version": "0.1.0", "private": true, "type": "module",
+  "main": "./src/index.ts", "exports": { ".": "./src/index.ts" },
+  "scripts": { "typecheck": "tsc --noEmit" },
+  "dependencies": {
+    "@company-brain/schema": "workspace:*",
+    "@company-brain/graph": "workspace:*"
+  },
+  "devDependencies": { "typescript": "^5.4.0" }
+}

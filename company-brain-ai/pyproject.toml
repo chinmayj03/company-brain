@@ -1,0 +1,131 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "company-brain-ai"
+version = "0.1.0"
+description = "Company Brain — LLM extraction pipeline, context collector, and graph query engine"
+requires-python = ">=3.11"
+
+dependencies = [
+    # API — versions loosened to be compatible with mcp[cli]>=1.6.0
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.1",
+    "pydantic>=2.11.0",
+    "pydantic-settings>=2.5.2",
+    "python-multipart>=0.0.9",
+
+    # LLM
+    "anthropic>=0.28.1",
+    "openai>=1.35.3",
+    "tiktoken>=0.7.0",            # Token counting for chunking
+
+    # Git / GitHub
+    "gitpython>=3.1.43",
+    "PyGithub>=2.3.0",
+
+    # HTTP
+    "httpx>=0.27.1",
+
+    # Database (shared with backend for direct graph writes)
+    "asyncpg>=0.29.0",
+    "sqlalchemy[asyncio]>=2.0.31",
+    "alembic>=1.13.1",
+
+    # Queue
+    "celery[sqs]>=5.4.0",
+    "boto3>=1.34.131",            # SQS + KMS
+    "kombu>=5.3.5",
+
+    # Caching
+    "redis>=5.0.7",
+
+    # Data processing
+    "networkx>=3.3",              # In-memory graph for traversal during extraction
+    "numpy>=1.26.4",
+    "pandas>=2.2.2",
+
+    # OpenAPI / schema parsing
+    "pyyaml>=6.0.1",
+    "jsonschema>=4.22.0",
+    "openapi-spec-validator>=0.7.1",
+
+    # Embeddings (pgvector integration)
+    "pgvector>=0.3.2",
+
+    # AST parsing — ADR-006 §2: tree-sitter structural layer (ported from CRG)
+    # tree-sitter-languages provides 23 language grammars in a single package
+    # (same approach used by code-review-graph). Individual packages kept for
+    # environments where tree-sitter-languages is unavailable.
+    # Graceful fallback to regex MethodChunker if grammars are unavailable.
+    "tree-sitter>=0.23.0",
+    "tree-sitter-languages>=1.10.2",  # ADR-006 §2: bundled 23-language grammar pack
+    "tree-sitter-java>=0.23.0",
+    "tree-sitter-python>=0.23.0",
+    "tree-sitter-typescript>=0.23.0",
+    "tree-sitter-go>=0.23.0",         # ADR-006 §2: Go grammar (not in individual packages before)
+
+    # MCP server — ADR-006 Week 3
+    # FastMCP provides the high-level FastAPI-based MCP server with SSE transport.
+    # mcp[cli] includes the mcp command-line tool for local testing.
+    "mcp[cli]>=1.6.0",
+
+    # Neo4j — async driver for dual-write graph path
+    "neo4j>=5.19.0",              # Includes AsyncGraphDatabase and async session support
+
+    # Retrieval stack — hybrid BM25 + dense + rerank (ADR-0010 optimization directive)
+    # qdrant-client[fastembed] bundles FastEmbed, which provides FREE local code embeddings
+    # (jinaai/jina-embeddings-v2-base-code, 768 dims) — no API key required.
+    # voyageai is OPTIONAL: only needed when VOYAGE_API_KEY is set (paid, best quality).
+    # embedder.py auto-selects: voyage → fastembed → ollama → BM25-only.
+    "qdrant-client[fastembed]>=1.9.0",  # vector store + FREE local embeddings via fastembed
+    "rank-bm25>=0.2.2",                  # BM25 lexical retrieval (always free)
+    "sentence-transformers>=3.0.0",      # bge-reranker-v2-m3 cross-encoder reranking (free, local)
+
+    # Observability — Langfuse is SELF-HOSTED (free). Cloud version is paid.
+    # Runs in docker-compose.infra.yml at localhost:3001. No account/key needed for local dev.
+    "langfuse>=2.36.0",                  # LLM call tracking, cost, prompt versions (self-hosted)
+    "opentelemetry-sdk>=1.25.0",         # OTel trace exporter
+    "opentelemetry-api>=1.25.0",
+
+    # Code intelligence
+    "gitignore-parser>=0.1.11",          # Respect .gitignore during file scanning
+    "semgrep>=1.75.0",                   # Pattern matching for annotation/security discovery
+
+    # Utilities
+    "tenacity>=8.3.0",            # Retry logic for LLM calls
+    "structlog>=24.2.0",          # Structured logging
+    "python-jose[cryptography]>=3.3.0",  # JWT validation
+    "cryptography>=42.0.8",       # AES-256-GCM for metadata encryption
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.2.2",
+    "pytest-asyncio==0.23.7",
+    "pytest-httpx==0.30.0",
+    "ruff==0.4.9",
+    "mypy==1.10.0",
+    "factory-boy==3.3.0",
+]
+
+# Install when you have a Voyage AI key for highest-quality code embeddings.
+# pip install -e ".[voyage]"
+voyage = [
+    "voyageai>=0.3.2",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "W", "F", "I", "N", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

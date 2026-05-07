@@ -77,13 +77,17 @@ log = structlog.get_logger(__name__)
 
 # ── Agent constants ────────────────────────────────────────────────────────────
 
-MAX_TURNS      = 18   # max agent iterations before forcing submit
+MAX_TURNS      = 35   # max agent iterations before forcing submit
               # 12 was too tight for Spring hexagonal apps where RepositoryImpl
               # injects multiple secondary repos (plan, provider, etc.) each
               # needing 1-2 turns to read.  18 covers: entry(1) + service(2) +
               # primary repo(2) + impl(2) + up to 4 secondary repos(8) + submit(1).
-MAX_FILE_CHARS = 5000 # max chars returned by read_file per call
-MAX_RESULTS    = 8    # max search results
+              # 35 is the testing/deep-exploration ceiling — gives the agent room
+              # to trace multi-level NIQ-style call chains (controller → service →
+              # NiqEngine → payer resolver → rule evaluator → DB) without early
+              # exit. Reduce to 18 for production cost control.
+MAX_FILE_CHARS = 8000 # max chars returned by read_file per call (raised for richer context)
+MAX_RESULTS    = 12   # max search results (raised to surface more call sites)
 
 _SKIP_DIRS = frozenset({
     "node_modules", ".git", "dist", "build", "generated",
@@ -130,7 +134,8 @@ NAVIGATION STRATEGY:
   2. Identify what services/repos/functions it calls.
   3. Find those classes and read their relevant methods.
   4. Continue tracing until you reach actual data access (DB queries, external API
-     calls, cache reads) or you run out of budget.
+     calls, cache reads) or you exhaust all collaborator chains. You have up to
+     35 turns — prioritise depth over breadth, but cover every collaborator.
   5. CRITICAL — follow ALL collaborators at every layer. A collaborator is any
      custom class this code holds a reference to and delegates work to. They appear
      as:
@@ -209,7 +214,9 @@ IMPORTANT:
 - Work through multiple layers — don't stop at the controller.
 - Read the actual repository/data-access layer to find DB queries and table names.
 - Use plain English for all descriptions — no Java/Python jargon.
-- Emit submit_knowledge() when you have traced all layers (or after 10 tool calls).
+- Emit submit_knowledge() when you have traced ALL layers to actual I/O (DB queries, external API calls).
+- You have up to 35 turns — use them to be thorough. Only call submit_knowledge() early if you have
+  fully traced the call chain to data access. Do NOT submit after just the controller layer.
 - Output ONLY the JSON action, nothing else. One action per turn."""
 
 

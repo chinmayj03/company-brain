@@ -1,0 +1,366 @@
+# Makefile.demo — end-to-end testing flow for network-iq-backend-java
+#
+# Usage:
+#   make -f Makefile.demo help
+#   make -f Makefile.demo doctor              # pre-flight
+#   make -f Makefile.demo guard               # set cost guards (DO THIS FIRST)
+#   make -f Makefile.demo up-all              # bring up every service
+#   make -f Makefile.demo discover            # list endpoints in target repo
+#   make -f Makefile.demo run-cli ENDPOINT=/api/x METHOD=GET
+#   make -f Makefile.demo run-ui              # opens browser + prints UI steps
+#   make -f Makefile.demo compare             # CLI vs UI parity check
+#   make -f Makefile.demo ask Q="what does X do"
+#   make -f Makefile.demo cost                # cumulative LLM spend
+#   make -f Makefile.demo wipe                # clear pipeline data, keep infra
+#   make -f Makefile.demo down-all            # stop everything
+#
+# Reuses existing Makefile targets via `$(MAKE) -f Makefile <t>`.
+
+# ── Configurable ──────────────────────────────────────────────────────────────
+TARGET_REPO    ?= /Users/chinmayjadhav/Documents/network-iq-backend-java
+WORKSPACE_ID   ?= 00000000-0000-0000-0000-000000000001
+WORKSPACE_SLUG ?= dev
+BRANCH         ?= main
+ENDPOINT       ?=
+METHOD         ?= GET
+Q              ?=
+
+# Cost ceiling per pipeline run (USD). Override with: make -f Makefile.demo … COST_CAP=0.30
+COST_CAP       ?= 0.50
+
+# Infrastructure ports
+PG_PORT        := 5432
+REDIS_PORT     := 6379
+NEO4J_BOLT     := 7687
+NEO4J_HTTP     := 7474
+QDRANT_HTTP    := 6333
+LOCALSTACK     := 4566
+
+# Service ports
+JAVA_PORT      := 8080
+AI_PORT        := 8000
+CB_API_PORT    := 8090
+FE_PORT        := 5173
+
+CYAN  := \033[36m
+GREEN := \033[32m
+RED   := \033[31m
+YEL   := \033[33m
+NC    := \033[0m
+
+.DEFAULT_GOAL := help
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+.PHONY: help
+help:
+	@echo "$(CYAN)company-brain demo Makefile$(NC)"
+	@echo ""
+	@echo "Recommended order:"
+	@echo "  1. make -f Makefile.demo doctor        — pre-flight check"
+	@echo "  2. make -f Makefile.demo guard         — cost / config guards"
+	@echo "  3. make -f Makefile.demo up-all        — start every service"
+	@echo "  4. make -f Makefile.demo health        — verify everything is up"
+	@echo "  5. make -f Makefile.demo discover      — list endpoints in target repo"
+	@echo "  6. make -f Makefile.demo run-cli ENDPOINT=/api/x METHOD=GET"
+	@echo "  7. make -f Makefile.demo run-ui        — same endpoint via UI"
+	@echo "  8. make -f Makefile.demo compare       — CLI vs UI parity"
+	@echo "  9. make -f Makefile.demo ask Q='your question'"
+	@echo " 10. make -f Makefile.demo cost          — total LLM \$$ spent"
+	@echo ""
+	@echo "Cleanup:"
+	@echo "     make -f Makefile.demo wipe          — clear pipeline data"
+	@echo "     make -f Makefile.demo down-all      — stop services"
+
+# ── Pre-flight ────────────────────────────────────────────────────────────────
+.PHONY: doctor
+doctor:
+	@echo "$(CYAN)→ Pre-flight checks$(NC)"
+	@command -v docker  >/dev/null || (echo "$(RED)✗ docker not installed$(NC)"; exit 1)
+	@docker info >/dev/null 2>&1   || (echo "$(RED)✗ docker daemon not running$(NC)"; exit 1)
+	@command -v java    >/dev/null || (echo "$(RED)✗ java not installed (need 21)$(NC)"; exit 1)
+	@command -v node    >/dev/null || (echo "$(RED)✗ node not installed (need 20+)$(NC)"; exit 1)
+	@command -v bun     >/dev/null || (echo "$(YEL)⚠ bun not installed — apps/api won't run$(NC)")
+	@command -v python3 >/dev/null || (echo "$(RED)✗ python3 not installed$(NC)"; exit 1)
+	@test -f .env || (echo "$(RED)✗ .env missing — run: cp .env.example .env$(NC)"; exit 1)
+	@grep -q '^ANTHROPIC_API_KEY=sk-ant-' .env \
+	    || (echo "$(RED)✗ ANTHROPIC_API_KEY missing or invalid in .env$(NC)"; exit 1)
+	@test -d "$(TARGET_REPO)" || (echo "$(RED)✗ target repo not found: $(TARGET_REPO)$(NC)"; exit 1)
+	@test -d "$(TARGET_REPO)/.git" || (echo "$(RED)✗ target is not a git repo: $(TARGET_REPO)$(NC)"; exit 1)
+	@echo "$(GREEN)✓ pre-flight ok$(NC)"
+	@echo "  target repo: $(TARGET_REPO)"
+	@echo "  workspace:   $(WORKSPACE_ID) ($(WORKSPACE_SLUG))"
+	@echo "  cost cap:    \$$$(COST_CAP)"
+
+# ── Cost / config guards ──────────────────────────────────────────────────────
+.PHONY: guard
+guard:
+	@echo "$(CYAN)→ Setting cost / model guards in .env$(NC)"
+	@cp .env .env.bak.$$(date +%s)
+	@# Force Anthropic provider
+	@if grep -q '^LLM_PROVIDER=' .env; then \
+	    sed -i.bak 's/^LLM_PROVIDER=.*/LLM_PROVIDER=anthropic/' .env; \
+	  else \
+	    echo 'LLM_PROVIDER=anthropic' >> .env; \
+	  fi
+	@# Use Haiku for ALL roles to stretch \$$4 — Sonnet only on /v1/ask
+	@./scripts/upsert-env.sh ANTHROPIC_MODEL_FAST       claude-haiku-4-5-20251001 || true
+	@./scripts/upsert-env.sh ANTHROPIC_MODEL_BALANCED   claude-haiku-4-5-20251001 || true
+	@./scripts/upsert-env.sh ANTHROPIC_MODEL_SYNTHESIS  claude-haiku-4-5-20251001 || true
+	@./scripts/upsert-env.sh ANTHROPIC_MODEL_REASONING  claude-haiku-4-5-20251001 || true
+	@./scripts/upsert-env.sh ANTHROPIC_MODEL_QUERY      claude-sonnet-4-6 || true
+	@# Aggressive prompt caching (ADR-0010 §1)
+	@./scripts/upsert-env.sh ANTHROPIC_PROMPT_CACHE     true || true
+	@# Per-job cost ceiling (mini-CostGuard until ADR-0029 lands)
+	@./scripts/upsert-env.sh BRAIN_JOB_BUDGET_USD       $(COST_CAP) || true
+	@# Smaller smart-zone budget to keep tokens tight
+	@./scripts/upsert-env.sh BRAIN_TOKEN_BUDGET         4000 || true
+	@# Force tight extraction concurrency to make cost predictable
+	@./scripts/upsert-env.sh BRAIN_MAX_EXTRACTION_CONCURRENCY 2 || true
+	@./scripts/upsert-env.sh BRAIN_WORKSPACE_ID  $(WORKSPACE_ID) || true
+	@./scripts/upsert-env.sh BRAIN_WORKSPACE_SLUG $(WORKSPACE_SLUG) || true
+	@echo "$(GREEN)✓ .env updated$(NC) (backup at .env.bak.*)"
+	@echo ""
+	@echo "$(YEL)→ ALSO set a budget alert in the Anthropic console:$(NC)"
+	@echo "    https://console.anthropic.com/settings/billing → Spend Limits"
+	@echo "    Recommend: hard cap at \$$3.50, alert at \$$2.50"
+
+# ── Bring up everything ───────────────────────────────────────────────────────
+.PHONY: up-all
+up-all:
+	@echo "$(CYAN)→ Starting infrastructure (Postgres, Redis, LocalStack, Neo4j, Qdrant)$(NC)"
+	@$(MAKE) -f Makefile up
+	@echo "$(CYAN)→ Waiting for health$(NC)"
+	@sleep 8
+	@$(MAKE) -f Makefile.demo health
+	@echo ""
+	@echo "$(GREEN)✓ infrastructure up$(NC)"
+	@echo ""
+	@echo "$(YEL)→ Now open FOUR more terminals and run:$(NC)"
+	@echo "    Terminal 1:  make backend"
+	@echo "    Terminal 2:  make ai"
+	@echo "    Terminal 3:  make -f Makefile.demo cb-api"
+	@echo "    Terminal 4:  make frontend"
+	@echo ""
+	@echo "Wait for each to print 'started' / 'ready', then come back here."
+
+# ── Health ────────────────────────────────────────────────────────────────────
+.PHONY: health
+health:
+	@echo "$(CYAN)→ Health checks$(NC)"
+	@printf "  postgres   : "; \
+	  pg_isready -h localhost -p $(PG_PORT) -U companybrain >/dev/null 2>&1 \
+	    && echo "$(GREEN)ok$(NC)" || echo "$(RED)down$(NC)"
+	@printf "  redis      : "; \
+	  redis-cli -h localhost -p $(REDIS_PORT) ping 2>/dev/null | grep -q PONG \
+	    && echo "$(GREEN)ok$(NC)" || echo "$(RED)down$(NC)"
+	@printf "  neo4j      : "; \
+	  curl -fsS http://localhost:$(NEO4J_HTTP) >/dev/null 2>&1 \
+	    && echo "$(GREEN)ok$(NC)" || echo "$(RED)down$(NC)"
+	@printf "  qdrant     : "; \
+	  curl -fsS http://localhost:$(QDRANT_HTTP)/healthz >/dev/null 2>&1 \
+	    && echo "$(GREEN)ok$(NC)" || echo "$(RED)down$(NC)"
+	@printf "  localstack : "; \
+	  curl -fsS http://localhost:$(LOCALSTACK)/_localstack/health >/dev/null 2>&1 \
+	    && echo "$(GREEN)ok$(NC)" || echo "$(RED)down$(NC)"
+	@printf "  java api   : "; \
+	  curl -fsS http://localhost:$(JAVA_PORT)/actuator/health >/dev/null 2>&1 \
+	    && echo "$(GREEN)ok$(NC)" || echo "$(YEL)not started yet$(NC)"
+	@printf "  python ai  : "; \
+	  curl -fsS http://localhost:$(AI_PORT)/health >/dev/null 2>&1 \
+	    && echo "$(GREEN)ok$(NC)" || echo "$(YEL)not started yet$(NC)"
+	@printf "  cb-api     : "; \
+	  curl -fsS http://localhost:$(CB_API_PORT)/health >/dev/null 2>&1 \
+	    && echo "$(GREEN)ok$(NC)" || echo "$(YEL)not started yet$(NC)"
+	@printf "  frontend   : "; \
+	  curl -fsS http://localhost:$(FE_PORT) >/dev/null 2>&1 \
+	    && echo "$(GREEN)ok$(NC)" || echo "$(YEL)not started yet$(NC)"
+
+# ── cb-api (Bun TypeScript structural extractor) ──────────────────────────────
+.PHONY: cb-api
+cb-api:
+	@echo "$(CYAN)→ Starting cb-api on :$(CB_API_PORT)$(NC)"
+	@cd apps/api && \
+	  bun install --frozen-lockfile && \
+	  PORT=$(CB_API_PORT) \
+	  NEO4J_URI=bolt://localhost:$(NEO4J_BOLT) \
+	  NEO4J_USER=neo4j \
+	  NEO4J_PASSWORD=password \
+	  JAVA_API_URL=http://localhost:$(JAVA_PORT) \
+	  bun run src/index.ts
+
+# ── Endpoint discovery (no LLM cost) ──────────────────────────────────────────
+.PHONY: discover
+discover:
+	@echo "$(CYAN)→ Endpoints in $(TARGET_REPO):$(NC)"
+	@cd $(TARGET_REPO) && \
+	grep -rEn --include='*.java' \
+	  '@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping)\s*\(' \
+	  src 2>/dev/null | \
+	awk -F: '{ \
+	  match($$0, /@(Get|Post|Put|Delete|Patch|Request)Mapping/, m); \
+	  match($$0, /["'"'"']([^"'"'"']+)["'"'"']/, p); \
+	  printf "  %-7s %-40s %s:%s\n", \
+	    toupper(substr(m[1], 1, length(m[1]))), p[1], $$1, $$2; \
+	}' | head -30
+	@echo ""
+	@echo "$(YEL)→ Pick one and run:$(NC)"
+	@echo "    make -f Makefile.demo run-cli ENDPOINT=/api/whatever METHOD=GET"
+
+# ── Run pipeline via CLI ──────────────────────────────────────────────────────
+.PHONY: run-cli
+run-cli:
+	@test -n "$(ENDPOINT)" || (echo "$(RED)✗ ENDPOINT= required$(NC)"; exit 1)
+	@echo "$(CYAN)→ Running pipeline via CLI$(NC)"
+	@echo "  endpoint:  $(METHOD) $(ENDPOINT)"
+	@echo "  repo:      $(TARGET_REPO)"
+	@echo "  workspace: $(WORKSPACE_ID)"
+	@echo ""
+	@SPEND_BEFORE=$$(./scripts/anthropic-spend.sh 2>/dev/null || echo "0.00"); \
+	echo "  spend before: \$$$$SPEND_BEFORE"; \
+	echo ""; \
+	JOB_ID=$$(curl -sS -X POST http://localhost:$(JAVA_PORT)/v1/pipeline/start \
+	    -H 'Content-Type: application/json' \
+	    -H 'X-Workspace-Id: $(WORKSPACE_ID)' \
+	    -d '{ \
+	      "endpointPath": "$(ENDPOINT)", \
+	      "httpMethod":   "$(METHOD)", \
+	      "branch":       "$(BRANCH)", \
+	      "repos": [{ \
+	        "localPath": "$(TARGET_REPO)", \
+	        "type":      "backend", \
+	        "branch":    "$(BRANCH)" \
+	      }] \
+	    }' | jq -r '.jobId // .job_id'); \
+	if [ -z "$$JOB_ID" ] || [ "$$JOB_ID" = "null" ]; then \
+	  echo "$(RED)✗ failed to start pipeline$(NC)"; exit 1; \
+	fi; \
+	echo "  job_id: $$JOB_ID"; \
+	echo "$(CYAN)→ Polling for completion (Ctrl-C to stop polling, run continues)$(NC)"; \
+	while true; do \
+	  STATUS=$$(curl -sS http://localhost:$(AI_PORT)/pipeline/jobs/$$JOB_ID 2>/dev/null | jq -r '.status'); \
+	  STAGE=$$(curl -sS http://localhost:$(AI_PORT)/pipeline/jobs/$$JOB_ID 2>/dev/null | jq -r '.progress.current_stage // "?"'); \
+	  printf "\r  status: %-12s stage: %-15s" "$$STATUS" "$$STAGE"; \
+	  if [ "$$STATUS" = "completed" ] || [ "$$STATUS" = "failed" ] || [ "$$STATUS" = "halted_budget" ]; then \
+	    echo ""; break; \
+	  fi; \
+	  sleep 2; \
+	done; \
+	echo ""; \
+	curl -sS http://localhost:$(AI_PORT)/pipeline/jobs/$$JOB_ID | jq '.result // .error'; \
+	echo "$$JOB_ID" > /tmp/cb-demo-last-cli-job; \
+	SPEND_AFTER=$$(./scripts/anthropic-spend.sh 2>/dev/null || echo "?"); \
+	echo "  spend after:  \$$$$SPEND_AFTER (\$$$(./scripts/anthropic-delta.sh $$SPEND_BEFORE $$SPEND_AFTER) for this run)"
+
+# ── UI flow (manual but scripted) ─────────────────────────────────────────────
+.PHONY: run-ui
+run-ui:
+	@test -n "$(ENDPOINT)" || (echo "$(RED)✗ ENDPOINT= required$(NC)"; exit 1)
+	@echo "$(CYAN)→ Opening UI$(NC)"
+	@(open http://localhost:$(FE_PORT) 2>/dev/null || \
+	  xdg-open http://localhost:$(FE_PORT) 2>/dev/null || \
+	  echo "  open manually: http://localhost:$(FE_PORT)")
+	@echo ""
+	@echo "$(YEL)→ In the browser:$(NC)"
+	@echo "  1. Navigate to 'API Explorer'"
+	@echo "  2. Repo path:    $(TARGET_REPO)"
+	@echo "  3. Branch:       $(BRANCH)"
+	@echo "  4. Endpoint:     $(ENDPOINT)"
+	@echo "  5. Method:       $(METHOD)"
+	@echo "  6. Click 'Run pipeline' and watch live progress"
+	@echo "  7. When done, copy the job_id from the result panel"
+	@echo "  8. Run: echo <job_id> > /tmp/cb-demo-last-ui-job"
+	@echo ""
+	@echo "  Then:  make -f Makefile.demo compare"
+
+# ── CLI vs UI parity ──────────────────────────────────────────────────────────
+.PHONY: compare
+compare:
+	@CLI_JOB=$$(cat /tmp/cb-demo-last-cli-job 2>/dev/null); \
+	UI_JOB=$$(cat /tmp/cb-demo-last-ui-job 2>/dev/null); \
+	test -n "$$CLI_JOB" || (echo "$(RED)✗ no CLI job_id (run 'run-cli' first)$(NC)"; exit 1); \
+	test -n "$$UI_JOB"  || (echo "$(RED)✗ no UI job_id (run 'run-ui' first)$(NC)"; exit 1); \
+	echo "$(CYAN)→ Comparing job_ids:$(NC)"; \
+	echo "  CLI: $$CLI_JOB"; \
+	echo "  UI:  $$UI_JOB"; \
+	echo ""; \
+	echo "$(CYAN)→ Postgres entity counts$(NC)"; \
+	docker exec cb-postgres psql -U companybrain -d companybrain -t -c \
+	    "SELECT 'cli' AS src, count(*) FROM nodes WHERE workspace_id='$(WORKSPACE_ID)' \
+	     AND metadata->>'pipeline_job_id' = '$$CLI_JOB' \
+	     UNION ALL \
+	     SELECT 'ui',  count(*) FROM nodes WHERE workspace_id='$(WORKSPACE_ID)' \
+	     AND metadata->>'pipeline_job_id' = '$$UI_JOB';" 2>/dev/null || \
+	    echo "  (no pipeline_job_id metadata yet — falling back to total counts)"; \
+	echo ""; \
+	echo "$(CYAN)→ Postgres totals (workspace-wide)$(NC)"; \
+	docker exec cb-postgres psql -U companybrain -d companybrain -c \
+	    "SELECT node_type, count(*) FROM nodes \
+	     WHERE workspace_id='$(WORKSPACE_ID)' GROUP BY node_type ORDER BY 2 DESC;"; \
+	echo ""; \
+	echo "$(CYAN)→ Neo4j totals$(NC)"; \
+	docker exec cb-neo4j cypher-shell -u neo4j -p password \
+	    "MATCH (n) WHERE n.scope='$(WORKSPACE_SLUG)' RETURN labels(n)[0] AS type, count(n) ORDER BY count(n) DESC;" 2>/dev/null \
+	    || echo "  (no neo4j data — cb-api not running?)"
+
+# ── Ask via /query (smart-zone style if ADR-0018 is shipped, else legacy) ────
+.PHONY: ask
+ask:
+	@test -n "$(Q)" || (echo "$(RED)✗ Q= required$(NC)"; exit 1)
+	@echo "$(CYAN)→ Asking via Python /query (uses Sonnet 4.6)$(NC)"
+	@echo "  Q: $(Q)"
+	@echo ""
+	@curl -sS -X POST http://localhost:$(AI_PORT)/query/ \
+	    -H 'Content-Type: application/json' \
+	    -d '{ \
+	      "task":         "$(Q)", \
+	      "workspaceId":  "$(WORKSPACE_ID)", \
+	      "repoPath":     "$(TARGET_REPO)" \
+	    }' | jq
+
+# ── Cumulative cost ───────────────────────────────────────────────────────────
+.PHONY: cost
+cost:
+	@echo "$(CYAN)→ LLM spend (last 24h)$(NC)"
+	@docker exec cb-postgres psql -U companybrain -d companybrain -t -c \
+	    "SELECT round(sum((metadata->>'cost_usd')::numeric)::numeric, 4) AS spend_usd \
+	     FROM edge_events \
+	     WHERE occurred_at > now() - interval '24 hours' \
+	       AND metadata ? 'cost_usd';" 2>/dev/null || true
+	@echo ""
+	@echo "$(YEL)→ Authoritative source: Anthropic console$(NC)"
+	@echo "    https://console.anthropic.com/settings/billing"
+
+# ── Pipeline data wipe (keeps infra running) ──────────────────────────────────
+.PHONY: wipe
+wipe:
+	@echo "$(YEL)→ Wiping pipeline data (keeping infra up)$(NC)"
+	@docker exec cb-postgres psql -U companybrain -d companybrain -c \
+	    "TRUNCATE nodes, edges, edge_events, node_context CASCADE;" || true
+	@docker exec cb-neo4j cypher-shell -u neo4j -p password \
+	    "MATCH (n) WHERE n.scope='$(WORKSPACE_SLUG)' DETACH DELETE n;" 2>/dev/null || true
+	@docker exec cb-redis redis-cli FLUSHDB || true
+	@curl -sS -X DELETE http://localhost:$(QDRANT_HTTP)/collections/brain__$(WORKSPACE_SLUG)__component 2>/dev/null || true
+	@curl -sS -X DELETE http://localhost:$(QDRANT_HTTP)/collections/brain__$(WORKSPACE_SLUG)__api_contract 2>/dev/null || true
+	@rm -f /tmp/cb_checkpoint_*.json /tmp/cb-demo-last-*-job
+	@echo "$(GREEN)✓ wiped$(NC)"
+
+# ── Stop everything ───────────────────────────────────────────────────────────
+.PHONY: down-all
+down-all:
+	@echo "$(YEL)→ Stopping infrastructure$(NC)"
+	@$(MAKE) -f Makefile down
+
+# ── Dump everything for a bug report ──────────────────────────────────────────
+.PHONY: diag
+diag:
+	@DIAG=/tmp/cb-demo-diag-$$(date +%s).txt; \
+	{ \
+	  echo "=== docker ps ==="; docker ps; \
+	  echo ""; echo "=== health ==="; $(MAKE) -f Makefile.demo health; \
+	  echo ""; echo "=== postgres counts ==="; \
+	  docker exec cb-postgres psql -U companybrain -d companybrain -c \
+	    "SELECT node_type, count(*) FROM nodes GROUP BY node_type;" 2>/dev/null; \
+	  echo ""; echo "=== last 50 ai service log lines ==="; \
+	  tail -50 logs/ai.log 2>/dev/null || echo "(no log file)"; \
+	} > $$DIAG; \
+	echo "$(GREEN)✓ diag at $$DIAG$(NC)"

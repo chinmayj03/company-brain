@@ -47,8 +47,11 @@ from companybrain.pipeline.entity_filter import filter_entities
 from companybrain.pipeline.context_hierarchy import L2SharedContext
 from companybrain.pipeline.context_manager_agent import ContextManagerAgent
 from companybrain.pipeline.shared_context_accumulator import SharedContextAccumulator
+from companybrain.pipeline.assumption_miner import mine_assumptions  # ADR-0017
 from companybrain.graph.java_client import JavaGraphClient, ArtifactFreshnessResult
 from companybrain.models.entities import PipelineStartRequest, ExtractedEntity
+from companybrain.store.base import BrainEntity as _BrainEntity  # ADR-0017
+from companybrain.store.identity import to_urn as _to_urn, workspace_slug_for as _ws_slug_for  # ADR-0017
 from companybrain.pipeline.concurrency import (
     get_extraction_concurrency,
     get_extraction_semaphore,
@@ -577,6 +580,24 @@ async def run_pipeline(
             filtered_out=raw_entity_count - len(entities),
         )
 
+        # ── Stage 1 assumption mining (ADR-0017) ─────────────────────────────────
+        # Deterministic static extraction — zero LLM cost.
+        # Runs after the relevance filter so we only mine assumptions from
+        # entities that are actually relevant to this endpoint.
+        # Results are BrainEntity objects written directly in Stage 5 via store.write().
+        _assumption_brain_entities: list[_BrainEntity] = []
+        if not _skip_extraction and focal_context.code_units:
+            _assumption_brain_entities = _collect_assumption_entities(
+                code_units=focal_context.code_units,
+                filtered_entities=entities,
+                workspace_id=request.workspace_id,
+            )
+            if _assumption_brain_entities:
+                log.info(
+                    "ADR-0017 assumption mining complete",
+                    count=len(_assumption_brain_entities),
+                )
+
         # ── Stage 1.4: LLM-guided dependency expansion ───────────────────────────
         # Skipped when resuming from checkpoint (expansion already happened in prior run).
         # The navigator is given MAX_TURNS to trace the call chain. When a
@@ -856,6 +877,12 @@ async def run_pipeline(
             )
             await store.write(be, run_id=job_id, workspace_id=request.workspace_id)
 
+        # ADR-0017: write assumption entities (already BrainEntity, no conversion needed).
+        # JsonFileBrainStore writes .brain/assumption/<qname>.json automatically.
+        for assumption_be in _assumption_brain_entities:
+            await store.write(assumption_be, run_id=job_id, workspace_id=request.workspace_id)
+
+
         await store.commit_run(job_id)
 
         stage_5 = {"stage": "5", "label": "Graph Population", "status": "done",
@@ -986,6 +1013,44 @@ def _resolve_commit_sha(repo_path: str) -> str:
         ).decode().strip()
     except Exception:
         return "HEAD"
+
+
+def _collect_assumption_entities(
+    *,
+    code_units: list,
+    filtered_entities: list,
+    workspace_id: str,
+) -> list[_BrainEntity]:
+    """
+    ADR-0017: Mine assumption BrainEntities from code units.
+
+    For each extracted entity that has a corresponding CodeUnit, run the
+    static assumption miner and collect all RELIES_ON-linked BrainEntities.
+    """
+    slug = _ws_slug_for(workspace_id)
+    units_by_file: dict[str, object] = {u.file_path: u for u in code_units}
+    result: list[_BrainEntity] = []
+    for ee in filtered_entities:
+        unit = units_by_file.get(ee.file)
+        if unit is None:
+            continue
+        entity_type = _ENTITY_TYPE_MAP.get(ee.entity_type, "component")
+        parent_id = _to_urn(
+            tenant=slug,
+            domain="code",
+            repo=ee.repo or workspace_id,
+            entity_type=entity_type,
+            qualified_name=ee.name,
+        )
+        parent_be = _BrainEntity(
+            id=parent_id,
+            entity_type=entity_type,
+            repo=ee.repo or workspace_id,
+            file=ee.file,
+            qualified_name=ee.name,
+        )
+        result.extend(mine_assumptions(unit, parent_be, workspace_id=workspace_id))
+    return result
 
 
 def _dedup_relationships(rels: list) -> list:

@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterator, Optional
 
 import structlog
 
@@ -47,6 +47,8 @@ from companybrain.llm.base import ChatMessage, TaskRole
 from companybrain.llm import get_provider
 from companybrain.config import settings
 from companybrain.pipeline.api_contract_extractor import APIContract, ParamDef
+from companybrain.store.base import BrainEntity
+from companybrain.store.identity import to_urn, workspace_slug_for
 
 log = structlog.get_logger(__name__)
 
@@ -98,6 +100,57 @@ class EndpointSemantics:
             for gap in sem.gaps:
                 gaps.append({"parameter": name, "question": gap})
         return gaps
+
+    def to_brain_entities(
+        self, parent: BrainEntity, *, workspace_id: str
+    ) -> Iterator[BrainEntity]:
+        """
+        ADR-0017: Yield a BrainEntity(entity_type='business_context') with an
+        EXPLAINS edge back to *parent*, capturing the LLM-synthesised rationale
+        for this endpoint and its parameters.
+        """
+        if not self.endpoint_purpose and not self.parameters:
+            return
+
+        slug = workspace_slug_for(workspace_id)
+        qname = f"{parent.qualified_name}__rationale"
+        urn = to_urn(
+            tenant=slug,
+            domain="code",
+            repo=parent.repo,
+            entity_type="business_context",
+            qualified_name=qname,
+        )
+
+        param_lines = [
+            f"  {name}: {sem.purpose}"
+            for name, sem in self.parameters.items()
+            if sem.purpose
+        ]
+        body = self.endpoint_purpose
+        if param_lines:
+            body = body + "\n\nParameters:\n" + "\n".join(param_lines)
+
+        yield BrainEntity(
+            id=urn,
+            entity_type="business_context",
+            repo=parent.repo,
+            file=parent.file,
+            qualified_name=qname,
+            t1_summary=self.endpoint_purpose or f"{self.http_method} {self.endpoint}",
+            metadata={
+                "endpoint": self.endpoint,
+                "http_method": self.http_method,
+                "body": body,
+                "origin": "llm_synthesis",
+            },
+            relationships=[{
+                "target_id": parent.id,
+                "edge_type": "EXPLAINS",
+                "confidence": 0.9,
+                "source": "llm_synthesis",
+            }],
+        )
 
 
 # ── LLM prompt ────────────────────────────────────────────────────────────────

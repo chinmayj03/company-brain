@@ -397,7 +397,19 @@ async def run_pipeline(
         extractor   = EntityExtractor()
         cm_agent    = ContextManagerAgent()
         accumulator = SharedContextAccumulator()
-        l2          = L2SharedContext()
+
+        # ADR-0014: warm L2 from the previous run's persisted cache (if available)
+        from companybrain.pipeline.shared_context_accumulator import L2Persistence
+        repo_path_for_l2 = (request.repos[0].local_path or "") if request.repos else ""
+        branch_for_l2    = request.branch or "main"
+
+        l2 = L2Persistence.load(repo_path_for_l2, branch_for_l2) if repo_path_for_l2 else L2SharedContext()
+        if not l2.is_empty():
+            await progress(
+                "0.6", "🧠",
+                f"L2 warmed from cache: {l2.compact_summary()}",
+                summary=l2.compact_summary(),
+            )
 
         if not _skip_extraction and not focal_context.is_empty():
             concurrency = get_extraction_concurrency()
@@ -866,6 +878,13 @@ async def run_pipeline(
             code_units=len(focal_context.code_units),
             git_commits=git_commits,
         )
+
+        # ADR-0014: persist L2 so the next run on the same (repo, branch) starts warm
+        if repo_path_for_l2:
+            try:
+                L2Persistence.save(l2, repo_path_for_l2, branch_for_l2)
+            except Exception as exc:
+                log.warning("L2 cache save failed (non-fatal)", error=str(exc))
 
         # Pipeline completed successfully — clear checkpoint so next run is fresh
         _checkpoint_clear(request)

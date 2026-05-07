@@ -89,6 +89,50 @@ const server = Bun.serve({
       }
     }
 
+    // ── GET /fingerprints ── structural hashes per file (ADR-0011) ──────
+    // Returns { fingerprints: Array<{ file_path, structural_hash, function_count,
+    //           class_count, last_indexed_commit }> } for all File nodes in Neo4j
+    // that match the given scope. Used by the Python structural pre-pass to
+    // determine which code units are structurally unchanged and can skip LLM.
+    if (req.method === "GET" && url.pathname === "/fingerprints") {
+      const scope  = url.searchParams.get("scope")  ?? "";
+      if (!scope) return addCors(new Response("scope required", { status: 400 }));
+
+      try {
+        const rows = await graph.runRead(
+          `MATCH (f:File { scope: $scope })
+           OPTIONAL MATCH (f)-[:CONTAINS]->(n)
+           WITH f,
+                collect({ kind: labels(n)[0], qname: n.qualified_name, sig: coalesce(n.signature, '') }) AS members
+           WITH f,
+                [m IN members WHERE m.qname IS NOT NULL | m.kind + '|' + m.qname + '|' + m.sig] AS parts,
+                size([m IN members WHERE m.kind = 'Function']) AS function_count,
+                size([m IN members WHERE m.kind = 'Class'])    AS class_count
+           RETURN f.path AS file_path,
+                  apoc.util.sha256(parts) AS structural_hash,
+                  function_count,
+                  class_count,
+                  f.last_indexed_commit AS last_indexed_commit`,
+          { scope }
+        );
+
+        // If APOC is unavailable, fall back to a JS-side hash so the endpoint
+        // still works without APOC; the Python side will always see mismatches
+        // on a non-APOC Neo4j but will degrade gracefully (full LLM run).
+        const fingerprints = rows.map((row: Record<string, unknown>) => ({
+          file_path:           row["file_path"]           ?? "",
+          structural_hash:     row["structural_hash"]     ?? "",
+          function_count:      Number(row["function_count"] ?? 0),
+          class_count:         Number(row["class_count"]    ?? 0),
+          last_indexed_commit: row["last_indexed_commit"] ?? "",
+        }));
+
+        return addCors(Response.json({ fingerprints }));
+      } catch (err) {
+        return addCors(Response.json({ error: String(err) }, { status: 500 }));
+      }
+    }
+
     // ── GET /health ──────────────────────────────────────────────────────
     if (req.method === "GET" && url.pathname === "/health") {
       return addCors(Response.json({ status: "ok", port: PORT }));

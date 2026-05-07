@@ -216,6 +216,42 @@ async def run_pipeline(
                 files=files_traced,
             )
 
+        # ── Stage 0.5: Structural pre-pass (ADR-0011) ────────────────────────────
+        # Run the Bun extractor-worker registry via cb-api BEFORE any LLM call.
+        # This populates Neo4j with structural nodes and returns per-file hashes
+        # that let us skip Stage 1 LLM calls entirely for structurally-unchanged
+        # files.  If cb-api is unreachable the pre-pass degrades gracefully —
+        # all units fall through to the dirty path and the LLM runs as before.
+        from companybrain.pipeline.structural_prepass import run_structural_prepass
+
+        _repo_path_for_prepass = (
+            request.repos[0].local_path or request.repos[0].url
+            if request.repos else ""
+        )
+        _commit_for_prepass = _resolve_commit_sha(_repo_path_for_prepass)
+
+        await progress("0.5", "🪚", "Structural pre-pass — cb-api → Neo4j → fingerprints")
+        _prepass = await run_structural_prepass(
+            repo_path=_repo_path_for_prepass,
+            commit_sha=_commit_for_prepass,
+            workspace_id=request.workspace_id,
+            focal_context=focal_context,
+        )
+
+        stages_summary.append({
+            "stage": "0.5",
+            "label": "Structural Pre-pass",
+            "fresh": len(_prepass.fresh_units),
+            "dirty": len(_prepass.dirty_units),
+            "cb_api": _prepass.cb_api_status,
+        })
+        await progress(
+            "0.5", "✅",
+            f"{len(_prepass.fresh_units)} structural-fresh, {len(_prepass.dirty_units)} need LLM",
+            fresh=len(_prepass.fresh_units),
+            dirty=len(_prepass.dirty_units),
+        )
+
         # ── Pre-flight: Freshness check — skip LLM for unchanged files ────────
         # Build the graph client early so we can call check_freshness before Stage 1.
         # This is the single biggest speed win: on average 80-90% of files are unchanged
@@ -233,15 +269,19 @@ async def run_pipeline(
 
         freshness_map: dict[str, ArtifactFreshnessResult] = {}
         fresh_entities: list[ExtractedEntity] = []
-        dirty_units = list(focal_context.code_units)
+        # Start with the pre-pass split; Stage 0c may further reduce the dirty set.
+        dirty_units = list(_prepass.dirty_units) if _prepass.dirty_units else list(focal_context.code_units)
 
         if not focal_context.is_empty():
             await progress("0c", "⚡", "Freshness pre-flight — checking which files changed since last run")
-            freshness_map = await _graph_client_for_freshness.check_freshness(focal_context.code_units)
+            # Only run freshness check on units the structural pre-pass marked dirty;
+            # structurally-fresh units are already excluded from LLM work.
+            _units_for_freshness = dirty_units or list(focal_context.code_units)
+            freshness_map = await _graph_client_for_freshness.check_freshness(_units_for_freshness)
 
-            fresh_units = []
+            fresh_units = list(_prepass.fresh_units)  # carry over structural-fresh units
             dirty_units = []
-            for unit in focal_context.code_units:
+            for unit in _units_for_freshness:
                 ext_id = f"{unit.repo_name}/{unit.file_path}"
                 result = freshness_map.get(ext_id)
                 if result and result.fresh and result.existing_entities:
@@ -781,20 +821,8 @@ async def run_pipeline(
             gap_count=len(gaps),
         )
 
-        # ── ADR-0008: Trigger TypeScript structural extraction ─────────────
-        # After LLM pipeline completes, kick off the Neo4j structural extractor
-        # so that typed graph nodes complement the Postgres semantic context.
-        # Failure is non-fatal — the LLM pipeline result is already persisted.
-        repo_path_for_structural = (
-            request.repos[0].local_path or request.repos[0].url
-            if request.repos else ""
-        )
-        if repo_path_for_structural:
-            await _trigger_structural_extraction(
-                repo_path=repo_path_for_structural,
-                scope=request.workspace_id,  # workspace_id doubles as graph scope
-                commit_sha=commitSha if 'commitSha' in dir() else "HEAD",
-            )
+        # NOTE (ADR-0011): _trigger_structural_extraction() has been moved to
+        # Stage 0.5 (run_structural_prepass). No second call here.
 
         # ── Usage summary ─────────────────────────────────────────────────────
         _run_tracker.log_summary(log, label=request.endpoint_path)
@@ -886,6 +914,23 @@ async def _trigger_structural_extraction(
             scope=scope,
             error=str(exc),
         )
+
+
+import subprocess as _subprocess
+
+
+def _resolve_commit_sha(repo_path: str) -> str:
+    """Returns the current HEAD SHA of the repo, or 'HEAD' if not a git repo."""
+    if not repo_path:
+        return "HEAD"
+    try:
+        return _subprocess.check_output(
+            ["git", "-C", repo_path, "rev-parse", "HEAD"],
+            stderr=_subprocess.DEVNULL,
+            timeout=5,
+        ).decode().strip()
+    except Exception:
+        return "HEAD"
 
 
 def _dedup_relationships(rels: list) -> list:

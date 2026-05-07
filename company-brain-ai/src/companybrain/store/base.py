@@ -1,0 +1,87 @@
+"""
+BrainStore interface and event model.
+
+A BrainEntity is the canonical in-memory representation of any brain entity.
+A BrainEvent describes a write/upsert/delete. Stores consume events.
+
+Storage hierarchy (read priority):
+  JsonFileBrainStore  ← source of truth, always-correct
+  PostgresBrainStore  ← projection, fast read for Java backend
+  Neo4jBrainStore     ← projection, fast traversal
+  QdrantBrainStore    ← projection, fast similarity (ADR-0015)
+"""
+from __future__ import annotations
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from typing import Any, AsyncIterator, Optional
+
+
+# ── Canonical entity shape ───────────────────────────────────────────────────
+
+@dataclass
+class BrainEntity:
+    """
+    The canonical brain entity. JSON-serialisable.
+
+    `id` is the canonical identifier. ADR-0013 promotes this to a URN; today
+    it is `{repo}::{entity_type}::{qualified_name}`.
+    """
+    id: str
+    entity_type: str           # component | screen | api_contract | data_model | assumption | business_context | function_node
+    repo: str
+    file: str                  # relative to repo root
+    qualified_name: str
+    t1_summary: str = ""
+    t0_token: str = ""         # ~15 tok
+    t1_token: str = ""         # ~100 tok
+    metadata: dict = field(default_factory=dict)
+    relationships: list[dict] = field(default_factory=list)  # {target_id, edge_type, confidence, source}
+    version_hash: str = ""     # sha256 of the entity's structural fingerprint
+    last_updated: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    last_updated_by: str = "harness/extractor"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "BrainEntity":
+        valid = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in valid})
+
+
+# ── Events ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class BrainEvent:
+    kind: str                  # "upsert" | "invalidate" | "delete"
+    entity: Optional[BrainEntity] = None    # set for upsert
+    entity_id: Optional[str] = None         # set for invalidate / delete
+    run_id: str = ""
+    workspace_id: str = ""
+    occurred_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+
+
+# ── Interface ─────────────────────────────────────────────────────────────────
+
+class BrainStore(ABC):
+    """
+    Stores can read, write, and emit events. Most implementations are
+    write-through to a backing data store; the JSON store is the SOT.
+    """
+
+    @abstractmethod
+    async def write(self, entity: BrainEntity, *, run_id: str, workspace_id: str) -> None: ...
+
+    @abstractmethod
+    async def read(self, entity_id: str) -> Optional[BrainEntity]: ...
+
+    @abstractmethod
+    async def is_fresh(self, entity_id: str, version_hash: str) -> bool: ...
+
+    @abstractmethod
+    async def list_ids(self) -> AsyncIterator[str]: ...
+
+    @abstractmethod
+    async def commit_run(self, run_id: str) -> None:
+        """Called once at end of pipeline. Stores can persist any in-memory state."""

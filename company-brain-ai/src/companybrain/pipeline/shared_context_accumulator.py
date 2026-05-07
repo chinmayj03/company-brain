@@ -265,3 +265,83 @@ class SharedContextAccumulator:
         # Keep top 30
         l2.entity_catalog.sort(key=lambda x: x["confidence"], reverse=True)
         l2.entity_catalog = l2.entity_catalog[:30]
+
+
+# ── ADR-0014: Persistent L2 shared context ───────────────────────────────────
+
+import json
+from pathlib import Path
+
+_BRANCH_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+class L2Persistence:
+    """
+    Serialise / deserialise L2SharedContext to .brain/.l2-cache/{branch}.json.
+
+    Used by the orchestrator at:
+      - run start  → load() to warm L2 from prior runs
+      - run end    → save() so the next run can warm
+
+    The file is git-trackable but is conventionally gitignored under .brain/
+    (commit only the canonical entity JSONs; the L2 cache is per-engineer).
+    Engineers who want shared L2 commit the file explicitly.
+    """
+
+    @staticmethod
+    def cache_path(repo_path: "str | Path", branch: str = "main") -> Path:
+        safe_branch = _BRANCH_SAFE.sub("_", branch)
+        return Path(repo_path) / ".brain" / ".l2-cache" / f"{safe_branch}.json"
+
+    @staticmethod
+    def save(l2: L2SharedContext, repo_path: "str | Path", branch: str = "main") -> None:
+        path = L2Persistence.cache_path(repo_path, branch)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "domain_glossary":  l2.domain_glossary,
+            "service_registry": l2.service_registry,
+            "pattern_library":  l2.pattern_library,
+            "cross_cutting":    l2.cross_cutting,
+            "field_semantics":  l2.field_semantics,
+            # entity_catalog is already capped at 30 in the accumulator
+            "entity_catalog":   l2.entity_catalog,
+        }
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        log.info(
+            "L2 cache saved",
+            path=str(path),
+            entries=sum(
+                len(v) if hasattr(v, "__len__") else 0
+                for v in payload.values()
+                if v != 1
+            ),
+        )
+
+    @staticmethod
+    def load(repo_path: "str | Path", branch: str = "main") -> L2SharedContext:
+        path = L2Persistence.cache_path(repo_path, branch)
+        if not path.exists():
+            return L2SharedContext()
+        try:
+            data = json.loads(path.read_text())
+        except Exception as exc:
+            log.warning("L2 cache corrupt — starting fresh", path=str(path), error=str(exc))
+            return L2SharedContext()
+        if data.get("version") != 1:
+            log.warning(
+                "L2 cache version mismatch — starting fresh",
+                path=str(path),
+                version=data.get("version"),
+            )
+            return L2SharedContext()
+        l2 = L2SharedContext(
+            domain_glossary  = data.get("domain_glossary", {}),
+            service_registry = data.get("service_registry", {}),
+            pattern_library  = data.get("pattern_library", []),
+            cross_cutting    = data.get("cross_cutting", []),
+            field_semantics  = data.get("field_semantics", {}),
+            entity_catalog   = data.get("entity_catalog", []),
+        )
+        log.info("L2 cache loaded", path=str(path), summary=l2.compact_summary())
+        return l2

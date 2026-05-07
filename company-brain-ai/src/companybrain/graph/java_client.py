@@ -31,6 +31,12 @@ from companybrain.models.entities import (
     ExtractedRelationship,
     BusinessContext,
 )
+from companybrain.store.identity import (
+    to_urn,
+    workspace_slug_for,
+    NODE_TYPE_TAXONOMY,
+    DEFAULT_DOMAIN,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -258,7 +264,7 @@ class JavaGraphClient:
             "progressLogs":    meta.get("progress_logs", []),
 
             # ── Extraction results ──
-            "entities":      [_entity_to_dict(e)   for e in entities],
+            "entities":      [_entity_to_dict(e, self.workspace_id)   for e in entities],
             "relationships": [_rel_to_dict(r)       for r in relationships],
             "contexts":      [_ctx_to_dict(eid, c)  for eid, c in contexts.items()],
 
@@ -337,8 +343,20 @@ def _artifact_to_dict(a: Artifact) -> dict:
 
 
 
-def _entity_to_dict(e: ExtractedEntity) -> dict:
+def _entity_to_dict(e: ExtractedEntity, workspace_id: str = "") -> dict:
+    tenant = workspace_slug_for(workspace_id)
+    repo   = e.repo or "monorepo"
+    etype  = NODE_TYPE_TAXONOMY.get(e.entity_type, "component")
+    try:
+        urn = to_urn(
+            tenant=tenant, domain=DEFAULT_DOMAIN, repo=repo,
+            entity_type=etype, qualified_name=e.name,
+        )
+    except ValueError:
+        urn = f"urn:cb:{tenant}:{DEFAULT_DOMAIN}:{repo}:component:{e.name}"
+
     d = {
+        "urn":                 urn,
         "entityType":          e.entity_type,
         "name":                e.name,
         "file":                e.file,

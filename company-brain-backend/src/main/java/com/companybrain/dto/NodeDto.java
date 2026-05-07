@@ -18,6 +18,7 @@ public class NodeDto {
     private UUID id;
     private String nodeType;
     private String externalId;
+    private String urn;          // canonical URN per ADR-0013; null during transition
     private String name;
     private Map<String, Object> metadata;
     private OffsetDateTime updatedAt;

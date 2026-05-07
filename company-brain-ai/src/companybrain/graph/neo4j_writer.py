@@ -5,8 +5,7 @@ Mirrors the TypeScript GraphClient (packages/graph/src/client.ts) using the
 same URN scheme and node/edge envelope structure. All writes are scoped to a
 workspace_id (= URN scope segment).
 
-URN format: urn:cb:llm:{workspace_id}:{file_path}:{entity_name}
-            urn:cb:llm:{workspace_id}:{file_path}          (file-level nodes)
+URN format (ADR-0013 canonical): urn:cb:{tenant}:code:{repo}:{entity_type}:{qname}
 
 Design rules (matching the TypeScript client):
   - Nodes are NEVER deleted — only soft-invalidated (valid_to_commit set).
@@ -32,6 +31,12 @@ from companybrain.models.entities import (
     BusinessContext,
     ExtractedEntity,
     ExtractedRelationship,
+)
+from companybrain.store.identity import (
+    to_urn,
+    workspace_slug_for,
+    NODE_TYPE_TAXONOMY,
+    DEFAULT_DOMAIN,
 )
 
 log = structlog.get_logger(__name__)
@@ -331,14 +336,8 @@ class Neo4jWriter:
             entity_external_id: The entity's external_id (repo/file::name).
             context:            BusinessContext from LLM Pass 3.
         """
-        # Derive the entity URN from its external_id.
-        # external_id format: "{repo}/{file}::{name}"
-        parts = entity_external_id.split("::", 1)
-        if len(parts) == 2:
-            file_part, name_part = parts
-            entity_urn = build_llm_urn(self.workspace_id, file_part, name_part)
-        else:
-            entity_urn = build_llm_urn(self.workspace_id, entity_external_id)
+        # Derive the entity URN from its external_id using canonical form.
+        entity_urn = self._external_id_to_urn(entity_external_id)
 
         context_urn = f"{entity_urn}:_context"
         confidence  = _CONFIDENCE_SCORE.get(context.source_confidence, 0.5)
@@ -391,7 +390,8 @@ class Neo4jWriter:
         Returns:
             Number of nodes invalidated.
         """
-        urn_prefix = build_llm_urn(self.workspace_id, file_path)
+        tenant = workspace_slug_for(self.workspace_id)
+        urn_prefix = f"urn:cb:{tenant}:{DEFAULT_DOMAIN}:monorepo:"
         count      = await self._run_with_retry(
             self._do_invalidate,
             urn_prefix,
@@ -496,7 +496,13 @@ RETURN count(n) AS c
 
     def _entity_to_row(self, entity: ExtractedEntity) -> dict[str, Any]:
         """Convert an ExtractedEntity to a Neo4j UNWIND row dict."""
-        urn        = build_llm_urn(self.workspace_id, entity.file, entity.name)
+        tenant     = workspace_slug_for(self.workspace_id)
+        repo       = entity.repo or "monorepo"
+        etype      = NODE_TYPE_TAXONOMY.get(entity.entity_type, "component")
+        urn        = to_urn(
+            tenant=tenant, domain=DEFAULT_DOMAIN, repo=repo,
+            entity_type=etype, qualified_name=entity.name,
+        )
         node_label = _ENTITY_LABEL_MAP.get(entity.entity_type, "Function")
 
         props: dict[str, Any] = {
@@ -552,7 +558,7 @@ RETURN count(n) AS c
         target_urn = self._external_id_to_urn(rel.to_entity)
 
         # Edge id = deterministic hash of (source, type, target) — idempotent
-        edge_id = "urn:cb:llm:edge:" + hashlib.md5(
+        edge_id = "urn:cb:edge:" + hashlib.md5(
             f"{source_urn}|{cb_type}|{target_urn}".encode()
         ).hexdigest()
 
@@ -583,15 +589,24 @@ RETURN count(n) AS c
 
     def _external_id_to_urn(self, external_id: str) -> str:
         """
-        Convert a pipeline external_id (repo/file::name) to a LLM URN.
+        Convert a pipeline external_id (repo/file::name) to a canonical URN.
 
         external_id format: "{repo}/{file}::{name}"
+        Falls back to `build_llm_urn` for edge IDs that cannot be resolved to
+        a canonical form without entity_type information.
         """
+        tenant = workspace_slug_for(self.workspace_id)
         parts = external_id.split("::", 1)
         if len(parts) == 2:
-            file_part, name_part = parts
-            return build_llm_urn(self.workspace_id, file_part, name_part)
-        return build_llm_urn(self.workspace_id, external_id)
+            name_part = parts[1]
+            return to_urn(
+                tenant=tenant, domain=DEFAULT_DOMAIN, repo="monorepo",
+                entity_type="component", qualified_name=name_part,
+            )
+        return to_urn(
+            tenant=tenant, domain=DEFAULT_DOMAIN, repo="monorepo",
+            entity_type="component", qualified_name=external_id,
+        )
 
     # ── Retry logic ───────────────────────────────────────────────────────────
 

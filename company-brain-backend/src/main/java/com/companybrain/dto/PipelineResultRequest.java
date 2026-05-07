@@ -90,6 +90,8 @@ public class PipelineResultRequest {
         private String lastModifiedCommit;
         /** Raw SQL/JPQL string for DatabaseQuery entities. */
         private String queryText;
+        /** Canonical URN per ADR-0013; nullable during transition. */
+        private String urn;
     }
 
     @Data

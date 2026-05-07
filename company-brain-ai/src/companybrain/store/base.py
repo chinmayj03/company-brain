@@ -24,8 +24,12 @@ class BrainEntity:
     """
     The canonical brain entity. JSON-serialisable.
 
-    `id` is the canonical identifier. ADR-0013 promotes this to a URN; today
-    it is `{repo}::{entity_type}::{qualified_name}`.
+    `id` is the canonical URN per ADR-0013:
+      urn:cb:{tenant}:{domain}:{repo}:{entity_type}:{qualified_name}
+
+    Legacy ids of the form `{repo}::{entity_type}::{qualified_name}` are still
+    accepted by the JSON store for backward compatibility but new code must
+    produce canonical URNs via `companybrain.store.identity.to_urn()`.
     """
     id: str
     entity_type: str           # component | screen | api_contract | data_model | assumption | business_context | function_node

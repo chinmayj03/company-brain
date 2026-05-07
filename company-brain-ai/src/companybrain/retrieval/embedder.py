@@ -1,69 +1,165 @@
 """
-CodeEmbedder — code embeddings with tiered provider selection.
+Embedding providers for the Company Brain retrieval stack.
 
-Provider priority (first available wins):
-  1. voyage-code-3      (VOYAGE_API_KEY set)       — best quality, paid
-  2. FastEmbed local    (qdrant-client[fastembed])  — free, CPU, code-specific
-     model: jinaai/jina-embeddings-v2-base-code (768 dims)
-  3. Ollama             (OLLAMA_HOST reachable)     — free, GPU-optional
-     model: nomic-embed-text or nomic-embed-code
-  4. Disabled           (none of the above)         → BM25-only mode
-
-All providers share the same Redis content-addressed cache
-(cache key includes model name, so switching providers never
-returns stale vectors from a different model's run).
-
-Usage::
-    embedder = CodeEmbedder()
-    vectors = await embedder.embed_batch(["def foo():", "class Bar:"])
-    # vectors: list[list[float]] | None  (None if all providers unavailable)
+Two APIs are provided:
+  make_embedder() / Embedder  — ADR-0015: synchronous Protocol-based API.
+                                 Used by HybridSearcher and QdrantBrainStore.
+  CodeEmbedder                — Legacy async API with Redis caching (backward compat).
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
-from typing import Optional
+import os
+from typing import Optional, Protocol, runtime_checkable
+
 import structlog
 
 log = structlog.get_logger(__name__)
 
-# ── Provider-specific model names ─────────────────────────────────────────────
-_VOYAGE_MODEL        = "voyage-code-3"           # dims = 1024
-_FASTEMBED_MODEL     = "jinaai/jina-embeddings-v2-base-code"  # dims = 768, code-specific
-_OLLAMA_EMBED_MODEL  = "nomic-embed-text"        # dims = 768; use nomic-embed-code if pulled
 
+# ── ADR-0015: Embedder protocol + sync concrete implementations ───────────────
+
+@runtime_checkable
+class Embedder(Protocol):
+    dim: int
+
+    def embed(self, text: str) -> list[float]: ...
+    def embed_batch(self, texts: list[str]) -> list[list[float]]: ...
+
+
+def make_embedder() -> Embedder:
+    """Resolve the best available embedder at startup.
+
+    Order:
+      1. Voyage AI (voyage-code-3)       — if VOYAGE_API_KEY is set.
+      2. OpenAI text-embedding-3-small   — if OPENAI_API_KEY is set.
+      3. sentence-transformers all-MiniLM-L6-v2 — local fallback.
+
+    Override with BRAIN_EMBEDDER=local to force the local fallback.
+    """
+    if os.getenv("BRAIN_EMBEDDER") == "local":
+        return _try_minilm()
+    if os.getenv("VOYAGE_API_KEY"):
+        return _VoyageCode3()
+    if os.getenv("OPENAI_API_KEY"):
+        return _OpenAITextSmall()
+    return _try_minilm()
+
+
+def _try_minilm() -> Embedder:
+    try:
+        return _LocalMiniLM()
+    except ImportError:
+        log.warning(
+            "sentence_transformers not installed — using hash embedder. "
+            "pip install sentence-transformers for semantic quality."
+        )
+        return _HashEmbedder()
+
+
+class _VoyageCode3:
+    dim = 1024
+
+    def __init__(self) -> None:
+        import voyageai  # type: ignore
+        self._client = voyageai.Client()
+
+    def embed(self, text: str) -> list[float]:
+        r = self._client.embed([text], model="voyage-code-3", input_type="document")
+        return r.embeddings[0]
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        r = self._client.embed(texts, model="voyage-code-3", input_type="document")
+        return r.embeddings
+
+
+class _OpenAITextSmall:
+    dim = 1536
+
+    def __init__(self) -> None:
+        from openai import OpenAI  # type: ignore
+        self._client = OpenAI()
+
+    def embed(self, text: str) -> list[float]:
+        r = self._client.embeddings.create(input=[text], model="text-embedding-3-small")
+        return r.data[0].embedding
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        r = self._client.embeddings.create(input=texts, model="text-embedding-3-small")
+        return [d.embedding for d in r.data]
+
+
+class _LocalMiniLM:
+    dim = 384
+
+    def __init__(self) -> None:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+        self._m = SentenceTransformer("all-MiniLM-L6-v2")
+        log.info("Embedder: local all-MiniLM-L6-v2 (dim=384)")
+
+    def embed(self, text: str) -> list[float]:
+        return self._m.encode(text, normalize_embeddings=True).tolist()
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        return self._m.encode(texts, normalize_embeddings=True, batch_size=32).tolist()
+
+
+class _HashEmbedder:
+    """Deterministic hash-based embedder — no external deps.
+
+    Used when sentence_transformers is unavailable (e.g. lightweight CI).
+    Vectors are reproducible but not semantically meaningful.
+    """
+    dim = 384
+
+    def embed(self, text: str) -> list[float]:
+        import hashlib
+        import math
+        seed = int(hashlib.md5(text.encode()).hexdigest(), 16)
+        result = []
+        for i in range(self.dim):
+            seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+            val = math.sin(seed + i) * 0.5 + 0.5
+            result.append(val - 0.5)
+        norm = math.sqrt(sum(v * v for v in result)) or 1.0
+        return [v / norm for v in result]
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed(t) for t in texts]
+
+
+# ── Legacy: CodeEmbedder — async with Redis caching ───────────────────────────
+
+_VOYAGE_MODEL        = "voyage-code-3"
+_FASTEMBED_MODEL     = "jinaai/jina-embeddings-v2-base-code"
+_OLLAMA_EMBED_MODEL  = "nomic-embed-text"
 CACHE_TTL = 30 * 24 * 3600   # 30 days
 
 
 class CodeEmbedder:
-    """
-    Embed code snippets using the best available provider.
-    Automatically falls through the tier list at first use.
-    All vectors are cached in Redis by content hash.
-    """
+    """Async code embedder with tiered provider selection and Redis caching."""
 
     def __init__(self, api_key: str = "", redis_url: str = ""):
         from companybrain.config import settings
         self._voyage_key = api_key or settings.voyage_api_key
         self._redis_url  = redis_url or getattr(settings, "redis_url", "redis://localhost:6379")
         self._ollama_host = getattr(settings, "ollama_host", "http://localhost:11434")
-
         self._vo_client       = None
         self._fastembed_model = None
         self._redis           = None
-
-        # Will be resolved on first embed call
-        self._provider: Optional[str] = None   # "voyage" | "fastembed" | "ollama" | None
-
-    # ── Provider resolution ────────────────────────────────────────────────────
+        self._provider: Optional[str] = None
 
     async def _resolve_provider(self) -> Optional[str]:
-        """Pick the best available provider. Called once, result cached."""
         if self._provider is not None:
             return self._provider
-
-        # Tier 1 — Voyage (paid, best quality)
         if self._voyage_key:
             try:
                 import voyageai  # type: ignore
@@ -73,20 +169,14 @@ class CodeEmbedder:
                 return self._provider
             except ImportError:
                 log.debug("voyageai not installed, trying next provider")
-
-        # Tier 2 — FastEmbed local (free, code-specific, no API key)
         try:
             from fastembed import TextEmbedding  # type: ignore
             self._fastembed_model = TextEmbedding(model_name=_FASTEMBED_MODEL)
             self._provider = "fastembed"
             log.info("Embedding provider: FastEmbed local", model=_FASTEMBED_MODEL)
             return self._provider
-        except ImportError:
-            log.debug("fastembed not installed, trying Ollama")
-        except Exception as e:
-            log.debug("FastEmbed init failed", error=str(e))
-
-        # Tier 3 — Ollama (free, requires Ollama running)
+        except (ImportError, Exception) as e:
+            log.debug("FastEmbed unavailable", error=str(e))
         try:
             import httpx
             resp = await asyncio.wait_for(
@@ -98,32 +188,19 @@ class CodeEmbedder:
             )
             if resp.status_code == 200:
                 self._provider = "ollama"
-                log.info("Embedding provider: Ollama", model=_OLLAMA_EMBED_MODEL,
-                         hint="run 'ollama pull nomic-embed-text' if not already pulled")
+                log.info("Embedding provider: Ollama", model=_OLLAMA_EMBED_MODEL)
                 return self._provider
         except Exception:
             pass
-
-        # No provider available
-        self._provider = ""   # empty string = disabled, don't retry
-        log.warning(
-            "No embedding provider available — using BM25-only retrieval.\n"
-            "  Free options:\n"
-            "    • pip install 'qdrant-client[fastembed]'  (auto-downloads model, no key needed)\n"
-            "    • ollama pull nomic-embed-text            (requires Ollama running)\n"
-            "  Paid option:\n"
-            "    • Set VOYAGE_API_KEY in .env             (voyage-code-3, best quality)"
-        )
+        self._provider = ""
+        log.warning("No embedding provider available — using BM25-only retrieval.")
         return None
 
     @property
     def enabled(self) -> bool:
-        # Unknown until first resolve; return optimistic True so callers proceed
         if self._provider is None:
             return True
         return bool(self._provider)
-
-    # ── Redis cache ────────────────────────────────────────────────────────────
 
     def _get_redis(self):
         if self._redis is None:
@@ -134,31 +211,17 @@ class CodeEmbedder:
                 pass
         return self._redis
 
-    # ── Public API ─────────────────────────────────────────────────────────────
-
     async def embed_batch(self, texts: list[str]) -> Optional[list[list[float]]]:
-        """
-        Embed a batch of code snippets. Returns list of float vectors or None.
-        Cache misses are fetched from the active provider and stored in Redis.
-        """
         if not texts:
             return None
-
         provider = await self._resolve_provider()
         if not provider:
             return None
-
-        model_tag = {
-            "voyage":    _VOYAGE_MODEL,
-            "fastembed": _FASTEMBED_MODEL,
-            "ollama":    _OLLAMA_EMBED_MODEL,
-        }.get(provider, provider)
-
+        model_tag = {"voyage": _VOYAGE_MODEL, "fastembed": _FASTEMBED_MODEL,
+                     "ollama": _OLLAMA_EMBED_MODEL}.get(provider, provider)
         keys = [_cache_key(t, model_tag) for t in texts]
         vectors: list[Optional[list[float]]] = [None] * len(texts)
         miss_indices: list[int] = []
-
-        # Check Redis cache
         r = self._get_redis()
         if r is not None:
             try:
@@ -172,17 +235,12 @@ class CodeEmbedder:
                 miss_indices = list(range(len(texts)))
         else:
             miss_indices = list(range(len(texts)))
-
         if not miss_indices:
-            log.debug("Embedding cache: 100% hit", count=len(texts))
             return [v for v in vectors if v is not None]
-
         miss_texts = [texts[i] for i in miss_indices]
-        new_vectors = await self._embed_with_provider(provider, miss_texts, input_type="document")
+        new_vectors = await self._embed_with_provider(provider, miss_texts, "document")
         if new_vectors is None:
             return None
-
-        # Populate vectors + write back to cache
         if r is not None:
             try:
                 pipe = r.pipeline()
@@ -196,29 +254,17 @@ class CodeEmbedder:
         else:
             for i, idx in enumerate(miss_indices):
                 vectors[idx] = new_vectors[i]
-
-        hit_rate = (len(texts) - len(miss_indices)) / len(texts)
-        log.debug("Embedding complete", total=len(texts),
-                  misses=len(miss_indices), hit_rate=f"{hit_rate:.0%}",
-                  provider=provider)
         return [v for v in vectors if v is not None]
 
     async def embed_query(self, query: str) -> Optional[list[float]]:
-        """Embed a single query string for retrieval."""
         provider = await self._resolve_provider()
         if not provider:
             return None
-        result = await self._embed_with_provider(provider, [query], input_type="query")
+        result = await self._embed_with_provider(provider, [query], "query")
         return result[0] if result else None
 
-    # ── Provider dispatch ──────────────────────────────────────────────────────
-
-    async def _embed_with_provider(
-        self,
-        provider: str,
-        texts: list[str],
-        input_type: str = "document",
-    ) -> Optional[list[list[float]]]:
+    async def _embed_with_provider(self, provider: str, texts: list[str],
+                                   input_type: str = "document") -> Optional[list[list[float]]]:
         try:
             if provider == "voyage":
                 return await self._embed_voyage(texts, input_type)
@@ -235,12 +281,8 @@ class CodeEmbedder:
         return result.embeddings
 
     async def _embed_fastembed(self, texts: list[str]) -> list[list[float]]:
-        # FastEmbed is sync — run in executor to avoid blocking the event loop
         loop = asyncio.get_event_loop()
-        def _sync_embed():
-            return list(self._fastembed_model.embed(texts))
-        raw = await loop.run_in_executor(None, _sync_embed)
-        # fastembed returns numpy arrays; convert to plain float lists
+        raw = await loop.run_in_executor(None, lambda: list(self._fastembed_model.embed(texts)))
         return [vec.tolist() if hasattr(vec, "tolist") else list(vec) for vec in raw]
 
     async def _embed_ollama(self, texts: list[str]) -> list[list[float]]:

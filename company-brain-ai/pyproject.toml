@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     # API — versions loosened to be compatible with mcp[cli]>=1.6.0
     "fastapi>=0.115.0",
+    "typer>=0.12.0",               # ADR-0016: brain CLI entry point
     "uvicorn[standard]>=0.30.1",
     "pydantic>=2.11.0",
     "pydantic-settings>=2.5.2",
@@ -80,7 +81,8 @@ dependencies = [
     # voyageai is OPTIONAL: only needed when VOYAGE_API_KEY is set (paid, best quality).
     # embedder.py auto-selects: voyage → fastembed → ollama → BM25-only.
     "qdrant-client[fastembed]>=1.9.0",  # vector store + FREE local embeddings via fastembed
-    "rank-bm25>=0.2.2",                  # BM25 lexical retrieval (always free)
+    "bm25s>=0.2",                        # ADR-0015: fast BM25S for entity-based retrieval
+    "rank-bm25>=0.2.2",                  # legacy BM25 for file-based retrieval (code_tracer)
     "sentence-transformers>=3.0.0",      # bge-reranker-v2-m3 cross-encoder reranking (free, local)
 
     # Observability — Langfuse is SELF-HOSTED (free). Cloud version is paid.
@@ -115,6 +117,9 @@ dev = [
 voyage = [
     "voyageai>=0.3.2",
 ]
+
+[project.scripts]
+brain = "companybrain.cli:app"
 
 [tool.ruff]
 line-length = 100

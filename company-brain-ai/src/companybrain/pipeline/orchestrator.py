@@ -836,7 +836,14 @@ async def run_pipeline(
         )
         neo4j_store = Neo4jBrainStore(neo4j_writer, workspace_id=request.workspace_id)
 
-        store = FanoutBrainStore(primary=json_store, mirrors=[pg_store, neo4j_store])
+        from companybrain.retrieval.qdrant_store import QdrantBrainStore
+        from companybrain.store.identity import workspace_slug_for
+        qdrant_store = QdrantBrainStore(
+            brain_root=brain_root.parent,
+            workspace_slug=workspace_slug_for(request.workspace_id),
+        )
+
+        store = FanoutBrainStore(primary=json_store, mirrors=[pg_store, neo4j_store, qdrant_store])
 
         # Convert every ExtractedEntity → canonical BrainEntity and write through
         for ee in entities:

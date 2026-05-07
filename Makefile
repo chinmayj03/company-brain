@@ -8,7 +8,8 @@
         switch-ollama switch-anthropic switch-openai switch-groq switch-openrouter \
         backend ai mcp frontend venv \
         db-shell db-reset redis-shell \
-        langfuse qdrant neo4j-shell neo4j-reset
+        langfuse qdrant neo4j-shell neo4j-reset \
+        brain-index brain-query brain-blast
 
 INFRA_COMPOSE = docker compose -f docker-compose.infra.yml
 ENV_FILE      = company-brain-ai/.env
@@ -234,3 +235,15 @@ neo4j-reset: ## Wipe Neo4j data volume (WARNING: destroys all graph data)
 qdrant: ## Open Qdrant dashboard (http://localhost:6333/dashboard)
 	@echo "$(CYAN)Qdrant → http://localhost:6333/dashboard$(RESET)"
 	@open http://localhost:6333/dashboard 2>/dev/null || true
+
+# ── Brain CLI (ADR-0016) ──────────────────────────────────────────────────────
+
+brain-index: ## Run whole-repo extraction: make brain-index REPO=./path/to/repo
+	cd company-brain-ai && python -m companybrain.cli index $(REPO)
+
+brain-query: ## Query the brain: make brain-query Q="payment processing" REPO=./path/to/repo
+	cd company-brain-ai && python -m companybrain.cli query "$(Q)" --repo $(REPO)
+
+brain-blast: ## Blast radius: make brain-blast URN="urn:cb:dev:code:monorepo:component:MyService"
+	cd company-brain-ai && python -m companybrain.cli blast-radius "$(URN)"
+

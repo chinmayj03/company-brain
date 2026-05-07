@@ -577,11 +577,128 @@ def run_stdio() -> None:
     mcp_app.run(transport="stdio")
 
 
+# ── JSON-RPC 2.0 stdio server (ADR-0019) ─────────────────────────────────────
+# Raw JSON-RPC 2.0 over stdin/stdout per the MCP spec.
+# Tools are sourced from TOOL_REGISTRY (brain_query, brain_get, brain_search,
+# brain_blast_radius, brain_rebuild) — Python-native, no BackendClient/TrpcClient.
+#
+# Run as:  python -m companybrain.mcp.server
+#
+# Register in ~/.claude.json:
+#   {
+#     "mcpServers": {
+#       "company-brain": {
+#         "command": "python",
+#         "args": ["-m", "companybrain.mcp.server"],
+#         "env": {
+#           "BRAIN_REPO_ROOT": "/path/to/pilot",
+#           "BRAIN_WORKSPACE_ID": "00000000-0000-0000-0000-000000000001",
+#           "NEO4J_URI": "bolt://localhost:7687",
+#           "QDRANT_URL": "http://localhost:6333"
+#         }
+#       }
+#     }
+#   }
+
+import asyncio as _asyncio
+import json as _json
+import sys as _sys
+import traceback as _traceback
+from typing import Any as _Any
+
+from companybrain.mcp.tools import TOOL_REGISTRY
+
+_JSONRPC_VERSION = "2.0"
+
+
+def _stdio_emit(payload: dict[_Any, _Any]) -> None:
+    _sys.stdout.write(_json.dumps(payload) + "\n")
+    _sys.stdout.flush()
+
+
+def _stdio_emit_result(rid: _Any, result: _Any) -> None:
+    _stdio_emit({"jsonrpc": _JSONRPC_VERSION, "id": rid, "result": result})
+
+
+def _stdio_emit_error(rid: _Any, code: int, message: str, data: _Any = None) -> None:
+    err: dict[str, _Any] = {"code": code, "message": message}
+    if data is not None:
+        err["data"] = data
+    _stdio_emit({"jsonrpc": _JSONRPC_VERSION, "id": rid, "error": err})
+
+
+async def _stdio_handle(request: dict[str, _Any]) -> None:
+    rid    = request.get("id")
+    method = request.get("method")
+    params = request.get("params", {}) or {}
+    try:
+        if method == "tools/list":
+            _stdio_emit_result(rid, {"tools": [t.schema for t in TOOL_REGISTRY.values()]})
+        elif method == "tools/call":
+            name = params.get("name")
+            args = params.get("arguments", {}) or {}
+            tool = TOOL_REGISTRY.get(name)
+            if tool is None:
+                _stdio_emit_error(rid, -32601, f"Unknown tool: {name}")
+                return
+            result = await tool.handler(args)
+            _stdio_emit_result(rid, {"content": [{"type": "text", "text": result}], "isError": False})
+        elif method == "initialize":
+            _stdio_emit_result(rid, {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "company-brain", "version": "0.1.0"},
+            })
+        elif method == "shutdown":
+            _stdio_emit_result(rid, None)
+            _sys.exit(0)
+        else:
+            _stdio_emit_error(rid, -32601, f"Method not found: {method}")
+    except Exception as exc:
+        log.error("mcp_server.handler_error", method=method, error=str(exc),
+                  traceback=_traceback.format_exc())
+        _stdio_emit_error(rid, -32603, f"Internal error: {exc}")
+
+
+def _configure_stdio_logging() -> None:
+    """Redirect structlog to stderr so it doesn't pollute the JSON-RPC stream."""
+    import logging
+    import structlog
+
+    logging.basicConfig(stream=_sys.stderr, level=logging.WARNING)
+    structlog.configure(
+        logger_factory=structlog.PrintLoggerFactory(file=_sys.stderr),
+    )
+
+
+async def main() -> None:
+    """Read JSON-RPC requests from stdin, write responses to stdout, line-delimited."""
+    _configure_stdio_logging()
+    log.info("mcp_server.start")
+    loop = _asyncio.get_running_loop()
+    reader = _asyncio.StreamReader()
+    protocol = _asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: protocol, _sys.stdin)
+
+    while True:
+        line = await reader.readline()
+        if not line:
+            break  # EOF — Claude Code closed the pipe
+        line_str = line.decode().strip()
+        if not line_str:
+            continue
+        try:
+            request = _json.loads(line_str)
+        except _json.JSONDecodeError:
+            _stdio_emit_error(rid=None, code=-32700, message="Parse error")
+            continue
+        await _stdio_handle(request)
+    log.info("mcp_server.stop")
+
+
 if __name__ == "__main__":
     import sys
-    if "--stdio" in sys.argv:
-        run_stdio()
-    else:
+    if "--http" in sys.argv:
         import uvicorn
         uvicorn.run(
             "companybrain.mcp.server:asgi_app",
@@ -589,6 +706,11 @@ if __name__ == "__main__":
             port=9000,
             reload=False,
         )
+    elif "--fastmcp-stdio" in sys.argv:
+        run_stdio()
+    else:
+        # Default: JSON-RPC 2.0 stdio server (ADR-0019)
+        _asyncio.run(main())
 
 
 # ── get_affected_flows (registered after initial module load) ─────────────────

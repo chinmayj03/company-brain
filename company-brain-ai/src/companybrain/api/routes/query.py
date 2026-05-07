@@ -1,27 +1,25 @@
 """
 POST /query — answer a natural language question using tiered graph context + LLM.
 
-Architecture (ADR-004: Tiered Memory & Context Assembly):
+Architecture (ADR-0018: Smart-zone context assembler):
 
-  1. Resolve the focal node from context_symbol or file_path (search Java backend).
-  2. Call POST /v1/internal/assemble-context on the Java backend.
-     Java runs BFS traversal and packs tiered context:
-       T2 (~600 tok): focal node + immediate neighbors (full business context)
-       T1 (~100 tok): mid-range nodes (purpose + change risk)
-       T0 (~15  tok): far nodes (name + type one-liners)
-     All within the configured token budget.
-  3. Build the LLM system prompt with the assembled context as a "KNOWLEDGE BASE" block.
-  4. Call the LLM (configured provider: OpenAI / Anthropic / Ollama).
-  5. Return answer + source citations from the traversal metadata.
+  1. SmartZoneAssembler.assemble() classifies the task, runs hybrid retrieval
+     (ADR-0015), expands via Neo4j blast-radius, MMR-reranks, tiers into
+     T0/T1/T2, compresses task-aware, and renders the final context block.
+  2. Build the LLM system prompt with payload.rendered as the context.
+  3. Call the LLM (configured provider: OpenAI / Anthropic / Ollama / Groq).
+  4. Return answer + source citations.
 
-Fallback: if Java is unavailable (dev mode, cold start), falls back to a direct
-          DB query path that mimics the old approach with basic context.
+Fallback: if SmartZoneAssembler is unavailable (missing .brain/, Neo4j down),
+          falls back to the legacy Java-assembler or hybrid-retrieval path.
 """
 from __future__ import annotations
 
 import os
+from pathlib import Path
+
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
 import httpx
 
@@ -64,79 +62,64 @@ async def query_graph(request: QueryRequest):
     """
     POST /query
 
-    1. Resolve focal node via Java search API
-    2. Assemble tiered context from Java ContextAssemblerService
-    3. Call LLM with assembled context
-    4. Return answer + citations
+    1. SmartZoneAssembler.assemble() builds T0/T1/T2 tiered context (ADR-0018)
+    2. Call LLM with payload.rendered as context
+    3. Return answer + citations
     """
     provider = get_provider()
 
-    # ── Step 1: Resolve focal node ────────────────────────────────────────────
-    focal_node_id: str | None   = None
-    focal_external_id: str | None = None
-    focal_name: str | None      = None
-
-    search_symbol = request.context_symbol or _symbol_from_file(request.file_path)
-    if search_symbol:
-        focal_node_id, focal_name = await _resolve_node(
-            request.workspace_id, search_symbol
-        )
-
-    if not focal_node_id:
-        log.info("[query] No focal node resolved — answering from question only",
-                 symbol=search_symbol)
-
-    # ── Step 2: Assemble tiered context from Java ─────────────────────────────
+    # ── Step 1: Smart-zone assembly (ADR-0018) ────────────────────────────────
     assembled_context: str | None = None
-    traversal_meta: dict = {}
+    smart_zone_meta: dict = {}
 
-    if focal_node_id:
-        assembled_context, traversal_meta = await _assemble_context(
-            workspace_id=str(request.workspace_id),
-            focal_node_id=focal_node_id,
-            question=request.question,
-            max_hops=request.max_hops,
-        )
+    assembled_context, smart_zone_meta = await _smart_zone_assemble(
+        task=request.question,
+        workspace_id=str(request.workspace_id),
+        repo_path=getattr(request, "repo_path", None),
+    )
 
-    # ── Step 2b: Hybrid retrieval fallback (ADR-0015) ─────────────────────────
-    # When the Java assembler is unavailable, supplement context with
-    # HybridSearcher (BM25S + dense + RRF) over the .brain/ entity store.
+    # ── Step 1b: Legacy Java assembler fallback ───────────────────────────────
     if not assembled_context:
-        hybrid_context = await _hybrid_retrieve(request.question, request.workspace_id)
-        if hybrid_context:
-            assembled_context = hybrid_context
-            log.info("[query] Using hybrid retrieval context (Java assembler unavailable)")
+        focal_node_id: str | None = None
+        focal_name: str | None = None
+        search_symbol = request.context_symbol or _symbol_from_file(request.file_path)
+        if search_symbol:
+            focal_node_id, focal_name = await _resolve_node(
+                request.workspace_id, search_symbol
+            )
+        if focal_node_id:
+            assembled_context, _ = await _assemble_context(
+                workspace_id=str(request.workspace_id),
+                focal_node_id=focal_node_id,
+                question=request.question,
+                max_hops=request.max_hops,
+            )
 
-    # ── Step 3: Build LLM prompt ──────────────────────────────────────────────
+    # ── Step 1c: Hybrid retrieval fallback (ADR-0015) ─────────────────────────
+    if not assembled_context:
+        assembled_context = await _hybrid_retrieve(request.question, request.workspace_id)
+        if assembled_context:
+            log.info("[query] Using hybrid retrieval context (SmartZone + Java unavailable)")
+
+    # ── Step 2: Build LLM prompt ──────────────────────────────────────────────
+    context_quality = "high" if assembled_context else "low"
     if assembled_context:
         user_content = (
             f"KNOWLEDGE BASE:\n\n{assembled_context}\n\n"
             f"---\n\n"
             f"QUESTION: {request.question}"
         )
-        context_quality = "high"
-    elif focal_name:
-        # Fell back: Java assembler unavailable, we have the node name at least
-        user_content = (
-            f"Limited context available for node `{focal_name}`.\n\n"
-            f"QUESTION: {request.question}\n\n"
-            f"Note: The full dependency graph is available but context assembly failed. "
-            f"Answer what you can from the question alone, and suggest running the pipeline."
-        )
-        context_quality = "low"
     else:
         user_content = (
             f"QUESTION: {request.question}\n\n"
-            f"Note: No node was found matching the requested symbol. "
-            f"Run the extraction pipeline on the relevant endpoint first."
+            f"Note: No brain context available. "
+            f"Run the extraction pipeline on the repo first."
         )
-        context_quality = "low"
 
-    # ── Step 4: Call LLM ──────────────────────────────────────────────────────
+    # ── Step 3: Call LLM ──────────────────────────────────────────────────────
     log.info("[query] Calling LLM",
-             focal=focal_name,
-             context_tokens=traversal_meta.get("estimatedTokens", 0),
-             nodes_included=traversal_meta.get("nodesIncluded", 0),
+             task_type=smart_zone_meta.get("task_type"),
+             tokens_used=smart_zone_meta.get("tokens_used", 0),
              quality=context_quality)
 
     response = await provider.chat(
@@ -148,37 +131,22 @@ async def query_graph(request: QueryRequest):
         max_tokens=1024,
     )
 
-    # ── Step 5: Build response ────────────────────────────────────────────────
-    # Reconstruct affected_nodes from traversal metadata for backward compatibility
-    affected_nodes: list[dict] = []
-    if focal_node_id and focal_name:
-        affected_nodes.append({
-            "id":    focal_node_id,
-            "name":  focal_name,
-            "type":  traversal_meta.get("focalNodeType", ""),
-            "depth": 0,
-        })
-
-    tier_summary = traversal_meta.get("tierSummary", {})
+    # ── Step 4: Build response ────────────────────────────────────────────────
     sources = []
-    if focal_name:
-        sources.append({
-            "label":   f"{focal_name} (focal)",
-            "node_id": focal_node_id or "",
-        })
-    if traversal_meta.get("nodesTraversed", 0) > 1:
+    t0_count = len(smart_zone_meta.get("t0", []))
+    t1_count = len(smart_zone_meta.get("t1", []))
+    t2_count = len(smart_zone_meta.get("t2", []))
+    if t0_count or t1_count or t2_count:
         sources.append({
             "label": (
-                f"{traversal_meta.get('nodesIncluded', 0)} nodes assembled "
-                f"(T2:{tier_summary.get('t2Count',0)} "
-                f"T1:{tier_summary.get('t1Count',0)} "
-                f"T0:{tier_summary.get('t0Count',0)})"
+                f"SmartZone: T0={t0_count} T1={t1_count} T2={t2_count} "
+                f"tokens={smart_zone_meta.get('tokens_used', 0)}"
             ),
             "node_id": "",
         })
 
     confidence = (
-        "high"   if context_quality == "high" and traversal_meta.get("nodesIncluded", 0) > 1
+        "high"   if context_quality == "high" and (t1_count + t2_count) > 1
         else "medium" if context_quality == "high"
         else "low"
     )
@@ -186,12 +154,66 @@ async def query_graph(request: QueryRequest):
     return QueryResponse(
         answer=response.content,
         sources=sources,
-        affected_nodes=affected_nodes,
+        affected_nodes=[],
         confidence=confidence,
     )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _smart_zone_assemble(
+    task: str, workspace_id: str, repo_path: str | None
+) -> tuple[str | None, dict]:
+    """
+    Run SmartZoneAssembler (ADR-0018) to build T0/T1/T2 tiered context.
+    Returns (rendered_str, meta_dict) or (None, {}) if unavailable.
+    """
+    try:
+        from neo4j import AsyncGraphDatabase
+        from companybrain.assembly.smart_zone import SmartZoneAssembler
+        from companybrain.assembly.types import TokenBudget
+        from companybrain.store.json_store import JsonFileBrainStore
+
+        brain_root_env = os.environ.get("BRAIN_ROOT", "")
+        effective_root = repo_path or brain_root_env
+        if not effective_root:
+            return None, {}
+
+        brain_root = Path(effective_root) / ".brain"
+        if not brain_root.exists():
+            log.debug("[query] .brain/ not found — skipping SmartZone", path=str(brain_root))
+            return None, {}
+
+        neo4j_url  = os.environ.get("NEO4J_URL", "bolt://localhost:7687")
+        neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
+        neo4j_pass = os.environ.get("NEO4J_PASSWORD", "password")
+
+        driver = AsyncGraphDatabase.driver(neo4j_url, auth=(neo4j_user, neo4j_pass))
+        store  = JsonFileBrainStore(brain_root.parent)
+
+        assembler = SmartZoneAssembler(
+            brain_root=brain_root,
+            workspace_id=workspace_id,
+            store=store,
+            neo4j_driver=driver,
+        )
+        budget  = TokenBudget()
+        payload = await assembler.assemble(task=task, budget=budget)
+        await driver.close()
+
+        meta = {
+            "task_type":  payload.task_type,
+            "tokens_used": payload.tokens_used,
+            "t0": payload.t0,
+            "t1": payload.t1,
+            "t2": payload.t2,
+        }
+        return payload.rendered if payload.rendered else None, meta
+
+    except Exception as exc:
+        log.warning("[query] SmartZone assembly failed (non-fatal)", error=str(exc))
+        return None, {}
+
 
 async def _resolve_node(workspace_id: str, symbol: str) -> tuple[str | None, str | None]:
     """

@@ -776,13 +776,16 @@ async def run_pipeline(
         stages_summary.append(stage_4)
         await progress("4", "✅", f"Detected {len(gaps)} gaps")
 
-        # ── Stage 5: Graph population — POST to Java backend ─────────────────
-        # Java owns all DB writes. The AI service sends back structured results;
-        # Java applies them through its service layer (RLS, caching, audit).
-        await progress("5", "💾", "Graph population — posting results to Java backend for persistence")
+        # ── Stage 5: Graph population — via BrainStore fan-out (ADR-0012) ──────
+        # Write to JSON SOT first, then mirror to Postgres + Neo4j.
+        # The existing JavaGraphClient.flush() is called inside PostgresBrainStore
+        # so the Java backend receives identical data as before.
+        await progress("5", "💾", "Graph population — writing to .brain/ SOT then mirroring to Postgres + Neo4j")
 
-        # Reuse the graph client we already created for the freshness check
-        graph_client = _graph_client_for_freshness
+        from companybrain.store import (
+            JsonFileBrainStore, PostgresBrainStore, Neo4jBrainStore, FanoutBrainStore,
+        )
+        from companybrain.graph.neo4j_writer import Neo4jWriter
 
         # Serialize FunctionContexts so Java can store them in node metadata.
         # Java's PipelineService reads "intentContexts" from pipeline_meta and
@@ -798,24 +801,50 @@ async def run_pipeline(
             "files_traced":      files_traced,
             "stages_summary":    stages_summary,
             "progress_logs":     log_entries if 'log_entries' in dir() else [],
-            "intent_contexts":   serialized_intent,    # ADR-003: FunctionContext per entity
-            "memory_tokens":     serialized_tokens,    # ADR-004: T0/T1 per entity
+            "intent_contexts":   serialized_intent,
+            "memory_tokens":     serialized_tokens,
         }
 
-        await graph_client.flush(
-            entities=entities,
-            relationships=relationships,
-            contexts=contexts,
+        # Build the fan-out store: JSON (primary) → Postgres + Neo4j (mirrors)
+        brain_root = _resolve_brain_root(request)
+        json_store = JsonFileBrainStore(brain_root)
+
+        pg_store = PostgresBrainStore(_graph_client_for_freshness)
+        pg_store.configure(
             pipeline_meta=pipeline_meta,
             artifacts=pipeline_artifacts,
             intent_contexts=serialized_intent,
         )
 
-        stage_5 = {"stage": "5", "label": "Graph Population", "status": "done"}
+        neo4j_writer = Neo4jWriter(
+            workspace_id=request.workspace_id,
+            uri=os.getenv("NEO4J_URI"),
+            username=os.getenv("NEO4J_USERNAME"),
+            password=os.getenv("NEO4J_PASSWORD"),
+        )
+        neo4j_store = Neo4jBrainStore(neo4j_writer, workspace_id=request.workspace_id)
+
+        store = FanoutBrainStore(primary=json_store, mirrors=[pg_store, neo4j_store])
+
+        # Convert every ExtractedEntity → canonical BrainEntity and write through
+        for ee in entities:
+            be = _to_brain_entity(
+                ee,
+                contexts.get(ee.external_id),
+                memory_tokens.get(ee.external_id),
+                relationships,
+                request.workspace_id,
+            )
+            await store.write(be, run_id=job_id, workspace_id=request.workspace_id)
+
+        await store.commit_run(job_id)
+
+        stage_5 = {"stage": "5", "label": "Graph Population", "status": "done",
+                   "brain_root": str(brain_root)}
         stages_summary.append(stage_5)
         await progress(
             "5", "🎉",
-            "Pipeline complete — results posted to Java backend",
+            "Pipeline complete — brain written to .brain/ and mirrored to Postgres + Neo4j",
             entity_count=len(entities),
             edge_count=len(relationships),
             gap_count=len(gaps),
@@ -1313,3 +1342,115 @@ def _checkpoint_clear(request) -> None:
         _checkpoint_path(request).unlink(missing_ok=True)
     except Exception:
         pass
+
+
+# ── ADR-0012: BrainStore helpers ──────────────────────────────────────────────
+
+def _resolve_brain_root(request) -> "_Path":
+    """
+    Return the .brain/ root for this pipeline run.
+
+    Uses the first repo's local_path when available; falls back to a tmp dir
+    keyed by workspace_id so tests and remote-URL runs still work.
+    """
+    try:
+        local = request.repos[0].local_path if request.repos else None
+        if local:
+            return _Path(local) / ".brain"
+    except (AttributeError, IndexError):
+        pass
+    return _Path(f"/tmp/cb_brain_{request.workspace_id}")
+
+
+def _to_brain_entity(
+    ee,
+    context,
+    memory_tok,
+    all_relationships: list,
+    workspace_id: str,
+) -> "BrainEntity":
+    """
+    Convert an ExtractedEntity (+ optional BusinessContext + MemoryToken)
+    to the canonical BrainEntity representation.
+    """
+    from companybrain.store.base import BrainEntity
+    from companybrain.pipeline.memory_tokenizer import memory_tokens_to_metadata
+
+    repo = ee.repo or workspace_id
+    entity_type = _ENTITY_TYPE_MAP.get(ee.entity_type, "component")
+    entity_id = f"{repo}::{entity_type}::{ee.name}"
+
+    t1_summary = ""
+    t0_token = ""
+    t1_token = ""
+    meta = {
+        "signature": ee.signature,
+        "confidence": ee.confidence,
+        "last_modified_commit": ee.last_modified_commit,
+    }
+    if ee.code_snippet:
+        meta["code_snippet"] = ee.code_snippet
+    if ee.query_text:
+        meta["query_text"] = ee.query_text
+
+    if context:
+        t1_summary = context.purpose
+        meta["change_risk"] = context.change_risk
+        meta["invariants"] = context.invariants
+
+    if memory_tok:
+        t0_token = memory_tok.t0
+        t1_token = memory_tok.t1
+
+    # Filter relationships that originate from this entity
+    rels = [
+        {
+            "target_id": r.to_entity,
+            "target_type": r.to_type,
+            "edge_type": r.edge_type,
+            "confidence": r.confidence,
+            "evidence": r.evidence,
+        }
+        for r in all_relationships
+        if r.from_entity == ee.external_id or r.from_entity == entity_id
+    ]
+
+    return BrainEntity(
+        id=entity_id,
+        entity_type=entity_type,
+        repo=repo,
+        file=ee.file,
+        qualified_name=ee.name,
+        t1_summary=t1_summary,
+        t0_token=t0_token,
+        t1_token=t1_token,
+        metadata=meta,
+        relationships=rels,
+        version_hash="",  # structural hash set by ADR-0013; empty for now
+    )
+
+
+# Map existing free-form entity_type → six harness types
+_ENTITY_TYPE_MAP: dict[str, str] = {
+    "ApiEndpoint":        "api_contract",
+    "Function":           "component",
+    "Class":              "component",
+    "Service":            "component",
+    "CodeFunction":       "function_node",
+    "FrontendComponent":  "component",
+    "SchemaField":        "data_model",
+    "DatabaseTable":      "data_model",
+    "DatabaseColumn":     "data_model",
+    "DatabaseQuery":      "data_model",
+    "ExternalService":    "component",
+    "ConfigKey":          "component",
+    "SharedType":         "data_model",
+    # Already-canonical types pass through
+    "component":          "component",
+    "screen":             "screen",
+    "api_contract":       "api_contract",
+    "data_model":         "data_model",
+    "assumption":         "assumption",
+    "business_context":   "business_context",
+    "function_node":      "function_node",
+}

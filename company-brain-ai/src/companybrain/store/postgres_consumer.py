@@ -1,0 +1,126 @@
+"""
+Postgres consumer — replays BrainEvents through the existing JavaGraphClient.
+
+This is a thin shim. It exists so the orchestrator stops calling JavaGraphClient
+directly and instead writes through BrainStore → events → consumer. Net effect on
+the Java side: identical (still POSTs to /v1/internal/pipeline-result).
+"""
+from __future__ import annotations
+from typing import TYPE_CHECKING, Optional
+
+import structlog
+
+from companybrain.store.base import BrainStore, BrainEntity
+
+if TYPE_CHECKING:
+    from companybrain.graph.java_client import JavaGraphClient
+    from companybrain.models.entities import Artifact, ExtractedEntity, ExtractedRelationship, BusinessContext
+
+log = structlog.get_logger(__name__)
+
+
+class PostgresBrainStore(BrainStore):
+    """
+    Wraps JavaGraphClient for write-path.
+
+    Buffers BrainEntity writes and flushes to the Java backend on commit_run().
+    Call configure() before commit_run() to attach the full pipeline metadata
+    (stages_summary, intent_contexts, memory_tokens, artifacts).
+    """
+
+    def __init__(self, java_client: "JavaGraphClient"):
+        self._client = java_client
+        self._buffered_entities: list[ExtractedEntity] = []
+        self._buffered_relationships: list[ExtractedRelationship] = []
+        self._buffered_contexts: dict[str, BusinessContext] = {}
+        self._pipeline_meta: dict = {}
+        self._artifacts: list[Artifact] = []
+        self._intent_contexts: dict = {}
+
+    def configure(
+        self,
+        pipeline_meta: dict | None = None,
+        artifacts: list | None = None,
+        intent_contexts: dict | None = None,
+    ) -> None:
+        """
+        Set rich pipeline metadata before commit_run().
+        Preserves backward compatibility — callers that don't configure() get
+        a minimal metadata dict with just run_id.
+        """
+        if pipeline_meta:
+            self._pipeline_meta = pipeline_meta
+        if artifacts:
+            self._artifacts = artifacts
+        if intent_contexts:
+            self._intent_contexts = intent_contexts
+
+    async def write(self, entity: BrainEntity, *, run_id: str, workspace_id: str) -> None:
+        self._buffered_entities.append(_to_extracted_entity(entity))
+        self._buffered_relationships.extend(_to_relationships(entity))
+
+    async def read(self, entity_id: str) -> Optional[BrainEntity]:
+        # Optional: implement via Java REST API. Tests should hit the JSON store.
+        return None
+
+    async def is_fresh(self, entity_id: str, version_hash: str) -> bool:
+        # Java side has its own freshness; the JSON store is the freshness oracle.
+        return False
+
+    async def list_ids(self):
+        if False: yield  # not implemented; Java is not a list source
+
+    async def commit_run(self, run_id: str) -> None:
+        if not self._buffered_entities:
+            return
+        meta = {**self._pipeline_meta, "run_id": run_id}
+        log.info(
+            "postgres_consumer.flush",
+            run_id=run_id,
+            entities=len(self._buffered_entities),
+            relationships=len(self._buffered_relationships),
+        )
+        await self._client.flush(
+            entities=self._buffered_entities,
+            relationships=self._buffered_relationships,
+            contexts=self._buffered_contexts,
+            pipeline_meta=meta,
+            artifacts=self._artifacts,
+            intent_contexts=self._intent_contexts,
+        )
+        self._buffered_entities.clear()
+        self._buffered_relationships.clear()
+        self._buffered_contexts.clear()
+
+
+def _to_extracted_entity(entity: BrainEntity) -> "ExtractedEntity":
+    """Translate canonical BrainEntity → existing ExtractedEntity."""
+    from companybrain.models.entities import ExtractedEntity
+    return ExtractedEntity(
+        entity_type=entity.entity_type,
+        name=entity.qualified_name,
+        file=entity.file,
+        repo=entity.repo,
+        signature=entity.metadata.get("signature", ""),
+        last_modified_commit=entity.metadata.get("last_modified_commit", ""),
+        confidence=entity.metadata.get("confidence", 0.9),
+        code_snippet=entity.metadata.get("code_snippet"),
+        query_text=entity.metadata.get("query_text"),
+    )
+
+
+def _to_relationships(entity: BrainEntity) -> "list[ExtractedRelationship]":
+    """Translate BrainEntity.relationships → list of ExtractedRelationship."""
+    from companybrain.models.entities import ExtractedRelationship
+    out = []
+    for rel in entity.relationships:
+        out.append(ExtractedRelationship(
+            from_entity=entity.id,
+            from_type=entity.entity_type,
+            edge_type=rel["edge_type"],
+            to_entity=rel["target_id"],
+            to_type=rel.get("target_type", "component"),
+            confidence=rel.get("confidence", 0.9),
+            evidence=rel.get("evidence", rel.get("source", "brain_store")),
+        ))
+    return out

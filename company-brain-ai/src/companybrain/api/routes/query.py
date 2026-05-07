@@ -98,6 +98,15 @@ async def query_graph(request: QueryRequest):
             max_hops=request.max_hops,
         )
 
+    # ── Step 2b: Hybrid retrieval fallback (ADR-0015) ─────────────────────────
+    # When the Java assembler is unavailable, supplement context with
+    # HybridSearcher (BM25S + dense + RRF) over the .brain/ entity store.
+    if not assembled_context:
+        hybrid_context = await _hybrid_retrieve(request.question, request.workspace_id)
+        if hybrid_context:
+            assembled_context = hybrid_context
+            log.info("[query] Using hybrid retrieval context (Java assembler unavailable)")
+
     # ── Step 3: Build LLM prompt ──────────────────────────────────────────────
     if assembled_context:
         user_content = (
@@ -239,6 +248,34 @@ async def _assemble_context(
         log.warning("[query] Context assembly failed — falling back to no context",
                     error=str(exc), focal_node_id=focal_node_id)
         return None, {}
+
+
+async def _hybrid_retrieve(question: str, workspace_id: str) -> str | None:
+    """Retrieve relevant entities via HybridSearcher as a fallback context source."""
+    try:
+        from pathlib import Path
+        from companybrain.retrieval.hybrid_search import HybridSearcher
+        from companybrain.store.identity import workspace_slug_for
+
+        brain_root_env = os.environ.get("BRAIN_ROOT", "")
+        if not brain_root_env:
+            return None
+        brain_root = Path(brain_root_env)
+        workspace_slug = workspace_slug_for(workspace_id)
+        searcher = HybridSearcher(brain_root=brain_root, workspace_slug=workspace_slug)
+        hits = searcher.search(question, top_k=10)
+        if not hits:
+            return None
+        lines = ["## Hybrid Retrieval Results\n"]
+        for hit in hits:
+            payload = hit.payload
+            name = payload.get("qualified_name") or hit.urn.split(":")[-1]
+            summary = payload.get("t1_summary", "")
+            lines.append(f"- **{name}** ({payload.get('entity_type', '')}): {summary}")
+        return "\n".join(lines)
+    except Exception as exc:
+        log.debug("[query] Hybrid retrieval failed (non-fatal)", error=str(exc))
+        return None
 
 
 def _symbol_from_file(file_path: str | None) -> str | None:

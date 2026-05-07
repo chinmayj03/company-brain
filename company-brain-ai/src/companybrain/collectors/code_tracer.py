@@ -35,14 +35,14 @@ log = structlog.get_logger(__name__)
 # ── Module-level hybrid searcher singleton ────────────────────────────────────
 # Keeps the BM25 index + Qdrant connection alive across calls so we don't
 # rebuild the index on every trace invocation.
-_HYBRID_SEARCHER: Optional["HybridSearcher"] = None
+_HYBRID_SEARCHER: Optional["FileHybridSearcher"] = None
 
 
-def _get_hybrid_searcher() -> "HybridSearcher":
+def _get_hybrid_searcher() -> "FileHybridSearcher":
     global _HYBRID_SEARCHER
     if _HYBRID_SEARCHER is None:
-        from companybrain.retrieval.hybrid_search import HybridSearcher
-        _HYBRID_SEARCHER = HybridSearcher()
+        from companybrain.retrieval.hybrid_search import FileHybridSearcher
+        _HYBRID_SEARCHER = FileHybridSearcher()
     return _HYBRID_SEARCHER
 
 

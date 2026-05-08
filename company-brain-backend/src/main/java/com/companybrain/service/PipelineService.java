@@ -199,6 +199,7 @@ public class PipelineService {
                         id.toString(),
                         workspaceId.toString(),
                         dto.getEntityType(),
+                        toEntityType(dto.getEntityType()),
                         extId,
                         dto.getName(),
                         toJson(meta),
@@ -210,13 +211,14 @@ public class PipelineService {
             // The ON CONFLICT guard covers re-runs: same (workspace, type, extId) → upsert.
             // nodes.urn is written when the AI service supplies it (ADR-0013 transition).
             jdbc.batchUpdate("""
-                    INSERT INTO nodes (id, workspace_id, node_type, external_id, name, metadata, urn)
-                    VALUES (?::uuid, ?::uuid, ?, ?, ?, ?::jsonb, ?)
+                    INSERT INTO nodes (id, workspace_id, node_type, entity_type, external_id, name, metadata, urn)
+                    VALUES (?::uuid, ?::uuid, ?, ?, ?, ?, ?::jsonb, ?)
                     ON CONFLICT (workspace_id, node_type, external_id)
                     DO UPDATE SET
-                        name     = EXCLUDED.name,
-                        metadata = EXCLUDED.metadata,
-                        urn      = COALESCE(EXCLUDED.urn, nodes.urn)
+                        name        = EXCLUDED.name,
+                        metadata    = EXCLUDED.metadata,
+                        entity_type = EXCLUDED.entity_type,
+                        urn         = COALESCE(EXCLUDED.urn, nodes.urn)
                     """, rows);
 
             entityCount = rows.size();
@@ -554,6 +556,22 @@ public class PipelineService {
             case "LOW"  -> "high";
             case "HIGH" -> "low";
             default     -> "medium";
+        };
+    }
+
+    /** Maps raw LLM node_type to the constrained entity_type taxonomy (V6 migration). */
+    private static String toEntityType(String nodeType) {
+        return switch (nodeType) {
+            case "ApiEndpoint"                       -> "api_contract";
+            case "SchemaField", "DatabaseTable",
+                 "DatabaseColumn", "DatabaseQuery",
+                 "SharedType"                        -> "data_model";
+            case "FrontendComponent", "Screen"       -> "component";
+            case "Assumption"                        -> "assumption";
+            case "BusinessContext"                   -> "business_context";
+            case "Function", "CodeFunction",
+                 "Method"                            -> "function_node";
+            default                                  -> "component";
         };
     }
 

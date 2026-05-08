@@ -117,14 +117,14 @@ ai: $(AI_VENV) ## Start Python FastAPI AI service (port 8000)
 	@echo "LLM Provider: $$(grep '^LLM_PROVIDER' $(ENV_FILE) 2>/dev/null || echo 'groq (default)')"
 	cd company-brain-ai && \
 		.venv/bin/uvicorn companybrain.api.main:app \
-		--host 0.0.0.0 --port 8000 --reload --env-file .env
+		--host 0.0.0.0 --port 8000 --reload --env-file ../.env
 
 mcp: $(AI_VENV) ## Start MCP server (HTTP+SSE, port 9000) — connects Claude Code / Cursor to company-brain
 	@echo "$(CYAN)Starting MCP server...$(RESET)"
 	@echo "Backend URL: $$(grep '^BACKEND_URL' $(ENV_FILE) 2>/dev/null || echo 'http://localhost:8080 (default)')"
 	cd company-brain-ai && \
 		.venv/bin/uvicorn companybrain.mcp.server:asgi_app \
-		--host 0.0.0.0 --port 9000 --reload --env-file .env
+		--host 0.0.0.0 --port 9000 --reload --env-file ../.env
 
 mcp-stdio: $(AI_VENV) ## Run MCP server over stdio (on-prem agent mode — for direct Claude Code integration)
 	@echo "$(CYAN)Starting MCP server (stdio)...$(RESET)"

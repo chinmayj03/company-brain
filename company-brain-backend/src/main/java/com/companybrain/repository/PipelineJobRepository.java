@@ -5,6 +5,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.Optional;
@@ -19,6 +20,7 @@ public interface PipelineJobRepository extends JpaRepository<PipelineJob, UUID> 
      * Update only the progress_logs column — no SELECT needed.
      * Avoids the fetch-then-save pattern that fires a SELECT on every progress push.
      */
+    @Transactional
     @Modifying
     @Query(value = "UPDATE pipeline_jobs SET progress_logs = CAST(:logs AS jsonb) WHERE id = :jobId",
            nativeQuery = true)
@@ -29,6 +31,7 @@ public interface PipelineJobRepository extends JpaRepository<PipelineJob, UUID> 
      * stage_summary and progress_logs are JSONB columns; Spring passes them as text
      * which Postgres CAST handles automatically.
      */
+    @Transactional
     @Modifying
     @Query(value = """
             UPDATE pipeline_jobs SET
@@ -59,6 +62,7 @@ public interface PipelineJobRepository extends JpaRepository<PipelineJob, UUID> 
     /**
      * Mark a job as failed in a single UPDATE — no SELECT + save round-trip.
      */
+    @Transactional
     @Modifying
     @Query(value = """
             UPDATE pipeline_jobs SET

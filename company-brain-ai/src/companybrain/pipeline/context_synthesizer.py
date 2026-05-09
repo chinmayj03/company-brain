@@ -275,8 +275,9 @@ class ContextSynthesizer:
         if entity.code_snippet:
             parts.append(f"\n## Method Body\n```java\n{entity.code_snippet[:500]}\n```")
 
-        # For database queries include the SQL/JPQL directly
-        if entity.entity_type == "DatabaseQuery" and entity.query_text:
+        # For database queries and interface methods include the SQL/JPQL directly.
+        # InterfaceMethod may have @Query body in query_text (e.g. Spring Data JPA).
+        if entity.query_text and entity.entity_type in ("DatabaseQuery", "InterfaceMethod"):
             parts.append(f"\n## Query\n```sql\n{entity.query_text}\n```")
 
         if context.get("human_annotations"):

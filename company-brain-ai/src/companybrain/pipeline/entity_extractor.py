@@ -101,12 +101,13 @@ Return ONLY valid JSON — no markdown fences, no explanation. Start with { end 
 | Type              | When to use |
 |-------------------|-------------|
 | ApiEndpoint       | The HTTP handler method itself (controller action) |
-| Function          | Any method/function that processes, transforms, or orchestrates data for this endpoint |
+| Function          | Any method/function in a class body that processes, transforms, or orchestrates data |
+| InterfaceMethod   | A method declared in an interface or abstract class with NO body — JPA derived queries, @Query methods, abstract service contracts |
 | Class             | Any class, interface, abstract class, or record (include services, repos, domain objects) |
 | SchemaField       | Request/response DTO fields — format: "ClassName.fieldName" |
 | DatabaseTable     | A DB table or entity class representing one (format: table_name) |
 | DatabaseColumn    | A specific column accessed — format: "table_name.column_name" |
-| DatabaseQuery     | Any DB access: @Query, JPQL, jOOQ, raw JDBC, JPA derived method, stored proc call |
+| DatabaseQuery     | Concrete DB access with queryable SQL: @Query body, JPQL, jOOQ DSL chain, raw JDBC, stored proc call. ONLY use when query_text can be populated |
 | FrontendComponent | React/Angular/Vue component that renders this endpoint's data |
 | ExternalService   | Downstream HTTP client, gRPC call, or message publish |
 | ConfigKey         | Feature flag, env var, or @Value property that gates this endpoint's behaviour |
@@ -122,13 +123,19 @@ Return ONLY valid JSON — no markdown fences, no explanation. Start with { end 
 5. Every request/response field that carries business meaning → SchemaField
 6. Every external service call → ExternalService
 
-### DatabaseQuery — extract ALL of these
-- @Query("...") annotations → use the JPQL/SQL verbatim as query_text
-- JPA derived method names (findBy..., countBy..., existsBy...) → query_text = "JPA derived: <method>"
-- jOOQ DSL chains (dsl.selectFrom(...).where(...)) → reconstruct approximate SQL as query_text
-- JDBC prepareStatement("...") → use the SQL string as query_text
-- Named queries (@NamedQuery) → include the JPQL
-- Stored procedure calls → query_text = "CALL <proc_name>(...)"
+### InterfaceMethod vs DatabaseQuery — critical distinction
+- Interface method WITH a body (jOOQ DSL chain, JDBC call) → DatabaseQuery (query_text populated)
+- Interface method WITH @Query annotation → InterfaceMethod (set query_text to the JPQL/SQL)
+- Interface method WITHOUT a body and WITHOUT @Query → InterfaceMethod (query_text = null)
+  These are JPA derived queries (findBy*, countBy*): emit InterfaceMethod, NOT DatabaseQuery.
+  A DatabaseQuery MUST have a query_text. Never emit DatabaseQuery with empty query_text.
+
+### DatabaseQuery — only for concrete SQL access
+- @Query("...") on interface method → prefer InterfaceMethod with query_text set
+- jOOQ DSL chains (dsl.selectFrom(...).where(...)) in a method body → DatabaseQuery
+- JDBC prepareStatement("...") in a method body → DatabaseQuery
+- Named queries (@NamedQuery) → DatabaseQuery with the JPQL
+- Stored procedure calls → DatabaseQuery, query_text = "CALL <proc_name>(...)"
 
 ### DatabaseColumn — extract when
 - A specific column name appears in a WHERE clause, SELECT list, or UPDATE SET

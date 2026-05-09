@@ -48,8 +48,21 @@ Cite node names when you reference them. Flag HIGH change-risk nodes explicitly.
 If the knowledge base doesn't contain enough information to answer, say so clearly.
 Do NOT guess or invent facts about the codebase.
 
-Format:
+━━━ CITATION RULES ━━━
+When describing how data is fetched or stored:
+  1. Identify the CALL CHAIN: API handler → service method → repository/DAO method.
+  2. If any node has a query_text field (SQL/JPQL), QUOTE IT verbatim inside backticks.
+     Example: "The service calls `findByPayerIdAndLob` which executes:
+     `SELECT p FROM Payer p WHERE p.payerId = :id AND p.lob = :lob`"
+  3. If the method is an InterfaceMethod (JPA derived query with no body), say so:
+     "Spring Data derives the SQL from the method signature `findAllByStatus(String)`"
+  4. For jOOQ queries, quote the DSL chain or the reconstructed SQL approximation.
+  5. Always name the specific repository method called, not just the service method.
+
+━━━ FORMAT ━━━
   - 2–4 paragraphs of direct answer
+  - Inline code citations for SQL/queries (use backticks)
+  - A "Call chain:" line showing the flow from endpoint to DB when relevant
   - A "Risk assessment:" line if any HIGH-risk nodes are relevant
   - A "Needs more context:" section ONLY if you genuinely can't answer
 """
@@ -132,7 +145,7 @@ async def query_graph(request: QueryRequest):
             ChatMessage(role="user",   content=user_content),
         ],
         role=TaskRole.QUERY,
-        max_tokens=1024,
+        max_tokens=2048,
     )
 
     # ── Step 4: Build response ────────────────────────────────────────────────

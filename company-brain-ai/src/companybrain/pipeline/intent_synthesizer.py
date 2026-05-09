@@ -139,6 +139,10 @@ _INTENT_SYSTEM = """You are a senior software engineer extracting business inten
 For EACH method listed, classify its intent and extract its business semantics.
 You will receive: class context, call sites, table reads/writes, and method source.
 
+InterfaceMethod entities (JPA repository interface declarations, abstract service contracts)
+have no method body. Use the method name, signature, and any provided query_text to infer
+their intent. They are almost always `data_read` or `data_write`.
+
 ━━━ OUTPUT FORMAT ━━━
 Output ONLY valid JSON — no markdown, no explanation, no extra text:
 {"methods": [

@@ -309,7 +309,7 @@ ask:
 	@echo "$(CYAN)→ Asking via Python /query (uses Sonnet 4.6)$(NC)"
 	@echo "  Q: $(Q)"
 	@echo ""
-	@curl -sS -X POST http://localhost:$(AI_PORT)/query/ \
+	@curl -sS -X POST http://localhost:$(AI_PORT)/query \
 	    -H 'Content-Type: application/json' \
 	    -d '{ \
 	      "task":         "$(Q)", \

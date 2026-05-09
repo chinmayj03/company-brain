@@ -101,12 +101,12 @@ async def _run_and_callback(request: AiRunRequest):
 
     # Build PipelineStartRequest from the Java payload
     repos = []
-    for r in request.repos:
+    for repo in request.repos:
         repos.append(RepoConfig(
-            local_path=r.get("local_path"),
-            url=r.get("url"),
-            type=RepoType(r.get("type", "backend")),
-            branch=r.get("branch", "main"),
+            local_path=repo.get("local_path"),
+            url=repo.get("url"),
+            type=RepoType(repo.get("type", "backend")),
+            branch=repo.get("branch", "main"),
         ))
 
     pipeline_request = PipelineStartRequest(
@@ -119,12 +119,52 @@ async def _run_and_callback(request: AiRunRequest):
     # Attach job_id so orchestrator can pass it to JavaGraphClient
     pipeline_request.__dict__["job_id"] = request.job_id
 
-    await run_pipeline(
-        pipeline_request,
-        on_progress=on_progress,
-        java_callback_url=request.callback_url,
-        java_callback_key=request.callback_key,
-    )
+    started_at = log_entries[0]["ts"] if log_entries else datetime.utcnow().isoformat()
+    try:
+        result = await run_pipeline(
+            pipeline_request,
+            on_progress=on_progress,
+            java_callback_url=request.callback_url,
+            java_callback_key=request.callback_key,
+        )
+        final_status = result.status
+        final_state = {
+            "status": final_status,
+            "job_id": request.job_id,
+            "started_at":   started_at,
+            "completed_at": datetime.utcnow().isoformat(),
+            "result": {
+                "entity_count":      result.entity_count,
+                "edge_count":        result.edge_count,
+                "gap_count":         result.gap_count,
+                "code_units_found":  result.code_units_found,
+                "git_commits_found": result.git_commits_found,
+                "files_traced":      result.files_traced[:20],
+                "stages_summary":    result.stages_summary,
+            },
+            "error": result.error,
+            "progress": {
+                "logs": log_entries,
+                "current_stage": "done" if final_status == "completed" else "error",
+            },
+        }
+    except Exception as exc:
+        # Polling clients hang forever if we don't write a terminal status — mark failed.
+        final_state = {
+            "status": "failed",
+            "job_id": request.job_id,
+            "started_at":   started_at,
+            "completed_at": datetime.utcnow().isoformat(),
+            "error": str(exc),
+            "progress": {"logs": log_entries, "current_stage": "error"},
+        }
+        raise
+    finally:
+        # Always write a terminal Redis state so the run-cli polling loop exits.
+        try:
+            await r.setex(f"job:{request.job_id}", JOB_TTL, json.dumps(final_state))
+        except Exception:
+            pass
 
 
 # ── Legacy: direct-from-frontend (Redis-backed) ──────────────────────────────

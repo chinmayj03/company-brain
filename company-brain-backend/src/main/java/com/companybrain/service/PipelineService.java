@@ -141,6 +141,14 @@ public class PipelineService {
                 result.getEntities()      != null ? result.getEntities().size()      : 0,
                 result.getRelationships() != null ? result.getRelationships().size() : 0);
 
+        // Internal endpoints carry no JWT, so RlsInterceptor never sets app.workspace_id
+        // for this connection. Without it, the FORCE'd RLS policy on `nodes` filters
+        // every row from SELECT — Phase 1's pre-load returns empty, fresh UUIDs are
+        // generated, the ON CONFLICT path keeps the existing row id, and Phase 5's
+        // artifact_links insert then references node UUIDs that don't exist in DB.
+        // Bind the session variable for this transaction so SELECTs see the workspace.
+        setWorkspaceForRls(workspaceId);
+
         if ("failed".equals(result.getStatus())) {
             markFailed(jobId, workspaceId, result.getErrorMessage(),
                     result.getProgressLogs() != null ? result.getProgressLogs()
@@ -573,6 +581,27 @@ public class PipelineService {
                  "Method"                            -> "function_node";
             default                                  -> "component";
         };
+    }
+
+    /**
+     * Bind app.workspace_id for the current transaction so RLS policies on
+     * nodes/edges/node_context/artifacts/etc. resolve correctly. Internal-key
+     * endpoints (AI service callbacks) bypass JwtAuthFilter and the RlsInterceptor
+     * never sees a workspace, so we must set it here from the request body.
+     *
+     * SET LOCAL is scoped to the active transaction and reverts on commit/rollback,
+     * so the pooled connection is safe to reuse for the next request. The UUID
+     * is interpolated directly because it has been parsed/validated by Jackson
+     * before reaching this method (no injection surface).
+     */
+    private void setWorkspaceForRls(UUID workspaceId) {
+        if (workspaceId == null) return;
+        try {
+            jdbc.execute("SET LOCAL app.workspace_id = '" + workspaceId + "'");
+        } catch (Exception e) {
+            log.warn("[pipeline] Failed to set RLS session variable  workspace={}  err={}",
+                    workspaceId, e.getMessage());
+        }
     }
 
     private String toJson(Object obj) {

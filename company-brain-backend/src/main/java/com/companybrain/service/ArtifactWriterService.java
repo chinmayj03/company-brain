@@ -12,6 +12,7 @@ import com.companybrain.repository.ArtifactRepository;
 import com.companybrain.repository.NodeRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -47,6 +48,7 @@ public class ArtifactWriterService {
     private final ArtifactLinkRepository      artifactLinkRepository;
     private final ArtifactChangeEventRepository changeEventRepository;
     private final NodeRepository              nodeRepository;
+    private final JdbcTemplate                jdbc;
 
     // ── Artifact upsert ───────────────────────────────────────────────────────
 
@@ -104,6 +106,18 @@ public class ArtifactWriterService {
 
         if (checks == null || checks.isEmpty()) {
             return new ArtifactFreshnessResponse(List.of());
+        }
+
+        // Internal endpoint — no JWT, so RlsInterceptor never set app.workspace_id.
+        // Without it, FORCE'd RLS on artifacts/nodes filters every row, and freshness
+        // would always report "dirty" even for unchanged files.
+        if (workspaceId != null) {
+            try {
+                jdbc.execute("SET LOCAL app.workspace_id = '" + workspaceId + "'");
+            } catch (Exception e) {
+                log.warn("[freshness] Failed to set RLS session variable  workspace={}  err={}",
+                        workspaceId, e.getMessage());
+            }
         }
 
         // Build lookup maps from DB (2 queries total)

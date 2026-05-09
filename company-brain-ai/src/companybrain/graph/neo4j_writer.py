@@ -829,18 +829,35 @@ RETURN count(n) AS c
 
     def _external_id_to_urn(self, external_id: str) -> str:
         """
-        Convert a pipeline external_id (repo/file::name) to a canonical URN.
+        Convert a pipeline external_id to a canonical URN, preserving real repo
+        + type information so the resulting URN matches the corresponding node.
 
-        external_id format: "{repo}/{file}::{name}"
-        Falls back to `build_llm_urn` for edge IDs that cannot be resolved to
-        a canonical form without entity_type information.
+        Accepted input shapes:
+          - already a URN  ("urn:cb:...")  → returned unchanged
+          - "{repo}/{file}::{name}"        → URN with that repo
+          - bare name                      → fallback to "monorepo" / "component"
+
+        Critical bug it fixes: previously this method always emitted
+        urn:cb:{tenant}:{domain}:monorepo:component:{name} regardless of the
+        entity's actual repo/type. Nodes were stored under
+        urn:cb:{tenant}:{domain}:network-iq-backend-java:component:{name}, so
+        MATCH (src {id: $edge_source_urn}) silently found nothing — every
+        edge was orphaned in Neo4j and blast-radius returned 0 hops.
         """
+        # Already a canonical URN? Return as-is so node/edge URNs line up.
+        if external_id.startswith("urn:"):
+            return external_id
+
         tenant = workspace_slug_for(self.workspace_id)
-        parts = external_id.split("::", 1)
+        parts  = external_id.split("::", 1)
         if len(parts) == 2:
-            name_part = parts[1]
+            # "{repo}/{file_or_path}::{name}" — use the real repo segment so
+            # the URN matches what _entity_to_row produced for the node.
+            repo_and_path = parts[0]
+            name_part     = parts[1]
+            real_repo     = repo_and_path.split("/", 1)[0] or "monorepo"
             return to_urn(
-                tenant=tenant, domain=DEFAULT_DOMAIN, repo="monorepo",
+                tenant=tenant, domain=DEFAULT_DOMAIN, repo=real_repo,
                 entity_type="component", qualified_name=name_part,
             )
         return to_urn(

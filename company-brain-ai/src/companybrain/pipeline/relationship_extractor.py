@@ -262,9 +262,12 @@ class RelationshipExtractor:
 
     # Approximate chars-per-token ratio for Llama models (conservative)
     _CHARS_PER_TOKEN = 3.5
-    # Leave headroom for system prompt (~2800 tokens) + output (~1024 tokens)
-    # BALANCED model on Groq free tier has 30k TPM; cap input at 5000 tokens ≈ 17500 chars
-    _MAX_INPUT_CHARS = 17_500
+    # Leave headroom for system prompt (~2800 tokens) + output (~1024 tokens).
+    # Anthropic Claude Haiku/Sonnet allow much larger inputs (200k context, 200k TPM)
+    # than the old Groq Llama free-tier 30k TPM, so we can give the relationship
+    # extractor a much bigger window. Old cap of 17.5k starved the model of call
+    # sites and is the root cause of '8 edges out of 110 entities'.
+    _MAX_INPUT_CHARS = 60_000
 
     def _build_user_message(
         self,
@@ -306,26 +309,36 @@ class RelationshipExtractor:
         _add("\n".join(entity_lines))
 
         # ── Priority 3: method body snippets ─────────────────────────────────
+        # Old cap of 6 entities × 380 chars = 2280 chars total of body code is the
+        # root cause of '8 edges per 110 entities'. The relationship LLM cannot
+        # find call sites it cannot see. Now we expose up to 30 entities and
+        # let each get up to 1500 chars (matches ADR-0040 Tier 1.B snippet size),
+        # subject to the overall 60k-char budget.
         snippets = [
             e for e in entities
             if e.entity_type in ("Function", "ApiEndpoint") and e.code_snippet
         ]
         if snippets:
             _add("\n## Method Body Snippets (find CALLS relationships from these)")
-            # Dynamically shrink snippet size to share the remaining budget
-            per_snippet = max(150, min(380, budget // max(1, len(snippets[:6]))))
-            for entity in snippets[:6]:
+            top_snippets = snippets[:30]
+            # Reserve ~6k chars for low-priority sections (queries + commits).
+            snippet_budget = max(0, budget - 6_000)
+            per_snippet = max(400, min(1500, snippet_budget // max(1, len(top_snippets))))
+            for entity in top_snippets:
                 fname = entity.file.split("/")[-1]
                 block = f"\n### {entity.name}  [{fname}]\n```\n{entity.code_snippet[:per_snippet]}\n```"
                 if not _add(block):
                     break
 
         # ── Priority 4: database queries ──────────────────────────────────────
+        # Bumped from 5 → 20 queries; bumped per-query from 150 → 400 chars so
+        # JOIN clauses / WHERE columns aren't truncated mid-token. Without this,
+        # READS_COLUMN / WRITES_COLUMN edges were almost never extracted.
         queries = [e for e in entities if e.entity_type == "DatabaseQuery" and e.query_text]
         if queries and budget > 200:
             _add("\n## Database Queries (find READS_COLUMN / WRITES_COLUMN edges)")
-            for q in queries[:5]:
-                if not _add(f"\n- {q.name}: `{(q.query_text or '')[:150]}`"):
+            for q in queries[:20]:
+                if not _add(f"\n- {q.name}: `{(q.query_text or '')[:400]}`"):
                     break
 
         # ── Priority 5: commit context (lowest — drop when tight) ────────────

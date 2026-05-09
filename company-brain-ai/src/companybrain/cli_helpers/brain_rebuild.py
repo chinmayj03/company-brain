@@ -20,7 +20,7 @@ async def rebuild_from_json(repo_path: Path, workspace_id: str) -> None:
 
     java = JavaGraphClient(workspace_id=workspace_id, job_id="rebuild")
     pg = PostgresBrainStore(java)
-    n4j = Neo4jBrainStore(Neo4jWriter(), workspace_id=workspace_id)
+    n4j = Neo4jBrainStore(Neo4jWriter(workspace_id=workspace_id), workspace_id=workspace_id)
     qd = QdrantBrainStore(brain_root=repo_path,
                           workspace_slug=workspace_slug_for(workspace_id))
 

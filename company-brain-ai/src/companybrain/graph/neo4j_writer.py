@@ -579,6 +579,14 @@ class Neo4jWriter:
 
         clean_rows = [{**r, "props": _clean_props(r.get("props", {}))} for r in rows]
 
+        # Entry log so we know this function actually fires (helps distinguish
+        # 'rows never reached cypher' from 'cypher failed silently').
+        log.info(
+            "Neo4j _upsert_node_batch ENTER",
+            rows=len(clean_rows),
+            sample_id=(clean_rows[0].get("id") if clean_rows else None),
+        )
+
         cypher = """
 UNWIND $rows AS row
 MERGE (n:CBNode { id: row.id })
@@ -589,11 +597,17 @@ RETURN count(n) AS c
 """
         try:
             async with self._session() as session:
-                await session.run(cypher, rows=clean_rows, scope=self.workspace_id)
+                result = await session.run(cypher, rows=clean_rows, scope=self.workspace_id)
+                # Force materialisation of any error from the server (lazy cursors
+                # can swallow errors until consumed).
+                summary = await result.consume()
+                log.info(
+                    "Neo4j _upsert_node_batch OK",
+                    rows=len(clean_rows),
+                    nodes_created=summary.counters.nodes_created if summary else 0,
+                    props_set=summary.counters.properties_set if summary else 0,
+                )
         except Exception as exc:
-            # Surface the FIRST row's keys + types alongside the error so the
-            # actual cause (NaN / nested dict / unknown property type) is
-            # visible in logs instead of just "ALL batches failed".
             sample = clean_rows[0] if clean_rows else {}
             sample_keys = list((sample.get("props") or {}).keys())
             log.error(

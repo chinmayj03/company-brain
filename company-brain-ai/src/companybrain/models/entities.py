@@ -272,8 +272,16 @@ class QueryRequest(BaseModel):
     max_hops: int = Field(default=3, ge=1, le=5)
 
 
-class QueryResponse(BaseModel):
+class LegacyQueryResponse(BaseModel):
+    """Legacy flat response kept for any callers that haven't migrated.
+
+    New code should import companybrain.models.query_response.QueryResponse.
+    """
     answer: str
     sources: list[dict]
     affected_nodes: list[dict]
     confidence: str
+
+
+# Alias kept for backward compatibility; routes/query.py uses the new typed model.
+QueryResponse = LegacyQueryResponse

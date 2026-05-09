@@ -1,22 +1,27 @@
 """
 POST /query — answer a natural language question using tiered graph context + LLM.
 
-Architecture (ADR-0018: Smart-zone context assembler):
+Architecture (ADR-0018: Smart-zone context assembler, ADR-0043: response layer):
 
   1. SmartZoneAssembler.assemble() classifies the task, runs hybrid retrieval
      (ADR-0015), expands via Neo4j blast-radius, MMR-reranks, tiers into
      T0/T1/T2, compresses task-aware, and renders the final context block.
-  2. Build the LLM system prompt with payload.rendered as the context.
-  3. Call the LLM (configured provider: OpenAI / Anthropic / Ollama / Groq).
-  4. Return answer + source citations.
+  2. Build the LLM messages using the new structured system prompt (ADR-0043).
+  3. Call the LLM, parse the JSON response into a typed QueryResponse.
+  4. Populate raw_markdown via the markdown renderer and return.
 
 Fallback: if SmartZoneAssembler is unavailable (missing .brain/, Neo4j down),
-          falls back to the legacy Java-assembler or hybrid-retrieval path.
+          falls back to the legacy Java-assembler or hybrid-retrieval path and
+          wraps the free-form answer in a minimal QueryResponse envelope.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
+import time
 from pathlib import Path
+from typing import Any
 
 import structlog
 from fastapi import APIRouter
@@ -24,49 +29,20 @@ from fastapi import APIRouter
 import httpx
 
 from companybrain.llm import get_provider, TaskRole, ChatMessage
-from companybrain.models.entities import QueryRequest, QueryResponse
+from companybrain.models.entities import QueryRequest
+from companybrain.models.query_response import (
+    Confidence,
+    QueryResponse,
+    Citation,
+)
+from companybrain.api.prompts.query_system import QUERY_SYSTEM_PROMPT
+from companybrain.api.responses.markdown_renderer import render_to_markdown
 
 router = APIRouter()
 log = structlog.get_logger(__name__)
 
 BACKEND_URL  = os.environ.get("BACKEND_URL", "http://localhost:8080")
 INTERNAL_KEY = os.environ.get("AI_INTERNAL_KEY", "dev-internal-key")
-
-# ── Prompts ───────────────────────────────────────────────────────────────────
-
-QUERY_SYSTEM_PROMPT = """\
-You are a senior software engineer answering questions about a codebase.
-
-You are given a KNOWLEDGE BASE built from the dependency graph of the codebase.
-It is organised in tiers:
-  • T2 blocks (## headers): the most relevant nodes — read carefully.
-  • T1 blocks (### headers): nearby context — skim for relevant facts.
-  • T0 list (## Other Related Nodes): distant nodes — use for awareness only.
-
-Answer the user's question using ONLY information from the KNOWLEDGE BASE.
-Cite node names when you reference them. Flag HIGH change-risk nodes explicitly.
-If the knowledge base doesn't contain enough information to answer, say so clearly.
-Do NOT guess or invent facts about the codebase.
-
-━━━ CITATION RULES ━━━
-When describing how data is fetched or stored:
-  1. Identify the CALL CHAIN: API handler → service method → repository/DAO method.
-  2. If any node has a query_text field (SQL/JPQL), QUOTE IT verbatim inside backticks.
-     Example: "The service calls `findByPayerIdAndLob` which executes:
-     `SELECT p FROM Payer p WHERE p.payerId = :id AND p.lob = :lob`"
-  3. If the method is an InterfaceMethod (JPA derived query with no body), say so:
-     "Spring Data derives the SQL from the method signature `findAllByStatus(String)`"
-  4. For jOOQ queries, quote the DSL chain or the reconstructed SQL approximation.
-  5. Always name the specific repository method called, not just the service method.
-
-━━━ FORMAT ━━━
-  - 2–4 paragraphs of direct answer
-  - Inline code citations for SQL/queries (use backticks)
-  - A "Call chain:" line showing the flow from endpoint to DB when relevant
-  - A "Risk assessment:" line if any HIGH-risk nodes are relevant
-  - A "Needs more context:" section ONLY if you genuinely can't answer
-"""
-
 
 # ── Main handler ──────────────────────────────────────────────────────────────
 
@@ -76,15 +52,14 @@ async def query_graph(request: QueryRequest):
     POST /query
 
     1. SmartZoneAssembler.assemble() builds T0/T1/T2 tiered context (ADR-0018)
-    2. Call LLM with payload.rendered as context
-    3. Return answer + citations
+    2. Call LLM with structured system prompt (ADR-0043)
+    3. Parse typed QueryResponse
+    4. Return structured response
     """
+    t0 = time.monotonic()
     provider = get_provider()
 
     # ── Step 1: Smart-zone assembly (ADR-0018) ────────────────────────────────
-    assembled_context: str | None = None
-    smart_zone_meta: dict = {}
-
     assembled_context, smart_zone_meta = await _smart_zone_assemble(
         task=request.question,
         workspace_id=str(request.workspace_id),
@@ -94,10 +69,9 @@ async def query_graph(request: QueryRequest):
     # ── Step 1b: Legacy Java assembler fallback ───────────────────────────────
     if not assembled_context:
         focal_node_id: str | None = None
-        focal_name: str | None = None
         search_symbol = request.context_symbol or _symbol_from_file(request.file_path)
         if search_symbol:
-            focal_node_id, focal_name = await _resolve_node(
+            focal_node_id, _ = await _resolve_node(
                 request.workspace_id, search_symbol
             )
         if focal_node_id:
@@ -119,7 +93,6 @@ async def query_graph(request: QueryRequest):
             log.info("[query] Using hybrid retrieval context (SmartZone + Java unavailable)")
 
     # ── Step 2: Build LLM prompt ──────────────────────────────────────────────
-    context_quality = "high" if assembled_context else "low"
     if assembled_context:
         user_content = (
             f"KNOWLEDGE BASE:\n\n{assembled_context}\n\n"
@@ -134,10 +107,11 @@ async def query_graph(request: QueryRequest):
         )
 
     # ── Step 3: Call LLM ──────────────────────────────────────────────────────
+    t1 = time.monotonic()
     log.info("[query] Calling LLM",
              task_type=smart_zone_meta.get("task_type"),
              tokens_used=smart_zone_meta.get("tokens_used", 0),
-             quality=context_quality)
+             context_available=bool(assembled_context))
 
     response = await provider.chat(
         messages=[
@@ -145,35 +119,73 @@ async def query_graph(request: QueryRequest):
             ChatMessage(role="user",   content=user_content),
         ],
         role=TaskRole.QUERY,
-        max_tokens=2048,
+        max_tokens=4096,
     )
+    llm_dur = int((time.monotonic() - t1) * 1000)
 
-    # ── Step 4: Build response ────────────────────────────────────────────────
-    sources = []
-    t0_count = len(smart_zone_meta.get("t0", []))
-    t1_count = len(smart_zone_meta.get("t1", []))
-    t2_count = len(smart_zone_meta.get("t2", []))
-    if t0_count or t1_count or t2_count:
-        sources.append({
-            "label": (
-                f"SmartZone: T0={t0_count} T1={t1_count} T2={t2_count} "
-                f"tokens={smart_zone_meta.get('tokens_used', 0)}"
+    # ── Step 4: Parse structured response ────────────────────────────────────
+    query_response = _parse_llm_response(response.content, assembled_context)
+
+    # ── Step 5: Render markdown blob ──────────────────────────────────────────
+    render_to_markdown(query_response)
+
+    dur = int((time.monotonic() - t0) * 1000)
+    log.info(
+        "[query] OK",
+        intent="unknown",
+        confidence=query_response.confidence.level,
+        affected_count=len(query_response.affected_entities),
+        call_chain_len=len(query_response.call_chain),
+        llm_ms=llm_dur,
+        total_ms=dur,
+    )
+    return query_response
+
+
+# ── LLM response parsing ──────────────────────────────────────────────────────
+
+def _parse_llm_response(raw: str, context: str | None) -> QueryResponse:
+    """
+    Parse the LLM's JSON output into a typed QueryResponse.
+
+    Falls back to a minimal envelope when the LLM returns free-form text,
+    so existing consumers always receive the same schema.
+    """
+    # Strip markdown fences the LLM sometimes wraps around JSON.
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+
+    try:
+        data: dict[str, Any] = json.loads(cleaned)
+        return QueryResponse(**data)
+    except Exception as exc:
+        log.warning("[query] LLM output was not valid QueryResponse JSON — wrapping",
+                    error=str(exc), preview=raw[:200])
+        # Wrap free-form text so callers always get the typed schema.
+        confidence_level = (
+            "medium" if context else "low"
+        )
+        return QueryResponse(
+            summary=_strip_uncited(raw),
+            confidence=Confidence(
+                level=confidence_level,
+                rationale="LLM returned free-form text rather than structured JSON",
             ),
-            "node_id": "",
-        })
+        )
 
-    confidence = (
-        "high"   if context_quality == "high" and (t1_count + t2_count) > 1
-        else "medium" if context_quality == "high"
-        else "low"
-    )
 
-    return QueryResponse(
-        answer=response.content,
-        sources=sources,
-        affected_nodes=[],
-        confidence=confidence,
-    )
+_CITATION_RE = re.compile(r"\[urn:cb:[^\]]+\]")
+_CODE_TOKEN_RE = re.compile(r"[A-Z][a-z]+[A-Z]|[a-z]+\.[a-zA-Z]+|[A-Z_]{3,}|\w+\.\w+")
+
+
+def _strip_uncited(text: str) -> str:
+    """Remove sentences that contain code-shaped tokens but no URN citation."""
+    result = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        if _CODE_TOKEN_RE.search(sentence) and not _CITATION_RE.search(sentence):
+            continue
+        result.append(sentence)
+    return " ".join(result) if result else text
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -181,10 +193,7 @@ async def query_graph(request: QueryRequest):
 async def _smart_zone_assemble(
     task: str, workspace_id: str, repo_path: str | None
 ) -> tuple[str | None, dict]:
-    """
-    Run SmartZoneAssembler (ADR-0018) to build T0/T1/T2 tiered context.
-    Returns (rendered_str, meta_dict) or (None, {}) if unavailable.
-    """
+    """Run SmartZoneAssembler; return (rendered_str, meta_dict) or (None, {})."""
     try:
         from neo4j import AsyncGraphDatabase
         from companybrain.assembly.smart_zone import SmartZoneAssembler
@@ -219,7 +228,7 @@ async def _smart_zone_assemble(
         await driver.close()
 
         meta = {
-            "task_type":  payload.task_type,
+            "task_type":   payload.task_type,
             "tokens_used": payload.tokens_used,
             "t0": payload.t0,
             "t1": payload.t1,
@@ -233,10 +242,6 @@ async def _smart_zone_assemble(
 
 
 async def _resolve_node(workspace_id: str, symbol: str) -> tuple[str | None, str | None]:
-    """
-    Search the Java backend for a node matching the given symbol.
-    Returns (node_id, node_name) or (None, None) if not found or backend unavailable.
-    """
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(
@@ -261,10 +266,6 @@ async def _assemble_context(
     question: str,
     max_hops: int,
 ) -> tuple[str | None, dict]:
-    """
-    Call POST /v1/internal/assemble-context on the Java backend.
-    Returns (contextText, traversalMeta) or (None, {}) if unavailable.
-    """
     payload = {
         "workspaceId": workspace_id,
         "focalNodeId": focal_node_id,
@@ -282,7 +283,6 @@ async def _assemble_context(
             resp.raise_for_status()
             data = resp.json()
             return data.get("contextText"), data
-
     except Exception as exc:
         log.warning("[query] Context assembly failed — falling back to no context",
                     error=str(exc), focal_node_id=focal_node_id)
@@ -292,17 +292,7 @@ async def _assemble_context(
 async def _hybrid_retrieve(
     question: str, workspace_id: str, repo_path: str | None = None
 ) -> str | None:
-    """Retrieve relevant entities via HybridSearcher as a fallback context source.
-
-    Resolves brain_root from (in order):
-      1. Caller-supplied repo_path (typically request.repo_path)
-      2. BRAIN_ROOT env var
-
-    Returns None if neither is set OR neither contains a usable .brain/ directory —
-    callers treat None as "no fallback context available."
-    """
     try:
-        from pathlib import Path
         from companybrain.retrieval.hybrid_search import HybridSearcher
         from companybrain.store.identity import workspace_slug_for
 
@@ -328,14 +318,9 @@ async def _hybrid_retrieve(
 
 
 def _symbol_from_file(file_path: str | None) -> str | None:
-    """
-    Derive a search symbol from a file path when no explicit symbol is given.
-    e.g. 'src/services/PaymentService.java' → 'PaymentService'
-    """
     if not file_path:
         return None
     base = file_path.split("/")[-1]
-    # Strip extension
     if "." in base:
         base = base.rsplit(".", 1)[0]
     return base or None

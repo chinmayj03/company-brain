@@ -2,6 +2,46 @@
 brain enrich --repo <path>
 
 Re-enrich the existing graph WITHOUT re-running Stage 1 (entity extraction).
+NB: this CLI is run standalone (no `make backend` env wrapper) so we eagerly
+load .env and patch a few sensible defaults at import time:
+  - ANTHROPIC_API_KEY is required for Stage 2/3 LLM calls.
+  - NEO4J_URI defaults to bolt://neo4j:7687 (Docker network alias) which the
+    standalone CLI cannot resolve — falls back to bolt://localhost:7687 when
+    the env var is unset or pointing at a Docker hostname.
+"""
+from __future__ import annotations
+
+import os
+from pathlib import Path as _Path
+
+# ── Eager env loading — must happen BEFORE anything imports settings ─────────
+def _load_env_for_cli() -> None:
+    """Walk parents of CWD looking for a .env, load it without overriding existing env."""
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except ImportError:
+        # python-dotenv may not be installed in slimmer envs — fall back silently.
+        return
+    # Search a few parent dirs of the package + repo root for .env
+    here = _Path(__file__).resolve()
+    candidates = [
+        _Path.cwd() / ".env",
+        here.parent.parent.parent.parent / ".env",          # company-brain-ai/.env
+        here.parent.parent.parent.parent.parent / ".env",   # company-brain/.env
+    ]
+    for c in candidates:
+        if c.is_file():
+            load_dotenv(c, override=False)
+            break
+
+    # Standalone CLI cannot resolve the Docker network alias `neo4j`. Fall back
+    # to localhost when the env var is unset or still references the alias.
+    uri = os.environ.get("NEO4J_URI", "")
+    if not uri or "neo4j:7687" in uri:
+        os.environ["NEO4J_URI"] = "bolt://localhost:7687"
+
+_load_env_for_cli()
+# ── End env bootstrapping ────────────────────────────────────────────────────
 
 Use case
 --------
@@ -131,32 +171,20 @@ async def enrich_existing(
     if not skip_context:
         print(f"[enrich] Stage 3: Context synthesis over {len(entities)} entities...")
         ctx_syn = ContextSynthesizer()
-        # Synthesize one entity at a time so a single failure doesn't poison the batch.
-        for e in entities:
-            try:
-                ctx = await ctx_syn.synthesize_one(
-                    entity=e,
-                    relationships=relationships,
-                    clusters=[],
-                )
-                if ctx is not None:
-                    contexts[e.external_id] = ctx
-            except AttributeError:
-                # Older synthesizer doesn't expose synthesize_one — fall back to batch.
-                try:
-                    batch = await ctx_syn.synthesize(
-                        entities=[e],
-                        relationships=relationships,
-                        clusters=[],
-                    )
-                    contexts.update(batch)
-                except Exception as exc:
-                    log.warning("Context synth failed for entity",
-                                entity=e.external_id, error=str(exc))
-            except Exception as exc:
-                log.warning("Context synth failed for entity",
-                            entity=e.external_id, error=str(exc))
-        print(f"[enrich] Stage 3: synthesized {len(contexts)} contexts")
+        try:
+            # synthesise_all (British spelling) is the canonical entry; takes
+            # entities + clusters + annotations and gathers per-entity coroutines
+            # internally, returning {external_id: BusinessContext}.
+            contexts = await ctx_syn.synthesise_all(
+                entities=entities,
+                clusters=[],
+                annotations=[],
+            )
+        except Exception as exc:
+            log.error("Context synthesis failed during enrich", error=str(exc))
+            print(f"[enrich] Stage 3 FAILED: {exc} — continuing without new contexts")
+            contexts = {}
+        print(f"[enrich] Stage 3: synthesised {len(contexts)} contexts")
 
     # ── Flush back through fanout ────────────────────────────────────────────
     print(f"[enrich] Posting results to Java backend...")

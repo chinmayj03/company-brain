@@ -359,20 +359,37 @@ class Neo4jWriter:
             return
 
         rows = [self._entity_to_row(e) for e in entities]
-        # Process in batches of BATCH_SIZE
+        # Process in batches of BATCH_SIZE; track which actually succeeded so the
+        # success log doesn't lie when every batch errored (e.g. DNS fail to neo4j:7687).
+        succeeded = 0
+        failed    = 0
         for i in range(0, len(rows), BATCH_SIZE):
             batch = rows[i : i + BATCH_SIZE]
-            await self._run_with_retry(
+            result = await self._run_with_retry(
                 self._upsert_node_batch,
                 batch,
                 context=f"upsert_entities batch {i // BATCH_SIZE}",
             )
+            # _run_with_retry returns None on failure, otherwise the inner result.
+            if result is None:
+                failed += len(batch)
+            else:
+                succeeded += len(batch)
 
-        log.info(
-            "Neo4j upserted entities",
-            count=len(entities),
-            workspace=self.workspace_id,
-        )
+        if failed and not succeeded:
+            log.error(
+                "Neo4j upsert_entities — ALL batches failed",
+                attempted=len(entities),
+                workspace=self.workspace_id,
+            )
+        else:
+            log.info(
+                "Neo4j upserted entities",
+                attempted=len(entities),
+                succeeded=succeeded,
+                failed=failed,
+                workspace=self.workspace_id,
+            )
 
     async def upsert_relationships(
         self, relationships: list[ExtractedRelationship]
@@ -405,21 +422,36 @@ class Neo4jWriter:
             row     = self._rel_to_row(rel, cb_type)
             by_type.setdefault(cb_type, []).append(row)
 
+        succeeded = 0
+        failed    = 0
         for cb_type, rows in by_type.items():
             for i in range(0, len(rows), BATCH_SIZE):
                 batch = rows[i : i + BATCH_SIZE]
-                await self._run_with_retry(
+                result = await self._run_with_retry(
                     self._upsert_edge_batch,
                     cb_type,
                     batch,
                     context=f"upsert_relationships[{cb_type}] batch {i // BATCH_SIZE}",
                 )
+                if result is None:
+                    failed += len(batch)
+                else:
+                    succeeded += len(batch)
 
-        log.info(
-            "Neo4j upserted relationships",
-            count=len(relationships),
-            workspace=self.workspace_id,
-        )
+        if failed and not succeeded:
+            log.error(
+                "Neo4j upsert_relationships — ALL batches failed",
+                attempted=len(relationships),
+                workspace=self.workspace_id,
+            )
+        else:
+            log.info(
+                "Neo4j upserted relationships",
+                attempted=len(relationships),
+                succeeded=succeeded,
+                failed=failed,
+                workspace=self.workspace_id,
+            )
 
     async def upsert_context(
         self, entity_external_id: str, context: BusinessContext

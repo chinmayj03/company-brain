@@ -247,6 +247,36 @@ def rebuild_from_json_cmd(
     asyncio.run(rebuild_from_json(repo_path, workspace_id))
 
 
+# ── brain enrich ─────────────────────────────────────────────────────────────
+
+@app.command(name="enrich")
+def enrich_cmd(
+    repo: str = typer.Option(".", help="Repo root containing .brain/"),
+    workspace_id: str = typer.Option(
+        os.getenv("BRAIN_WORKSPACE_ID", "00000000-0000-0000-0000-000000000001"),
+    ),
+    skip_relationships: bool = typer.Option(False, help="Skip Stage 2 relationship extraction."),
+    skip_context: bool = typer.Option(False, help="Skip Stage 3 context synthesis."),
+):
+    """Re-run Stage 2 (relationships) + Stage 3 (context) over EXISTING entities.
+
+    Skips Stage 1 entity extraction entirely — uses entities already stored in
+    .brain/. Roughly 5x cheaper than a full pipeline run because the most
+    expensive stage is skipped. Use this when:
+      - Source files have not changed since the last full run, and
+      - You want to re-extract relationships with the new edge taxonomy, OR
+      - You want to re-synthesise business_context with the expanded schema.
+    """
+    from companybrain.cli_helpers.brain_enrich import enrich_existing_sync
+    repo_path = Path(repo).resolve()
+    enrich_existing_sync(
+        repo_path,
+        workspace_id,
+        skip_relationships=skip_relationships,
+        skip_context=skip_context,
+    )
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def _lang_for(p: Path) -> str:

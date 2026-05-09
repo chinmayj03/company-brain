@@ -194,6 +194,13 @@ public class PipelineService {
                 UUID id = nodeIds.computeIfAbsent(typeKey, k -> UUID.randomUUID());
                 // Also register under plain extId so edge resolution works (first-wins)
                 nodeIds.putIfAbsent(extId, id);
+                // ADR-0013: edges arriving from PostgresBrainStore use BrainEntity.id
+                // (the canonical URN) as fromEntity/toEntity. Without a URN-keyed
+                // entry every edge would fall into the "node not found" branch and
+                // be silently dropped. Register URN here so resolveId() finds it.
+                if (dto.getUrn() != null && !dto.getUrn().isBlank()) {
+                    nodeIds.putIfAbsent(dto.getUrn(), id);
+                }
 
                 Map<String, Object> meta = new LinkedHashMap<>();
                 meta.put("file",                  dto.getFile());
@@ -303,8 +310,12 @@ public class PipelineService {
                             UUID dbId  = UUID.fromString(rs.getString("id"));
                             String nt  = rs.getString("node_type");
                             String eid = rs.getString("external_id");
+                            String urn = rs.getString("urn");
                             nodeIds.put(eid, dbId);
                             nodeIds.put(nt + ":" + eid, dbId);
+                            if (urn != null && !urn.isBlank()) {
+                                nodeIds.put(urn, dbId);
+                            }
                         });
             }
 

@@ -1027,11 +1027,14 @@ def _map_node_type(structural_kind: str) -> str:
     }
     return _MAP.get(structural_kind, "Function")
 
-def _extract_snippet(source: str, method_name: str, max_chars: int = 400) -> str:
+def _extract_snippet(source: str, method_name: str, max_chars: int = 1500) -> str:
     """
     Pull a compact snippet of a method body from source text.
     Used to populate ExtractedEntity.code_snippet so the relationship extractor
     can see actual call sites (e.g. `competitorsService.getPayerCompetitors()`).
+
+    ADR-0040 Tier 1.B mandates ~1500 chars so the body is large enough to
+    contain real call sites and SQL strings, not just signatures.
 
     Returns the method signature + first max_chars chars of the body, or "" if not found.
     """

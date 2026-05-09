@@ -163,12 +163,33 @@ class Settings(BaseSettings):
     # max_tokens sets the billing ceiling per LLM call — right-size these to P95 actual output.
     # Overly generous ceilings waste buffer on retries and inflate tail latency.
     # Use Langfuse to audit actual output token distributions and tighten further.
-    max_tokens_entity_extraction:  int = 4_000   # Stage 1  — was 6000; entity JSON is bounded
-    max_tokens_intent_synthesis:   int = 1_024   # Stage 1.5 — was 2048; label+description is short
-    max_tokens_relationship:       int = 2_048   # Stage 2  — was 4096; max 20 edges × ~50 tokens
-    max_tokens_context_synthesis:  int = 1_024   # Stage 3  — was 2048; 9-field context object
-    max_tokens_gap_detection:      int = 1_500   # Stage 4  — was 4096; 3-8 gap objects × ~100 tok
+    # Tightened per-stage caps so output cost can't balloon past what each
+    # stage actually produces. Empirical p95 sizes (claude-haiku-4-5):
+    #   entity extraction   →  10-30 entities × ~80 tok →   ~2000  (cap 2000)
+    #   intent synthesis    →  one MethodIntent × ~400 tok →  ~400  (cap  700)
+    #   relationship extr.  →  up to 80 edges × ~50 tok  →   ~4000  (cap 2500)
+    #   context synthesis   →  one 21-field ctx × ~600 tok → ~600  (cap  900)
+    #   gap detection       →  3-8 gaps × ~150 tok       →   ~1200  (cap 1000)
+    # Caps sit ~2× the empirical p95 so real responses don't get truncated,
+    # but we stop paying for unused output budget.
+    max_tokens_entity_extraction:  int = 2_000   # Stage 1
+    max_tokens_intent_synthesis:   int = 700     # Stage 1.5
+    max_tokens_relationship:       int = 2_500   # Stage 2 (raised slightly for 50-type taxonomy → 80 edges)
+    max_tokens_context_synthesis:  int = 900     # Stage 3 (room for 21-field BusinessContext)
+    max_tokens_gap_detection:      int = 1_000   # Stage 4
     max_tokens_query:              int = 4_096   # Live query responses — keep generous
+
+    # ── Stage skip flags (cost-cut) ──────────────────────────────────────────
+    # When True, Stage 1.5 (intent synthesis) is skipped entirely. With the
+    # expanded 21-field BusinessContext schema (commit 5aa83a1c4), Stage 3
+    # already captures purpose / side_effects / change_risk / gaps which were
+    # the main signal IntentSynthesizer produced. Skipping Stage 1.5 cuts ~50
+    # LLM calls per typical pipeline run.
+    # Override via env var: BRAIN_SKIP_INTENT_SYNTHESIS=true
+    skip_intent_synthesis: bool = False
+    # When True, Stage 4 (gap detection) is skipped. One LLM call but useful
+    # for fast iteration / demo runs where gaps aren't being acted on.
+    skip_gap_detection:    bool = False
 
 
 settings = Settings()

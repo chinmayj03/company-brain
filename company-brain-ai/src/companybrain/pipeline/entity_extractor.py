@@ -396,6 +396,19 @@ class EntityExtractor:
             )
             return _entities_from_interface(unit)
 
+        # ── Trivial-POJO fast-path (ADR-0040 Tier 0 — cost-cut) ──────────────
+        # Lombok-annotated DTOs and pure data classes contain no business
+        # logic — every method is generated. Asking the LLM to "explain"
+        # them costs ~$0.005 each and produces low-signal output. We detect
+        # them structurally and emit a Class entity + one SchemaField per
+        # declared field, with no LLM call.
+        if _is_trivial_pojo(unit):
+            log.info(
+                "Trivial-POJO fast-path: skipping LLM, emitting from fields",
+                unit=unit.brief(),
+            )
+            return _entities_from_trivial_pojo(unit)
+
         # Try AST-based chunking first (tree-sitter — exact line ranges, no regex).
         # Falls back to regex MethodChunker if the grammar is unavailable.
         symbol_table = self._ast_analyzer.analyze(unit)
@@ -1171,5 +1184,163 @@ def _entities_from_interface(unit: "CodeUnit") -> "list[ExtractedEntity]":
         unit=unit.brief() if hasattr(unit, "brief") else file_path,
         count=len(entities),
         names=[e.name for e in entities],
+    )
+    return entities
+
+
+# ── Trivial-POJO fast-path (ADR-0040 Tier 0 — cost-cut) ──────────────────────
+
+# Annotations that mark a class as a Lombok-generated data shape with no
+# business logic. We accept either the simple form (@Data) or fully-qualified
+# (@lombok.Data). One match anywhere in the file body is enough.
+_LOMBOK_POJO_ANNOTATIONS = (
+    "@Data",
+    "@Value",
+    "@Getter",
+    "@Setter",
+    "@Builder",
+    "@NoArgsConstructor",
+    "@AllArgsConstructor",
+    "@RequiredArgsConstructor",
+)
+
+# Annotations that mark a class as business-meaningful. If ANY of these are
+# present we DO NOT take the trivial-POJO fast-path even if Lombok is also
+# present — the LLM should explain @Service / @Controller / @Entity bodies.
+_BUSINESS_ANNOTATIONS = (
+    "@RestController", "@Controller", "@Service", "@Repository", "@Component",
+    "@Configuration", "@Aspect", "@RequestMapping", "@GetMapping", "@PostMapping",
+    "@PutMapping", "@DeleteMapping", "@PatchMapping", "@FeignClient",
+    "@KafkaListener", "@RabbitListener", "@Scheduled", "@Cacheable",
+)
+
+
+def _is_trivial_pojo(unit: "CodeUnit") -> bool:
+    """Return True when this code unit is a Lombok DTO / pure data class.
+
+    Heuristics (all must hold):
+      1. Java/Kotlin file with at least one Lombok-generator annotation
+         (@Data, @Value, @Getter, @Setter, @Builder).
+      2. NO business-meaningful annotation (Controller / Service / Entity etc.).
+      3. Body, after stripping comments + Lombok annotations, contains no
+         method body with `if|for|while|switch|try|throw|return ` followed
+         by computation.  i.e. no real logic, just field declarations.
+    """
+    content = unit.content or ""
+    if not content.strip():
+        return False
+
+    file_path = str(getattr(unit, "file_path", "") or "")
+    lang      = getattr(unit, "language", None) or ""
+    if lang not in ("java", "kotlin") and not file_path.endswith((".java", ".kt")):
+        return False
+
+    # Quick bail-outs: business annotations present → not trivial
+    if any(a in content for a in _BUSINESS_ANNOTATIONS):
+        return False
+
+    # Must have at least one Lombok generator
+    if not any(a in content for a in _LOMBOK_POJO_ANNOTATIONS):
+        return False
+
+    # Strip comments and annotation lines to check the remaining "real" code.
+    stripped = _re.sub(r"//.*", "", content)
+    stripped = _re.sub(r"/\*.*?\*/", "", stripped, flags=_re.DOTALL)
+    stripped = _re.sub(r"^\s*@\w+(\([^)]*\))?\s*$", "", stripped, flags=_re.MULTILINE)
+
+    # Look for method bodies that DO real work — `{ ... }` containing control
+    # flow or non-trivial returns. If any method has more than a getter/setter
+    # body, this isn't trivial.
+    body_pattern = _re.compile(
+        r"\b(public|protected|private)\s+[\w<>\[\],?\s]+\s+\w+\s*\([^)]*\)\s*"
+        r"(?:throws\s+[\w,\s]+)?\s*\{(?P<body>[^{}]*)\}",
+        _re.MULTILINE,
+    )
+    for m in body_pattern.finditer(stripped):
+        body = (m.group("body") or "").strip()
+        if not body:
+            continue
+        # Trivial bodies: getter (return this.x;), setter (this.x = x;),
+        # equals/hashCode/toString delegates, builder boilerplate.
+        if _re.match(r"^return\s+(this\.)?\w+\s*;?\s*$", body):
+            continue
+        if _re.match(r"^(this\.)?\w+\s*=\s*\w+\s*;?\s*$", body):
+            continue
+        # Anything else is real logic — bail out of fast-path.
+        return False
+
+    return True
+
+
+def _entities_from_trivial_pojo(unit: "CodeUnit") -> "list[ExtractedEntity]":
+    """Emit one Class entity + one SchemaField per declared field, no LLM.
+
+    For Lombok-generated DTOs the entire semantic content is the field list:
+    type + name. We extract that with a regex, no LLM round-trip.
+    """
+    from companybrain.models.entities import ExtractedEntity
+
+    content   = unit.content or ""
+    file_path = str(getattr(unit, "file_path", "") or "")
+    repo      = getattr(unit, "repo_name", "") or ""
+    commit    = getattr(unit, "commit_sha", "") or ""
+
+    entities: list[ExtractedEntity] = []
+
+    # Class declaration (single class per file is the common Lombok shape)
+    class_match = _re.search(
+        r"\b(?:public\s+)?(?:final\s+|abstract\s+)?class\s+(\w+)",
+        content,
+    )
+    if not class_match:
+        return entities
+    class_name = class_match.group(1)
+
+    entities.append(ExtractedEntity(
+        entity_type="Class",
+        name=class_name,
+        file=file_path,
+        repo=repo,
+        signature=f"class {class_name}",
+        last_modified_commit=commit,
+        confidence=1.0,
+        structural_purpose="lombok_pojo",
+        code_snippet="",
+    ))
+
+    # Field declarations: `private FooType bar;` or `@Column private Type name;`
+    # We capture only the simple form; complex generics / nested types are kept
+    # in the type string for downstream readers.
+    field_pattern = _re.compile(
+        r"^\s*(?:@\w+(?:\([^)]*\))?\s+)*"
+        r"(?:public|private|protected)\s+(?:static\s+|final\s+|transient\s+)*"
+        r"(?P<type>[\w<>,\s\[\]?]+?)\s+(?P<name>\w+)\s*(?:=[^;]+)?;",
+        _re.MULTILINE,
+    )
+    seen: set[str] = set()
+    for m in field_pattern.finditer(content):
+        field_name = m.group("name").strip()
+        field_type = m.group("type").strip()
+        if field_name in seen:
+            continue
+        seen.add(field_name)
+        entities.append(ExtractedEntity(
+            entity_type="SchemaField",
+            name=f"{class_name}.{field_name}",
+            file=file_path,
+            repo=repo,
+            signature=f"{field_type} {field_name}",
+            last_modified_commit=commit,
+            confidence=1.0,
+            structural_purpose="lombok_field",
+            code_snippet="",
+        ))
+
+    log.debug(
+        "Trivial-POJO fast-path entities emitted",
+        unit=unit.brief() if hasattr(unit, "brief") else file_path,
+        count=len(entities),
+        class_name=class_name,
+        fields=len(entities) - 1,
     )
     return entities

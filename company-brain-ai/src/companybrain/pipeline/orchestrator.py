@@ -735,11 +735,24 @@ async def run_pipeline(
         # Runs AFTER entity dedup so we don't synthesise the same function twice.
         # Runs BEFORE relationship extraction so RelationshipExtractor can use
         # the richer entity metadata when scoring edge candidates.
-        await progress("1.5", "💡", "Intent synthesis — extracting business meaning from code functions")
+        #
+        # Cost-cut: when settings.skip_intent_synthesis is True (or env var
+        # BRAIN_SKIP_INTENT_SYNTHESIS=true), Stage 1.5 is skipped entirely.
+        # The 21-field BusinessContext from Stage 3 covers most of what this
+        # stage produced (purpose / side_effects / change_risk / gaps), so
+        # skipping cuts ~50 LLM calls per typical run with minimal signal loss.
+        from companybrain.config import settings as _stage_settings
 
         intent_contexts: dict = {}
-        if entities and not _skip_intent_synthesis:
+        if (entities
+                and not _skip_intent_synthesis
+                and not _stage_settings.skip_intent_synthesis):
+            await progress("1.5", "💡", "Intent synthesis — extracting business meaning from code functions")
             intent_contexts = await IntentSynthesizer().synthesise_all(entities, focal_context)
+        elif _stage_settings.skip_intent_synthesis:
+            await progress("1.5", "⏭️ ",
+                           "Intent synthesis SKIPPED (settings.skip_intent_synthesis=true) — "
+                           "BusinessContext from Stage 3 will provide the equivalent fields")
 
             # Attach FunctionContext to each entity's metadata so ContextAssemblerService
             # can include it in T2 blocks and the pipeline result carries it to Java.
@@ -857,12 +870,21 @@ async def run_pipeline(
         )
 
         # ── Stage 4: Gap detection ─────────────────────────────────────────────
-        await progress("4", "🔎", "Gap detection — finding unexplained behaviour and missing owners")
-
-        gaps = await GapDetector().detect(entities, git_clusters, annotations, contexts)
-        stage_4 = {"stage": "4", "label": "Gap Detection", "gaps": len(gaps)}
-        stages_summary.append(stage_4)
-        await progress("4", "✅", f"Detected {len(gaps)} gaps")
+        # Cost-cut: when settings.skip_gap_detection is True (or env var
+        # BRAIN_SKIP_GAP_DETECTION=true), skip the gap-detection LLM call.
+        # One call saved per run — useful for fast iteration / demo runs
+        # where gaps aren't being acted on downstream.
+        gaps: list = []
+        if not _stage_settings.skip_gap_detection:
+            await progress("4", "🔎", "Gap detection — finding unexplained behaviour and missing owners")
+            gaps = await GapDetector().detect(entities, git_clusters, annotations, contexts)
+            stage_4 = {"stage": "4", "label": "Gap Detection", "gaps": len(gaps)}
+            stages_summary.append(stage_4)
+            await progress("4", "✅", f"Detected {len(gaps)} gaps")
+        else:
+            await progress("4", "⏭️ ",
+                           "Gap detection SKIPPED (settings.skip_gap_detection=true)")
+            stages_summary.append({"stage": "4", "label": "Gap Detection (skipped)", "gaps": 0})
 
         # ── Stage 5: Graph population — via BrainStore fan-out (ADR-0012) ──────
         # Write to JSON SOT first, then mirror to Postgres + Neo4j.

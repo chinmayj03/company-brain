@@ -37,6 +37,7 @@ from companybrain.store.identity import (
     workspace_slug_for,
     NODE_TYPE_TAXONOMY,
     DEFAULT_DOMAIN,
+    RepoUnknownForUrn,
 )
 
 log = structlog.get_logger(__name__)
@@ -364,12 +365,28 @@ class Neo4jWriter:
             )
             return
 
-        rows = [self._entity_to_row(e) for e in entities]
+        # Build rows; skip entities whose repo is missing so we never write a
+        # monorepo-URN node that would orphan every edge referencing that node.
+        rows: list[dict[str, Any]] = []
+        valid_entities: list[ExtractedEntity] = []
+        skipped = 0
+        for e in entities:
+            try:
+                rows.append(self._entity_to_row(e))
+                valid_entities.append(e)
+            except RepoUnknownForUrn:
+                skipped += 1
+        if skipped:
+            log.warning(
+                "Neo4j upsert_entities: skipped entities with missing repo",
+                skipped=skipped,
+                total=len(entities),
+            )
 
         # Populate the bare-name → canonical URN index so subsequent edge
         # writes can resolve LLM-emitted bare names to the right node URN.
         # First-wins so duplicate names (rare) don't churn the entry.
-        for e, row in zip(entities, rows):
+        for e, row in zip(valid_entities, rows):
             if e.name and row.get("id"):
                 self._name_to_urn.setdefault(e.name, row["id"])
                 # Also register qualified forms the LLM sometimes emits.
@@ -432,11 +449,22 @@ class Neo4jWriter:
 
         # Group by canonical edge type for UNWIND efficiency (mirrors TypeScript
         # upsertEdges which groups by type before issuing dynamic MERGE queries).
+        # Rows whose URN resolution failed return None and are counted as dropped.
         by_type: dict[str, list[dict[str, Any]]] = {}
+        dropped = 0
         for rel in relationships:
             cb_type = _EDGE_TYPE_MAP.get(rel.edge_type, rel.edge_type.lower())
             row     = self._rel_to_row(rel, cb_type)
+            if row is None:
+                dropped += 1
+                continue
             by_type.setdefault(cb_type, []).append(row)
+        if dropped:
+            log.warning(
+                "Neo4j upsert_relationships: dropped edges with unresolvable URNs",
+                dropped=dropped,
+                total=len(relationships),
+            )
 
         succeeded = 0
         failed    = 0
@@ -520,6 +548,8 @@ class Neo4jWriter:
         file_path: str,
         new_hash: str,
         commit_sha: str = "unknown",
+        *,
+        repo: str = "",
     ) -> int:
         """
         Soft-delete all nodes for *file_path* whose source_checksum differs from
@@ -532,12 +562,23 @@ class Neo4jWriter:
             file_path:   Relative file path (used to match source_uri).
             new_hash:    MD5 of the current file content at extraction time.
             commit_sha:  The commit SHA that triggered re-extraction.
+            repo:        Real repository name (required — no monorepo default).
 
         Returns:
             Number of nodes invalidated.
         """
+        if not repo:
+            log.warning(
+                "invalidate_stale called without repo — matching all repos for tenant scope",
+                file_path=file_path,
+            )
         tenant = workspace_slug_for(self.workspace_id)
-        urn_prefix = f"urn:cb:{tenant}:{DEFAULT_DOMAIN}:monorepo:"
+        # Use the real repo when available; fall back to the tenant prefix only
+        # so we still invalidate nodes even when repo is not threaded through.
+        if repo:
+            urn_prefix = f"urn:cb:{tenant}:{DEFAULT_DOMAIN}:{repo}:"
+        else:
+            urn_prefix = f"urn:cb:{tenant}:{DEFAULT_DOMAIN}:"
         count      = await self._run_with_retry(
             self._do_invalidate,
             urn_prefix,
@@ -753,7 +794,17 @@ RETURN count(n) AS c
     def _entity_to_row(self, entity: ExtractedEntity) -> dict[str, Any]:
         """Convert an ExtractedEntity to a Neo4j UNWIND row dict."""
         tenant     = workspace_slug_for(self.workspace_id)
-        repo       = entity.repo or "monorepo"
+        repo       = entity.repo
+        if not repo:
+            log.error(
+                "Neo4j _entity_to_row: entity missing repo — skipping to avoid monorepo URN",
+                entity_name=entity.name,
+                entity_type=entity.entity_type,
+                file=entity.file,
+            )
+            raise RepoUnknownForUrn(
+                f"entity {entity.name!r} has no repo set; cannot build a valid URN"
+            )
         etype      = NODE_TYPE_TAXONOMY.get(entity.entity_type, "component")
         urn        = to_urn(
             tenant=tenant, domain=DEFAULT_DOMAIN, repo=repo,
@@ -807,11 +858,24 @@ RETURN count(n) AS c
 
     def _rel_to_row(
         self, rel: ExtractedRelationship, cb_type: str
-    ) -> dict[str, Any]:
-        """Convert an ExtractedRelationship to a Neo4j UNWIND row dict."""
+    ) -> dict[str, Any] | None:
+        """Convert an ExtractedRelationship to a Neo4j UNWIND row dict.
+
+        Returns None when either endpoint's URN cannot be resolved (e.g. the
+        entity had no repo). Callers must filter out None rows.
+        """
         # Derive URNs from external_ids (repo/file::name)
         source_urn = self._external_id_to_urn(rel.from_entity)
         target_urn = self._external_id_to_urn(rel.to_entity)
+        if source_urn is None or target_urn is None:
+            log.warning(
+                "Dropping edge — unresolvable URN for endpoint",
+                from_entity=rel.from_entity,
+                to_entity=rel.to_entity,
+                source_urn=source_urn,
+                target_urn=target_urn,
+            )
+            return None
 
         # Edge id = deterministic hash of (source, type, target) — idempotent
         edge_id = "urn:cb:edge:" + hashlib.md5(
@@ -891,14 +955,14 @@ RETURN count(n) AS c
                 tenant=tenant, domain=DEFAULT_DOMAIN, repo=real_repo,
                 entity_type="component", qualified_name=name_part,
             )
-        # Last resort: fabricate URN with monorepo fallback. May still orphan
-        # the edge but at least the LLM gets a valid syntax. Log so the
-        # operator can see how many edges fall into this trap.
-        log.debug("Edge URN fallback to monorepo (no name match)", external_id=external_id)
-        return to_urn(
-            tenant=tenant, domain=DEFAULT_DOMAIN, repo="monorepo",
-            entity_type="component", qualified_name=external_id,
+        # No match found — log the offending id and return None so the caller
+        # can drop the edge rather than silently orphaning it with a monorepo URN.
+        log.warning(
+            "Edge URN resolution failed — dropping edge (no repo known for id)",
+            external_id=external_id,
+            workspace=self.workspace_id,
         )
+        return None  # type: ignore[return-value]
 
     # ── Retry logic ───────────────────────────────────────────────────────────
 

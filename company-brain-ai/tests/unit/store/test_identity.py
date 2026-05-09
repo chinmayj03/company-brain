@@ -21,6 +21,7 @@ from companybrain.store.identity import (
     to_external_id,
     NODE_TYPE_TAXONOMY,
     workspace_slug_for,
+    RepoUnknownForUrn,
 )
 
 
@@ -103,6 +104,42 @@ def test_parse_urn_rejects_too_few_segments():
         parse_urn("urn:cb:tenant:domain")
 
 
+# ── RepoUnknownForUrn (ADR-0043 WS1.S3) ─────────────────────────────────────
+
+def test_from_legacy_postgres_raises_on_empty_repo():
+    with pytest.raises(RepoUnknownForUrn):
+        from_legacy_postgres(
+            workspace_slug="dev",
+            node_type="Function",
+            legacy_external_id="src/Foo.java::bar",
+            repo="",
+        )
+
+
+def test_from_legacy_neo4j_raises_on_empty_repo():
+    with pytest.raises(RepoUnknownForUrn):
+        from_legacy_neo4j("urn:cb:llm:dev:src/Foo.ts:Foo", repo="")
+
+
+def test_no_monorepo_in_urn_from_real_repo():
+    """Ensure that using a real repo never produces a 'monorepo' segment."""
+    urn = to_urn(tenant="dev", domain="code", repo="my-repo",
+                 entity_type="component", qualified_name="Foo")
+    assert "monorepo" not in urn
+
+
+def test_legacy_postgres_requires_real_repo():
+    """from_legacy_postgres must accept a real repo name and embed it correctly."""
+    urn = from_legacy_postgres(
+        workspace_slug="dev",
+        node_type="ApiEndpoint",
+        legacy_external_id="backend/src/p.ts::charge",
+        repo="network-iq-backend-java",
+    )
+    assert parse_urn(urn).repo == "network-iq-backend-java"
+    assert "monorepo" not in urn
+
+
 # ── Legacy Postgres migration helper ─────────────────────────────────────────
 
 def test_legacy_postgres_translation():
@@ -110,9 +147,9 @@ def test_legacy_postgres_translation():
         workspace_slug="dev",
         node_type="ApiEndpoint",
         legacy_external_id="backend/src/p.ts::charge",
-        repo="monorepo",
+        repo="my-service",
     )
-    assert urn == "urn:cb:dev:code:monorepo:api_contract:charge"
+    assert urn == "urn:cb:dev:code:my-service:api_contract:charge"
 
 
 def test_legacy_postgres_no_separator():
@@ -120,7 +157,7 @@ def test_legacy_postgres_no_separator():
         workspace_slug="dev",
         node_type="Class",
         legacy_external_id="PaymentService",
-        repo="monorepo",
+        repo="my-service",
     )
     assert parse_urn(urn).qualified_name == "PaymentService"
     assert parse_urn(urn).entity_type == "component"
@@ -131,7 +168,7 @@ def test_legacy_postgres_unknown_node_type_defaults_to_component():
         workspace_slug="dev",
         node_type="WeirdType",
         legacy_external_id="foo::Bar",
-        repo="monorepo",
+        repo="my-service",
     )
     assert parse_urn(urn).entity_type == "component"
 
@@ -140,9 +177,10 @@ def test_legacy_postgres_unknown_node_type_defaults_to_component():
 
 def test_legacy_neo4j_translation():
     legacy = "urn:cb:llm:dev:src/Foo.ts:Foo"
-    urn = from_legacy_neo4j(legacy, repo="monorepo")
-    assert urn.startswith("urn:cb:dev:code:monorepo:component:")
+    urn = from_legacy_neo4j(legacy, repo="frontend-app")
+    assert urn.startswith("urn:cb:dev:code:frontend-app:component:")
     assert parse_urn(urn).qualified_name == "Foo"
+    assert "monorepo" not in urn
 
 
 def test_legacy_neo4j_rejects_non_llm_urn():

@@ -42,7 +42,7 @@ public class PipelineResultRequest {
 
     private List<EntityDto> entities;
     private List<RelationshipDto> relationships;
-    private List<ContextDto> contexts;
+    private Map<String, ContextDto> contexts;
 
     // ── Artifact provenance (ADR-005) ─────────────────────────────────
     // Artifacts are the raw inputs the LLM pipeline was run over.

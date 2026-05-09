@@ -388,8 +388,15 @@ public class PipelineService {
             List<Object[]> insertRows = new ArrayList<>();
             List<String>   nodeUuids = new ArrayList<>();
 
-            for (var dto : result.getContexts()) {
-                UUID nodeId = resolveId(nodeIds, workspaceId, dto.getEntityExternalId());
+            for (var entry : result.getContexts().entrySet()) {
+                String externalId = entry.getKey();
+                var dto = entry.getValue();
+                if (dto == null) continue;
+                // Prefer the map key, fall back to the dto field if both are populated.
+                String resolveKey = externalId != null && !externalId.isBlank()
+                        ? externalId
+                        : dto.getEntityExternalId();
+                UUID nodeId = resolveId(nodeIds, workspaceId, resolveKey);
                 if (nodeId == null) continue;
 
                 nodeUuids.add(nodeId.toString());

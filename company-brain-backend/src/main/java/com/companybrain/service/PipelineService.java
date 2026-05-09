@@ -202,6 +202,20 @@ public class PipelineService {
                 meta.put("confidence",            dto.getConfidence());
                 meta.put("first_appeared_commit", dto.getFirstAppearedCommit());
                 meta.put("last_modified_commit",  dto.getLastModifiedCommit());
+                // ADR-0040 Tier 1.A/B/2.A — content fields. Only persist when non-empty
+                // so we don't bloat the JSONB with null keys.
+                if (dto.getQueryText()             != null && !dto.getQueryText().isBlank()) {
+                    meta.put("query_text",            dto.getQueryText());
+                }
+                if (dto.getCodeSnippet()           != null && !dto.getCodeSnippet().isBlank()) {
+                    meta.put("code_snippet",          dto.getCodeSnippet());
+                }
+                if (dto.getJavadoc()               != null && !dto.getJavadoc().isBlank()) {
+                    meta.put("javadoc",               dto.getJavadoc());
+                }
+                if (dto.getValidationConstraints() != null && !dto.getValidationConstraints().isEmpty()) {
+                    meta.put("validation_constraints", dto.getValidationConstraints());
+                }
 
                 rows.add(new Object[]{
                         id.toString(),

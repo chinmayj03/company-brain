@@ -34,9 +34,15 @@ function addCors(res: Response): Response {
 const JAVA_API    = process.env["JAVA_API_URL"] ?? "http://localhost:8080";
 
 const graph = new GraphClient({
-  uri:      process.env["NEO4J_URI"]      ?? "bolt://localhost:7687",
-  user:     process.env["NEO4J_USER"]     ?? "neo4j",
+  url:      process.env["NEO4J_URI"]      ?? "bolt://localhost:7687",
+  username: process.env["NEO4J_USER"]     ?? "neo4j",
   password: process.env["NEO4J_PASSWORD"] ?? "password",
+});
+
+// Establish the Neo4j driver once at startup. Without this every query
+// fails with "GraphClient not connected — call connect() first".
+await graph.connect().catch((err: unknown) => {
+  console.error("[api] GraphClient.connect() failed at startup:", err);
 });
 
 const router = createToolRouter(graph, JAVA_API);
@@ -108,7 +114,7 @@ const server = Bun.serve({
       try {
         // Query returns raw parts array so we can hash on the JS side —
         // apoc.util.sha256 is not available without the APOC plugin.
-        const rows = await graph.runRead(
+        const rows = await graph.query(
           `MATCH (f:File { scope: $scope })
            OPTIONAL MATCH (f)-[:CONTAINS]->(n)
            WITH f,

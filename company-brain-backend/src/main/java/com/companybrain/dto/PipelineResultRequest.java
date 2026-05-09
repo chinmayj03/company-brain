@@ -90,6 +90,12 @@ public class PipelineResultRequest {
         private String lastModifiedCommit;
         /** Raw SQL/JPQL string for DatabaseQuery entities. */
         private String queryText;
+        /** Method/function body up to ~1500 chars (ADR-0040 Tier 1.B mandatory for code entities). */
+        private String codeSnippet;
+        /** JavaDoc / docstring above the entity (ADR-0040 Tier 2.A). */
+        private String javadoc;
+        /** Validation constraints extracted from annotations (ADR-0040 Tier 2.A). */
+        private List<String> validationConstraints;
         /** Canonical URN per ADR-0013; nullable during transition. */
         private String urn;
     }

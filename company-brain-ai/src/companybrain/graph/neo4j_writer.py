@@ -542,16 +542,22 @@ class Neo4jWriter:
     # ── Internal Cypher execution ─────────────────────────────────────────────
 
     async def _upsert_node_batch(self, rows: list[dict[str, Any]]) -> None:
-        """UNWIND batch of node rows into MERGE statements."""
+        """UNWIND batch of node rows into MERGE statements.
+
+        The previous version used apoc.create.addLabels() to attach a dynamic
+        :NodeType label (Function, Class, etc.) but APOC is not installed in
+        the default Neo4j docker image — every batch failed with "Unknown
+        procedure apoc.create.addLabels". Switched to plain Cypher and rely
+        on the n.type property + :CBNode label, which is what all our queries
+        already filter on. No functional loss, no APOC dependency.
+        """
         cypher = """
 UNWIND $rows AS row
 MERGE (n:CBNode { id: row.id })
 SET n += row.props,
     n.type  = row.node_type,
     n.scope = $scope
-WITH n, row
-CALL apoc.create.addLabels(n, [row.node_label]) YIELD node
-RETURN count(node) AS c
+RETURN count(n) AS c
 """
         async with self._session() as session:
             await session.run(cypher, rows=rows, scope=self.workspace_id)

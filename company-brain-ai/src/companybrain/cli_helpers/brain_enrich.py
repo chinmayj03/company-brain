@@ -226,17 +226,69 @@ async def enrich_existing(
             contexts = {}
         print(f"[enrich] Stage 3: synthesised {len(contexts)} contexts")
 
-    # ── Flush back through fanout ────────────────────────────────────────────
-    print("[enrich] Posting results to Java backend...")
-    await java.flush(
-        entities=entities,
-        relationships=relationships,
-        contexts=contexts,
-        pipeline_meta={"run_id": "enrich"},
-        status="completed",
-    )
+    # ── Persist LLM output to .brain/ FIRST so it survives mirror failures ──
+    # If Java's persistence fails (FK violation, schema drift, network blip),
+    # the user shouldn't have to pay for the LLM passes again. By updating
+    # each BrainEntity's relationships/context in the JSON SOT before any
+    # network call, a subsequent `brain rebuild-from-json` recovers everything
+    # for free.
+    print("[enrich] Persisting LLM output to .brain/ JSON (durable; no LLM re-run on failure)")
+    rels_by_from: dict[str, list[dict]] = {}
+    for r in relationships:
+        rels_by_from.setdefault(r.from_entity, []).append({
+            "edge_type":   r.edge_type,
+            "target_id":   r.to_entity,
+            "target_type": r.to_type,
+            "confidence":  r.confidence,
+            "evidence":    r.evidence,
+            "source":      "enrich",
+        })
 
-    # Mirror to Neo4j + Qdrant via the fanout's per-mirror commit.
+    for be in entities_brain:
+        # Match relationships keyed either by URN (be.id) or by qualified_name.
+        new_rels = rels_by_from.get(be.id, []) + rels_by_from.get(be.qualified_name, [])
+        if new_rels:
+            # Replace, don't append: this run is the source of truth for the
+            # new edge taxonomy.
+            be.relationships = new_rels
+
+        # Inject the context blob keyed by external_id (urn or repo/file::name).
+        # ContextSynthesizer keys by entity.external_id which on ExtractedEntity
+        # is `repo/file::name`; check both forms.
+        ctx_key_a = f"{be.repo}/{be.file}::{be.qualified_name}"
+        ctx_key_b = be.id
+        ctx = contexts.get(ctx_key_a) or contexts.get(ctx_key_b)
+        if ctx is not None:
+            # BusinessContext is a dataclass — convert to dict for the JSON store.
+            from dataclasses import asdict
+            be.metadata = {**(be.metadata or {}), "business_context": asdict(ctx)}
+
+        # Write the updated entity back to .brain/ JSON.
+        await json_store.write(be, run_id="enrich", workspace_id=workspace_id)
+
+    await json_store.commit_run("enrich")
+    print(f"[enrich] .brain/ updated for {len(entities_brain)} entities")
+
+    # ── Now mirror to Java/Neo4j/Qdrant ──────────────────────────────────────
+    # If any of these fail, the user can recover for $0 with:
+    #   brain rebuild-from-json --repo <repo> --workspace-id <id>
+    print("[enrich] Mirroring to Java/Postgres + Neo4j + Qdrant ...")
+    try:
+        await java.flush(
+            entities=entities,
+            relationships=relationships,
+            contexts=contexts,
+            pipeline_meta={"run_id": "enrich"},
+            status="completed",
+        )
+        print("[enrich] Java/Postgres mirror OK")
+    except Exception as exc:
+        log.error("Java mirror failed (non-fatal — .brain/ already persisted)",
+                  error=str(exc))
+        print(f"[enrich] Java mirror FAILED: {exc}")
+        print("[enrich] Recover with: brain rebuild-from-json --repo <path> "
+              "--workspace-id <id>  (no LLM re-run needed)")
+
     for mirror in fanout.mirrors:
         try:
             for be in entities_brain:

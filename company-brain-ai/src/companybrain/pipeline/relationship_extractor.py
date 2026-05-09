@@ -132,14 +132,23 @@ these, SKIP IT. Do NOT invent new types.
     0.85 — test class name follows *ServiceTest → *Service or *ControllerTest → *Controller
     0.70 — test is in same package as production code and accesses same entity
 
-• EMIT structural edges using the new types:
-    - Class inheritance        → EXTENDS    (child Class → parent Class)
-    - Interface implementation → IMPLEMENTS (Class → Interface)
-    - Constructor / @Autowired / @Inject collaborators → USES (using entity → used entity)
-    - Field declarations of domain types (private FooService foo;) → USES
-    - Thrown exceptions       → THROWS     (Function → Exception class)
-  These give the graph richer context — change-impact analysis, dependency
-  inversion checks, and exception-flow tracing all need them.
+• Structural edges already extracted deterministically (do NOT re-emit):
+    - EXTENDS / IMPLEMENTS / CONTAINS / INSTANTIATES / IMPORTS are pre-extracted
+      from the AST before this pass runs. You may safely OMIT these — they will
+      be present in the final graph regardless.
+    - Focus your output on BEHAVIORAL edges that need a body to find:
+      CALLS, USES, THROWS, CATCHES, READS_COLUMN, WRITES_COLUMN, VALIDATES,
+      RENDERS_FIELD, CALLS_ENDPOINT, AWAITS, DELEGATES_TO, LISTENS_TO,
+      PUBLISHES_TO, SUBSCRIBES_TO, SCHEDULED_BY, AUTHORIZED_BY.
+  Emitting EXTENDS/IMPLEMENTS/CONTAINS still works (they'll dedup) but wastes
+  your output budget on edges we already have at confidence=1.0.
+
+• USES is still useful — emit when you see @Autowired / @Inject / constructor
+  injection / field collaborator that REFERENCES an entity by name (we don't
+  pre-extract these structurally because they require body inspection).
+
+• THROWS is still useful — emit when you see `throw new XException(...)` so
+  exception-flow tracing works.
 
 • DO NOT EMIT edges for:
     - Module imports (import statements)

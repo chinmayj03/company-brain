@@ -816,7 +816,25 @@ async def run_pipeline(
             _checkpoint_save(request, entities, structural_rels, focal_context, stage_reached="1.6")
 
         # ── Stage 2: Relationship extraction ──────────────────────────────────
-        await progress("2", "🔗", "Relationship extraction — mapping CALLS / READS / RENDERS edges")
+        # Phase 2.A — Deterministic structural edges (no LLM, $0).
+        # Extracts CONTAINS / EXTENDS / IMPLEMENTS / INSTANTIATES / IMPORTS from
+        # the AST/regex. Adds dozens of free edges per run AND lets the LLM
+        # focus its budget on behavioral edges only (CALLS / USES / THROWS /
+        # READS_COLUMN / etc.).
+        from companybrain.pipeline.structural_edges import extract_structural_edges
+
+        ast_structural_rels: list = []
+        if focal_context.code_units:
+            try:
+                ast_structural_rels = extract_structural_edges(
+                    focal_context.code_units, entities,
+                )
+            except Exception as exc:
+                log.warning("Structural-edge extraction failed (non-fatal)",
+                            error=str(exc))
+
+        await progress("2", "🔗",
+                       f"Relationship extraction — {len(ast_structural_rels)} structural edges from AST + LLM behavioral pass")
 
         llm_relationships = await RelationshipExtractor().extract(
             entities,
@@ -824,9 +842,12 @@ async def run_pipeline(
             {"path": request.endpoint_path, "method": request.http_method},
         )
 
-        # Merge structural (import-graph) + LLM relationships.
-        # Structural edges come first so their external_ids win dedup when LLM finds the same edge.
-        relationships = _dedup_relationships(structural_rels + llm_relationships)
+        # Merge: AST structural + import-graph structural + LLM behavioral.
+        # AST edges come FIRST so their high-confidence (1.0) entries win the
+        # dedup tiebreak when the LLM also surfaces the same edge.
+        relationships = _dedup_relationships(
+            ast_structural_rels + structural_rels + llm_relationships
+        )
 
         stage_2 = {
             "stage": "2", "label": "Relationship Extraction",

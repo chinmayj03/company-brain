@@ -228,6 +228,11 @@ class ContextSynthesizer:
         log.info("ContextSynthesizer ready", llm_provider=self._provider.provider_name,
                  model=self._provider.model_for_role(TaskRole.SYNTHESIS))
 
+    # Entities batched per LLM call when batched mode is on. Each call's
+    # output budget is roughly 600 tok/entity × N, so 8 entities × 600 ≈ 4800
+    # tokens which stays inside Anthropic Haiku's safe response window.
+    _BATCH_SIZE = 8
+
     async def synthesise_all(
         self,
         entities: list[ExtractedEntity],
@@ -256,21 +261,141 @@ class ContextSynthesizer:
         # Build a lookup: entity name → relevant clusters + annotations
         entity_context_map = self._build_entity_context_map(entities, clusters, annotations)
 
-        tasks = [
-            self._synthesise_entity(entity, entity_context_map.get(entity.name, {}))
-            for entity in entities
+        # Batch entities into groups of _BATCH_SIZE per LLM call. The system
+        # prompt is shared (cached) so input cost amortises; output cost stays
+        # ~the same per entity but the per-call HTTP+latency overhead is cut
+        # by ~Nx. For 100 entities this drops 100 LLM calls → ~13 calls.
+        batches: list[list[ExtractedEntity]] = [
+            entities[i : i + self._BATCH_SIZE]
+            for i in range(0, len(entities), self._BATCH_SIZE)
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        tasks = [
+            self._synthesise_batch(batch, entity_context_map)
+            for batch in batches
+        ]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         context_map: dict[str, BusinessContext] = {}
-        for entity, result in zip(entities, results):
+        for batch, result in zip(batches, batch_results):
             if isinstance(result, Exception):
-                log.error("Context synthesis failed", entity=entity.name, error=str(result))
+                log.error("Context synthesis batch failed",
+                          first_entity=batch[0].name if batch else "?",
+                          batch_size=len(batch),
+                          error=str(result))
+                # Fall back to per-entity calls for this batch so a single bad
+                # entity doesn't lose the rest of the group's contexts.
+                for entity in batch:
+                    try:
+                        ctx = await self._synthesise_entity(
+                            entity, entity_context_map.get(entity.name, {}),
+                        )
+                        if ctx is not None:
+                            context_map[entity.external_id] = ctx
+                    except Exception as exc:
+                        log.warning("Per-entity fallback also failed",
+                                    entity=entity.name, error=str(exc))
                 continue
-            context_map[entity.external_id] = result
+            for entity, ctx in zip(batch, result or []):
+                if ctx is not None:
+                    context_map[entity.external_id] = ctx
 
-        log.info("Context synthesis complete", synthesised=len(context_map))
+        log.info("Context synthesis complete",
+                 synthesised=len(context_map),
+                 batches=len(batches),
+                 batch_size=self._BATCH_SIZE)
         return context_map
+
+    @retry(**SYNTHESIS_RETRY)
+    async def _synthesise_batch(
+        self,
+        batch: list[ExtractedEntity],
+        entity_context_map: dict,
+    ) -> list[BusinessContext | None]:
+        """One LLM call producing N BusinessContexts in one go.
+
+        Strategy: the system prompt asks for a JSON object keyed by entity
+        external_id. We send ALL entities' user-content concatenated under
+        clear `### entity N` headers; the LLM returns a single JSON dict.
+        Per-entity confidence is derived from the original entity_context_map
+        flags so we don't lose the high/medium/low signal.
+        """
+        if not batch:
+            return []
+        async with self._semaphore:
+            sections = []
+            for i, entity in enumerate(batch, 1):
+                ctx = entity_context_map.get(entity.name, {})
+                section = self._build_user_message(entity, ctx)
+                sections.append(
+                    f"### entity {i}: external_id = {entity.external_id}\n{section}"
+                )
+            user_content = (
+                "Synthesise BusinessContext for EACH of the following entities. "
+                "Return a JSON object keyed by external_id, where each value is "
+                "the BusinessContext object you would produce for that entity:\n\n"
+                "  { \"<external_id_1>\": { ... context fields ... }, "
+                "    \"<external_id_2>\": { ... }, ... }\n\n"
+                + "\n\n---\n\n".join(sections)
+            )
+
+            raw = await self._provider.chat_json(
+                messages=[
+                    ChatMessage(role="system", content=CONTEXT_SYNTHESIS_PROMPT),
+                    ChatMessage(role="user", content=user_content),
+                ],
+                role=TaskRole.FAST,
+                # Per-batch ceiling = per-entity cap × batch size (with headroom)
+                max_tokens=min(8000, settings.max_tokens_context_synthesis * len(batch)),
+            )
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                log.warning("Batch LLM returned non-JSON — falling back to per-entity",
+                            batch_size=len(batch))
+                raise
+
+            results: list[BusinessContext | None] = []
+            for entity in batch:
+                ctx_data = (
+                    data.get(entity.external_id)
+                    or data.get(entity.name)
+                    or data.get(f"entity {batch.index(entity) + 1}")
+                )
+                if not isinstance(ctx_data, dict):
+                    results.append(None)
+                    continue
+                ctx_for_entity = entity_context_map.get(entity.name, {})
+                confidence = "low"
+                if ctx_for_entity.get("has_human_annotation"):
+                    confidence = "high"
+                elif ctx_for_entity.get("has_rich_pr"):
+                    confidence = "medium"
+                results.append(BusinessContext(
+                    entity_external_id=entity.external_id,
+                    purpose=ctx_data.get("purpose", ""),
+                    history_summary=ctx_data.get("history_summary", ""),
+                    invariants=ctx_data.get("invariants", []) or [],
+                    change_risk=ctx_data.get("change_risk", "MEDIUM"),
+                    change_risk_reason=ctx_data.get("change_risk_reason", ""),
+                    source_confidence=confidence,
+                    owner_team=ctx_data.get("owner_team"),
+                    external_dependencies=ctx_data.get("external_dependencies", []) or [],
+                    gaps=ctx_data.get("gaps", []) or [],
+                    business_capability=ctx_data.get("business_capability"),
+                    personas_affected=ctx_data.get("personas_affected", []) or [],
+                    failure_modes=ctx_data.get("failure_modes", []) or [],
+                    side_effects=ctx_data.get("side_effects", []) or [],
+                    idempotency=ctx_data.get("idempotency"),
+                    blast_radius=ctx_data.get("blast_radius", []) or [],
+                    deprecation_status=ctx_data.get("deprecation_status"),
+                    data_sensitivity=ctx_data.get("data_sensitivity"),
+                    compliance_tags=ctx_data.get("compliance_tags", []) or [],
+                    performance_notes=ctx_data.get("performance_notes"),
+                    related_concepts=ctx_data.get("related_concepts", []) or [],
+                ))
+            return results
 
     @retry(**SYNTHESIS_RETRY)
     async def _synthesise_entity(

@@ -123,6 +123,26 @@ public class PipelineResultRequest {
         private String ownerTeam;
         private List<String> externalDependencies;
         private List<String> gaps;
+
+        // ── Expanded business context (Python BusinessContext schema, all optional) ──
+        // Fields default to null/empty when missing so older AI service versions
+        // still deserialise without error.
+        private String       businessCapability;
+        private List<String> personasAffected;
+
+        private List<String> failureModes;
+        private List<String> sideEffects;
+        private String       idempotency;
+
+        private List<String> blastRadius;
+        private String       deprecationStatus;
+
+        private String       dataSensitivity;
+        private List<String> complianceTags;
+
+        private String       performanceNotes;
+
+        private List<String> relatedConcepts;
     }
 
     // ── ADR-005: Artifact DTOs ────────────────────────────────────────

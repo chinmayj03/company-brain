@@ -151,16 +151,67 @@ class BusinessContext:
     """
     Business context synthesised by LLM Pass 3 for a single entity.
     Stored in the node_context table.
+
+    Field groups:
+      ── Core narrative ──
+      purpose            — one-paragraph description of what this does and why.
+      history_summary    — 1-2 sentence summary of how this evolved (commits/PRs).
+      business_capability— the product capability this serves (e.g. "competitor pricing lookup").
+      personas_affected  — list of user/operator roles impacted ("payer admin", "ops on-call").
+
+      ── Behavior / contract ──
+      invariants         — must-hold rules (input prerequisites, output guarantees).
+      failure_modes      — known ways this can break and what the user observes.
+      side_effects       — observable effects beyond the return value (logs, events, audit).
+      idempotency        — "idempotent" | "non-idempotent" | "unknown".
+
+      ── Risk / change management ──
+      change_risk        — LOW | MEDIUM | HIGH
+      change_risk_reason — why the rating
+      blast_radius       — list of downstream entities affected by changes here.
+      deprecation_status — "active" | "deprecated" | "experimental" | "internal-only".
+
+      ── Data sensitivity / compliance ──
+      data_sensitivity   — "public" | "internal" | "confidential" | "pii" | "phi" | "regulated".
+      compliance_tags    — e.g. ["sox", "pci", "hipaa", "gdpr"].
+
+      ── Performance / ops ──
+      performance_notes  — N+1 risks, query cost, hot-path latency expectations.
+
+      ── Provenance ──
+      source_confidence  — high | medium | low
+      owner_team         — owning team (from CODEOWNERS / annotations / heuristics).
+      external_dependencies — third-party services / SDKs this leans on.
+      related_concepts   — domain terms, similar entities, or canonical alternatives.
+      gaps               — open questions this synthesis could not resolve.
     """
     entity_external_id: str
     purpose: str
     history_summary: str
     invariants: list[str]
-    change_risk: str         # LOW | MEDIUM | HIGH
+    change_risk: str
     change_risk_reason: str
-    source_confidence: str   # high | medium | low
+    source_confidence: str
+
+    # ── Expanded fields (default-empty so old payloads still deserialise) ────
+    business_capability: Optional[str] = None
+    personas_affected: list[str] = field(default_factory=list)
+
+    failure_modes: list[str] = field(default_factory=list)
+    side_effects: list[str] = field(default_factory=list)
+    idempotency: Optional[str] = None
+
+    blast_radius: list[str] = field(default_factory=list)
+    deprecation_status: Optional[str] = None
+
+    data_sensitivity: Optional[str] = None
+    compliance_tags: list[str] = field(default_factory=list)
+
+    performance_notes: Optional[str] = None
+
     owner_team: Optional[str] = None
     external_dependencies: list[str] = field(default_factory=list)
+    related_concepts: list[str] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
 
 

@@ -389,10 +389,14 @@ public class PipelineService {
             }
 
             // 1 batch INSERT … ON CONFLICT DO UPDATE
+            // NB: edges schema renamed observed_source → source (text NOT NULL).
+            // The old name caused Phase 2 to throw BatchUpdateException
+            // ('column "observed_source" of relation "edges" does not exist'),
+            // which surfaced as a generic 500 on every pipeline-result request.
             jdbc.batchUpdate("""
                     INSERT INTO edges
                         (id, workspace_id, source_id, target_id, edge_type,
-                         confidence, is_pruned, last_seen, observed_source)
+                         confidence, is_pruned, last_seen, source)
                     VALUES
                         (?::uuid, ?::uuid, ?::uuid, ?::uuid, ?,
                          ?, false, now(), 'llm_extraction')

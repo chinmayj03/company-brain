@@ -607,6 +607,11 @@ RETURN count(n) AS c
                     nodes_created=summary.counters.nodes_created if summary else 0,
                     props_set=summary.counters.properties_set if summary else 0,
                 )
+                # Return a truthy value so _run_with_retry's `result is None`
+                # check (in upsert_entities) treats this as success. Without
+                # an explicit return the batch counts as failed even though
+                # the cypher succeeded.
+                return len(clean_rows)
         except Exception as exc:
             sample = clean_rows[0] if clean_rows else {}
             sample_keys = list((sample.get("props") or {}).keys())
@@ -654,7 +659,11 @@ RETURN count(r) AS c
 """
         try:
             async with self._session() as session:
-                await session.run(cypher, rows=clean_rows)
+                result = await session.run(cypher, rows=clean_rows)
+                await result.consume()
+                # Truthy return so the per-batch counter in upsert_relationships
+                # treats this as success.
+                return len(clean_rows)
         except Exception as exc:
             log.error(
                 "Neo4j upsert_edge_batch failed",

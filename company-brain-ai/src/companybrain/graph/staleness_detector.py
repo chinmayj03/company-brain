@@ -289,12 +289,24 @@ LIMIT 1
         Errors are logged and swallowed — returns an empty list on failure.
         """
         if self._writer._driver is None:
-            log.warning(
-                "Neo4j not connected — skipping staleness query",
-                context=context,
-                workspace=self.workspace_id,
-            )
-            return []
+            # connect() is idempotent — try once before declaring disconnected.
+            try:
+                await self._writer.connect()
+            except Exception as exc:
+                log.warning(
+                    "Neo4j not connected and connect() failed — skipping staleness query",
+                    context=context,
+                    workspace=self.workspace_id,
+                    error=str(exc),
+                )
+                return []
+            if self._writer._driver is None:
+                log.warning(
+                    "Neo4j not connected — skipping staleness query",
+                    context=context,
+                    workspace=self.workspace_id,
+                )
+                return []
 
         try:
             async with self._writer._session() as session:

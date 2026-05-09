@@ -49,6 +49,10 @@ class Neo4jBrainStore(BrainStore):
             entities=len(self._buf_e),
             relationships=len(self._buf_r),
         )
+        # Neo4jWriter.connect() is idempotent. Without this call every write
+        # short-circuits with "writer not connected — skipping write" and the
+        # success log line lies about how many rows were upserted.
+        await self._writer.connect()
         await self._writer.upsert_entities(self._buf_e)
         await self._writer.upsert_relationships(self._buf_r)
         self._buf_e.clear()

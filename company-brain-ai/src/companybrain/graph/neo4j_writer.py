@@ -270,6 +270,16 @@ class Neo4jWriter:
         if not entities:
             return
 
+        if self._driver is None:
+            # Don't pretend the write happened — misleading success logs cost an
+            # afternoon today.
+            log.error(
+                "Neo4j upsert_entities called before connect() — refusing to lie about success",
+                count=len(entities),
+                workspace=self.workspace_id,
+            )
+            return
+
         rows = [self._entity_to_row(e) for e in entities]
         # Process in batches of BATCH_SIZE
         for i in range(0, len(rows), BATCH_SIZE):
@@ -299,6 +309,14 @@ class Neo4jWriter:
             relationships: Relationships from LLM Pass 2.
         """
         if not relationships:
+            return
+
+        if self._driver is None:
+            log.error(
+                "Neo4j upsert_relationships called before connect() — refusing to lie about success",
+                count=len(relationships),
+                workspace=self.workspace_id,
+            )
             return
 
         # Group by canonical edge type for UNWIND efficiency (mirrors TypeScript
@@ -626,12 +644,24 @@ RETURN count(n) AS c
         Non-transient errors (auth failures, bad Cypher): logged once, no retry.
         """
         if self._driver is None:
-            log.warning(
-                "Neo4j writer not connected — skipping write",
-                context=context,
-                workspace=self.workspace_id,
-            )
-            return None
+            # Self-heal: try to connect once. connect() is idempotent.
+            try:
+                await self.connect()
+            except Exception as exc:
+                log.error(
+                    "Neo4j writer not connected and auto-connect() failed",
+                    context=context,
+                    workspace=self.workspace_id,
+                    error=str(exc),
+                )
+                return None
+            if self._driver is None:
+                log.error(
+                    "Neo4j writer not connected after auto-connect()",
+                    context=context,
+                    workspace=self.workspace_id,
+                )
+                return None
 
         last_exc: Optional[Exception] = None
         for attempt in range(1, MAX_RETRIES + 1):

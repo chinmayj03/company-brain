@@ -73,10 +73,19 @@ export class GitExtractor {
     const now = new Date().toISOString();
 
     // ── Parse scope → orgSlug / repoSlug ──────────────────────────────────
-    // scope format: "<org>/<repo>", e.g. "acme/web"
+    // Scope format is canonically "<org>/<repo>", e.g. "acme/web". The
+    // /extract endpoint historically passed the workspace UUID instead,
+    // which used to throw and abort the entire extractor chain. Now we
+    // skip cleanly (no nodes/edges written) and let other extractors run.
     const [orgSlug, repoSlug] = ctx.scope.split("/");
     if (!orgSlug || !repoSlug) {
-      throw new Error(`GitExtractor: scope must be "<org>/<repo>", got "${ctx.scope}"`);
+      ctx.log?.warn?.(
+        `GitExtractor: scope "${ctx.scope}" is not "<org>/<repo>" — skipping. ` +
+        `Pass scope=org/repo on the /extract request to enable Git extraction.`
+      );
+      return { nodesWritten: 0, edgesWritten: 0, warnings: [
+        `git skipped — scope "${ctx.scope}" not in org/repo format`,
+      ] };
     }
 
     // ── 1. Organisation node ──────────────────────────────────────────────

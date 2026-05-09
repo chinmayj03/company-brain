@@ -368,6 +368,20 @@ export class GraphClient {
     }
   }
 
+  /**
+   * Alias for query() — many extractors and tools were written expecting a
+   * `runRead` method (cf. drift-detector, packages/tools/src/queries/*).
+   * Without it every read at extract-time fails with "graph.runRead is not
+   * a function" and the whole extractor short-circuits.  Keep the alias so
+   * we don't have to touch ~7 caller sites.
+   */
+  async runRead<T = Record<string, unknown>>(
+    cypher: string,
+    params?: Record<string, unknown>
+  ): Promise<T[]> {
+    return this.query<T>(cypher, params);
+  }
+
   /** Get a single node by URN. Returns null if not found. */
   async getNode(id: string): Promise<Record<string, unknown> | null> {
     assertValidUrn(id);

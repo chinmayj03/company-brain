@@ -312,9 +312,9 @@ ask:
 	@curl -sS -X POST http://localhost:$(AI_PORT)/query \
 	    -H 'Content-Type: application/json' \
 	    -d '{ \
-	      "task":         "$(Q)", \
-	      "workspaceId":  "$(WORKSPACE_ID)", \
-	      "repoPath":     "$(TARGET_REPO)" \
+	      "question":     "$(Q)", \
+	      "workspace_id": "$(WORKSPACE_ID)", \
+	      "repo_path":    "$(TARGET_REPO)" \
 	    }' | jq
 
 # ── Cumulative cost ───────────────────────────────────────────────────────────

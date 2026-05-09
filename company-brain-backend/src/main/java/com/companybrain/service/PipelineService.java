@@ -447,16 +447,43 @@ public class PipelineService {
             List<Object[]> insertRows = new ArrayList<>();
             List<String>   nodeUuids = new ArrayList<>();
 
+            // Final-guard: build a SET of UUIDs that ACTUALLY exist in `nodes`
+            // for this workspace right now. resolveId() can return a UUID that
+            // looked plausible (came from the in-memory nodeIds map) but was
+            // never actually persisted (ON CONFLICT picked the existing row's
+            // id, leaving the generated one orphaned). Filtering against this
+            // set prevents the FK violation that aborts the whole batch.
+            Set<UUID> persistedNodeIds = new HashSet<>();
+            jdbc.query(
+                    "SELECT id FROM nodes WHERE workspace_id = ?::uuid",
+                    ps -> ps.setString(1, workspaceId.toString()),
+                    rs -> { persistedNodeIds.add(UUID.fromString(rs.getString("id"))); }
+            );
+
+            int contextSkipped = 0;
             for (var entry : result.getContexts().entrySet()) {
                 String externalId = entry.getKey();
                 var dto = entry.getValue();
                 if (dto == null) continue;
-                // Prefer the map key, fall back to the dto field if both are populated.
                 String resolveKey = externalId != null && !externalId.isBlank()
                         ? externalId
                         : dto.getEntityExternalId();
                 UUID nodeId = resolveId(nodeIds, workspaceId, resolveKey);
-                if (nodeId == null) continue;
+                if (nodeId == null) {
+                    contextSkipped++;
+                    continue;
+                }
+                if (!persistedNodeIds.contains(nodeId)) {
+                    // Phantom UUID — nodeIds had a stale entry. Skip and warn
+                    // (first 3 only) so the operator can see the pattern.
+                    if (contextSkipped < 3) {
+                        log.warn("[pipeline] Skipping context — node_id not persisted "
+                                + " externalId={}  resolved={}  jobId={}",
+                                resolveKey, nodeId, jobId);
+                    }
+                    contextSkipped++;
+                    continue;
+                }
 
                 nodeUuids.add(nodeId.toString());
 
@@ -474,6 +501,11 @@ public class PipelineService {
                         body.getBytes(StandardCharsets.UTF_8),
                         conf
                 });
+            }
+
+            if (contextSkipped > 0) {
+                log.warn("[pipeline] Phase 3 skipped {} contexts (node_id missing)  jobId={}",
+                        contextSkipped, jobId);
             }
 
             if (!nodeUuids.isEmpty()) {

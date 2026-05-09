@@ -1,5 +1,6 @@
 """rebuild-from-json: read .brain/ JSONs, fan out to Postgres + Neo4j + Qdrant."""
 from __future__ import annotations
+import uuid
 from pathlib import Path
 
 from companybrain.graph.java_client import JavaGraphClient
@@ -18,7 +19,12 @@ async def rebuild_from_json(repo_path: Path, workspace_id: str) -> None:
 
     json_store = JsonFileBrainStore(brain_root)
 
-    java = JavaGraphClient(workspace_id=workspace_id, job_id="rebuild")
+    # Java's PipelineResultRequest.jobId is a UUID; passing the literal string
+    # "rebuild" caused Jackson to throw InvalidFormatException → 500.
+    # markCompleted is an UPDATE — a fresh UUID with no matching pipeline_jobs
+    # row simply hits 0 rows, which is fine for replay.
+    rebuild_job_id = str(uuid.uuid4())
+    java = JavaGraphClient(workspace_id=workspace_id, job_id=rebuild_job_id)
     pg = PostgresBrainStore(java)
     n4j = Neo4jBrainStore(Neo4jWriter(workspace_id=workspace_id), workspace_id=workspace_id)
     qd = QdrantBrainStore(brain_root=repo_path,

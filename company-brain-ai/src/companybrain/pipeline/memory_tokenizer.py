@@ -101,6 +101,12 @@ class MemoryTokenizer:
             sig = f" — `{_truncate(entity.signature, 80)}`" if entity.signature else ""
             t1 = f"{entity.entity_type} `{entity.name}`{sig}\nFile: {entity.file}\n(No business context synthesised yet — run pipeline to enrich)"
 
+        # Tier 3.B: append the actual SQL/JPQL to T1 so the retriever can
+        # surface it verbatim in the knowledge base for the /query route.
+        if entity.query_text and entity.entity_type in ("DatabaseQuery", "InterfaceMethod"):
+            sql_snippet = _truncate(entity.query_text, 300)
+            t1 = t1 + f"\nSQL: `{sql_snippet}`"
+
         return MemoryToken(
             entity_external_id=entity.external_id,
             t0=t0.strip(),

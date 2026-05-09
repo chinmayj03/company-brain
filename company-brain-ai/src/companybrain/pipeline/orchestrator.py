@@ -49,6 +49,7 @@ from companybrain.pipeline.context_manager_agent import ContextManagerAgent
 from companybrain.pipeline.shared_context_accumulator import SharedContextAccumulator
 from companybrain.pipeline.assumption_miner import mine_assumptions  # ADR-0017
 from companybrain.pipeline.derived_query_extractor import DerivedQueryExtractor  # Tier 1.C
+from companybrain.pipeline.extraction_loop import ExtractionLoop  # ADR-0041 Phase 2
 from companybrain.graph.java_client import JavaGraphClient, ArtifactFreshnessResult
 from companybrain.models.entities import PipelineStartRequest, ExtractedEntity
 from companybrain.store.base import BrainEntity as _BrainEntity  # ADR-0017
@@ -551,6 +552,37 @@ async def run_pipeline(
             )
             api_snapshot = {"path": request.endpoint_path, "method": request.http_method, "handler_code": ""}
             entities = await extractor.extract_from_clusters(git_clusters, api_snapshot)
+
+        # ── Stage 1 post-processing: call-graph following (ADR-0041 Phase 2) ──
+        # Follow CALLS edges and code_snippet call-sites to extract entities from
+        # files that CodeTracer didn't include in the initial FocalContext.
+        # Controlled by max_hops=2 and max_files_per_hop=3 to stay within cost budget.
+        if focal_context.code_units and not _skip_extraction:
+            try:
+                _repo_paths = [getattr(rc, "path", None) for rc in
+                               getattr(request, "repo_configs", []) if getattr(rc, "path", None)]
+                _loop_repo_root = _repo_paths[0] if _repo_paths else "."
+                _loop = ExtractionLoop(repo_root=_loop_repo_root, max_hops=2)
+                _loop_result = await _loop.run(
+                    initial_entities=entities,
+                    initial_relationships=[],
+                    initial_units=focal_context.code_units,
+                    extractor=extractor,
+                    focal_context=focal_context,
+                    l2=l2,
+                )
+                if _loop_result.files_followed:
+                    existing_names = {e.name for e in entities}
+                    _new_loop = [e for e in _loop_result.entities if e.name not in existing_names]
+                    entities.extend(_new_loop)
+                    log.info(
+                        "ExtractionLoop followed call chain",
+                        hops=_loop_result.hops_taken,
+                        files=_loop_result.files_followed,
+                        new_entities=len(_new_loop),
+                    )
+            except Exception as _loop_err:
+                log.warning("ExtractionLoop failed (non-fatal)", error=str(_loop_err))
 
         # ── Stage 1 post-processing: derived query extraction (Tier 1.C) ────────
         # Zero-cost structural scan for interface/repository methods that the LLM

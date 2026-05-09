@@ -271,6 +271,12 @@ class Neo4jWriter:
         self._password = password or os.environ.get("NEO4J_PASSWORD",  "neo4j")
         self._database = database
         self._driver: Optional[AsyncDriver] = None
+        # Name → canonical URN map populated in upsert_entities. Used by
+        # _external_id_to_urn so an edge whose to_entity is just a bare name
+        # (very common — that's what the LLM tends to emit) resolves to the
+        # SAME URN the corresponding node was stored under, instead of the
+        # bogus 'monorepo' fallback that orphans every edge in Neo4j.
+        self._name_to_urn: dict[str, str] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -359,6 +365,16 @@ class Neo4jWriter:
             return
 
         rows = [self._entity_to_row(e) for e in entities]
+
+        # Populate the bare-name → canonical URN index so subsequent edge
+        # writes can resolve LLM-emitted bare names to the right node URN.
+        # First-wins so duplicate names (rare) don't churn the entry.
+        for e, row in zip(entities, rows):
+            if e.name and row.get("id"):
+                self._name_to_urn.setdefault(e.name, row["id"])
+                # Also register qualified forms the LLM sometimes emits.
+                if "." in e.name:
+                    self._name_to_urn.setdefault(e.name.split(".", 1)[-1], row["id"])
         # Process in batches of BATCH_SIZE; track which actually succeeded so the
         # success log doesn't lie when every batch errored (e.g. DNS fail to neo4j:7687).
         succeeded = 0
@@ -848,6 +864,18 @@ RETURN count(n) AS c
         if external_id.startswith("urn:"):
             return external_id
 
+        # Bare-name lookup: if the name was registered during upsert_entities
+        # we know the canonical URN exactly. This is the path that fixes
+        # 'every edge orphaned in Neo4j' for relationships whose to_entity
+        # is the LLM's bare name (most relationships hit this path).
+        if external_id in self._name_to_urn:
+            return self._name_to_urn[external_id]
+        # Sometimes the LLM qualifies the name (Class.method) or vice-versa.
+        if "." in external_id:
+            tail = external_id.split(".", 1)[-1]
+            if tail in self._name_to_urn:
+                return self._name_to_urn[tail]
+
         tenant = workspace_slug_for(self.workspace_id)
         parts  = external_id.split("::", 1)
         if len(parts) == 2:
@@ -856,10 +884,17 @@ RETURN count(n) AS c
             repo_and_path = parts[0]
             name_part     = parts[1]
             real_repo     = repo_and_path.split("/", 1)[0] or "monorepo"
+            # Try the index again now that we've parsed out the bare name.
+            if name_part in self._name_to_urn:
+                return self._name_to_urn[name_part]
             return to_urn(
                 tenant=tenant, domain=DEFAULT_DOMAIN, repo=real_repo,
                 entity_type="component", qualified_name=name_part,
             )
+        # Last resort: fabricate URN with monorepo fallback. May still orphan
+        # the edge but at least the LLM gets a valid syntax. Log so the
+        # operator can see how many edges fall into this trap.
+        log.debug("Edge URN fallback to monorepo (no name match)", external_id=external_id)
         return to_urn(
             tenant=tenant, domain=DEFAULT_DOMAIN, repo="monorepo",
             entity_type="component", qualified_name=external_id,

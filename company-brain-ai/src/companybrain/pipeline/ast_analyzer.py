@@ -288,6 +288,117 @@ class SymbolTable:
                     result.append(imp)
         return result
 
+    # ── ADR-0041 Phase 1: walk helpers ─────────────────────────────────────
+    # These are the building blocks for the ReferenceFollowingExtractor.
+    # They expose the AST-derived structural data in a flat, traversable form
+    # so the extraction loop can follow the call graph without regex.
+
+    def walk_methods(self) -> list[dict]:
+        """
+        Return every method across all classes as a flat list of dicts.
+
+        Keys: class_name, method_name, signature, return_type, annotations,
+              jpa_query, spring_mapping, start_line, end_line, body_text,
+              file_path, language
+        """
+        results: list[dict] = []
+        for cls in self.classes:
+            for m in cls.methods:
+                results.append({
+                    "class_name":      cls.name,
+                    "method_name":     m.name,
+                    "signature":       m.signature,
+                    "return_type":     m.return_type,
+                    "annotations":     [a.name for a in m.annotations],
+                    "jpa_query":       m.jpa_query,
+                    "spring_mapping":  m.spring_mapping,
+                    "start_line":      m.start_line,
+                    "end_line":        m.end_line,
+                    "body_text":       m.body_text,
+                    "file_path":       self.file_path,
+                    "language":        self.language,
+                })
+        return results
+
+    def walk_fields(self) -> list[dict]:
+        """
+        Return every field across all classes as a flat list of dicts.
+
+        Keys: class_name, field_name, type_name, modifiers, annotations,
+              is_injected, file_path, language
+        """
+        results: list[dict] = []
+        for cls in self.classes:
+            for f in cls.fields:
+                results.append({
+                    "class_name":  cls.name,
+                    "field_name":  f.name,
+                    "type_name":   f.type_name,
+                    "modifiers":   f.modifiers,
+                    "annotations": [a.name for a in f.annotations],
+                    "is_injected": f.is_injected,
+                    "file_path":   self.file_path,
+                    "language":    self.language,
+                })
+        return results
+
+    def walk_type_refs(self) -> list[str]:
+        """
+        Return all type names referenced in this file: field types, parameter
+        types, return types, superclass, and interfaces.
+        Deduped, short names only (no package prefix).
+        """
+        seen: set[str] = set()
+        for cls in self.classes:
+            if cls.superclass:
+                seen.add(cls.superclass.split(".")[-1])
+            for iface in cls.interfaces:
+                seen.add(iface.split(".")[-1])
+            for f in cls.fields:
+                seen.add(f.type_name.split("<")[0].strip())
+            for m in cls.methods:
+                seen.add(m.return_type.split("<")[0].strip())
+                for p in m.parameters:
+                    seen.add(p.type_name.split("<")[0].strip())
+        seen.discard("")
+        return sorted(seen)
+
+    def walk_calls(self) -> list[dict]:
+        """
+        Heuristic call-site detection from method bodies using regex.
+        Returns dicts: {from_class, from_method, callee_expr, line_hint}.
+
+        This is intentionally light — it finds `identifier.methodName(` patterns
+        in method bodies. The ReferenceFollowingExtractor uses this to discover
+        which classes a method depends on without a full call-graph analysis.
+        """
+        _call_re = re.compile(r'\b(\w+)\.(\w+)\s*\(')
+        results: list[dict] = []
+        for cls in self.classes:
+            for m in cls.methods:
+                if not m.body_text:
+                    continue
+                for i, line in enumerate(m.body_text.splitlines()):
+                    for match in _call_re.finditer(line):
+                        receiver   = match.group(1)
+                        method_name = match.group(2)
+                        # Skip noise: this, super, log, logger, System, String, etc.
+                        if receiver.lower() in (
+                            "this", "super", "log", "logger", "system",
+                            "string", "math", "objects", "optional",
+                        ):
+                            continue
+                        results.append({
+                            "from_class":   cls.name,
+                            "from_method":  m.name,
+                            "receiver":     receiver,
+                            "callee_method": method_name,
+                            "callee_expr":  f"{receiver}.{method_name}(",
+                            "line_hint":    m.start_line + i,
+                            "file_path":    self.file_path,
+                        })
+        return results
+
 
 # ── Main class ────────────────────────────────────────────────────────────────
 

@@ -11,9 +11,16 @@
  *   NEO4J_PASSWORD(default password)
  *   JAVA_API_URL  (default http://localhost:8080)
  */
+import { createHash } from "node:crypto";
 import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
 import { GraphClient } from "@company-brain/graph";
 import { createToolRouter } from "@company-brain/tools";
+
+function sha256Parts(parts: string[]): string {
+  return createHash("sha256")
+    .update(parts.sort().join("\n"))
+    .digest("hex");
+}
 
 const PORT        = Number(process.env["PORT"] ?? 8090);
 
@@ -99,6 +106,8 @@ const server = Bun.serve({
       if (!scope) return addCors(new Response("scope required", { status: 400 }));
 
       try {
+        // Query returns raw parts array so we can hash on the JS side —
+        // apoc.util.sha256 is not available without the APOC plugin.
         const rows = await graph.runRead(
           `MATCH (f:File { scope: $scope })
            OPTIONAL MATCH (f)-[:CONTAINS]->(n)
@@ -109,23 +118,25 @@ const server = Bun.serve({
                 size([m IN members WHERE m.kind = 'Function']) AS function_count,
                 size([m IN members WHERE m.kind = 'Class'])    AS class_count
            RETURN f.path AS file_path,
-                  apoc.util.sha256(parts) AS structural_hash,
+                  parts AS member_parts,
                   function_count,
                   class_count,
                   f.last_indexed_commit AS last_indexed_commit`,
           { scope }
         );
 
-        // If APOC is unavailable, fall back to a JS-side hash so the endpoint
-        // still works without APOC; the Python side will always see mismatches
-        // on a non-APOC Neo4j but will degrade gracefully (full LLM run).
-        const fingerprints = rows.map((row: Record<string, unknown>) => ({
-          file_path:           row["file_path"]           ?? "",
-          structural_hash:     row["structural_hash"]     ?? "",
-          function_count:      Number(row["function_count"] ?? 0),
-          class_count:         Number(row["class_count"]    ?? 0),
-          last_indexed_commit: row["last_indexed_commit"] ?? "",
-        }));
+        const fingerprints = rows.map((row: Record<string, unknown>) => {
+          const parts = Array.isArray(row["member_parts"])
+            ? (row["member_parts"] as string[])
+            : [];
+          return {
+            file_path:           row["file_path"]           ?? "",
+            structural_hash:     sha256Parts(parts),
+            function_count:      Number(row["function_count"] ?? 0),
+            class_count:         Number(row["class_count"]    ?? 0),
+            last_indexed_commit: row["last_indexed_commit"] ?? "",
+          };
+        });
 
         return addCors(Response.json({ fingerprints }));
       } catch (err) {

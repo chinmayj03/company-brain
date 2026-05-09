@@ -187,8 +187,15 @@ def compute_cost_usd(
     )
 
 
-def log_llm_call(record: LLMCallRecord) -> None:
-    """Emit a structured log, update the run-level UsageTracker, and forward to Langfuse."""
+def log_llm_call(
+    record: LLMCallRecord,
+    *,
+    job_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    stage: Optional[str] = None,
+) -> None:
+    """Emit a structured log, update the run-level UsageTracker, forward to Langfuse,
+    and fire-and-forget a write to the llm_call_log table for cost telemetry."""
     import structlog as _sl
     _sl.get_logger(__name__).info(
         "llm_call",
@@ -219,6 +226,55 @@ def log_llm_call(record: LLMCallRecord) -> None:
             )
     except Exception:
         pass   # observability must never crash the pipeline
+
+    # Persist to llm_call_log for make -f Makefile.demo cost queries.
+    # Fire-and-forget from the running asyncio event loop (providers call this
+    # from within async chat() methods, so a loop is always available).
+    import asyncio as _asyncio
+    try:
+        loop = _asyncio.get_event_loop()
+        if loop.is_running():
+            loop.create_task(_persist_llm_call_log(record, job_id=job_id,
+                                                    workspace_id=workspace_id,
+                                                    stage=stage))
+    except Exception:
+        pass   # never crash the pipeline for telemetry
+
+
+async def _persist_llm_call_log(
+    record: LLMCallRecord,
+    *,
+    job_id: Optional[str],
+    workspace_id: Optional[str],
+    stage: Optional[str],
+) -> None:
+    """Write one row to llm_call_log. Non-fatal — swallows all errors."""
+    try:
+        import asyncpg
+        from companybrain.config import settings
+
+        # Convert postgresql+asyncpg:// URL to plain postgresql:// for asyncpg
+        db_url = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+
+        conn = await asyncpg.connect(db_url)
+        try:
+            await conn.execute(
+                """INSERT INTO llm_call_log
+                   (workspace_id, job_id, stage, provider, model, role,
+                    input_tokens, output_tokens, cache_read_tokens,
+                    cache_creation_tokens, cost_usd)
+                   VALUES ($1::uuid, $2, $3, $4, $5, $6,
+                           $7, $8, $9, $10, $11)""",
+                workspace_id, job_id, stage,
+                record.provider, record.model, record.role,
+                record.input_tokens, record.output_tokens,
+                record.cache_read_tokens, record.cache_creation_tokens,
+                record.cost_usd,
+            )
+        finally:
+            await conn.close()
+    except Exception:
+        pass   # observability never crashes the pipeline
 
 
 # ── Run-level usage tracker ───────────────────────────────────────────────────

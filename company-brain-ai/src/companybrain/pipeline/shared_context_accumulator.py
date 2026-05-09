@@ -116,17 +116,30 @@ class SharedContextAccumulator:
         unit: CodeUnit,
     ) -> None:
         for e in entities:
-            if e.entity_type != "Class":
+            if e.entity_type not in ("Class", "InterfaceMethod"):
                 continue
-            name = e.name
+            # Use the short name (strip package prefix and method suffixes)
+            name = e.name.split(".")[-1].split("(")[0]
+            role = None
             if any(name.endswith(s) for s in _SERVICE_SUFFIXES):
-                l2.service_registry.setdefault(name, {"role": "service", "file": e.file})
+                role = "service"
             elif any(name.endswith(s) for s in _REPO_SUFFIXES):
-                l2.service_registry.setdefault(name, {"role": "repository", "file": e.file})
+                role = "repository"
             elif any(name.endswith(s) for s in _CLIENT_SUFFIXES):
-                l2.service_registry.setdefault(name, {"role": "client", "file": e.file})
+                role = "client"
             elif any(name.endswith(s) for s in _CONTROLLER_SUFFIXES):
-                l2.service_registry.setdefault(name, {"role": "controller", "file": e.file})
+                role = "controller"
+            if role is None:
+                continue
+
+            existing = l2.service_registry.get(name)
+            # Prefer the declaration file (file stem == class name) over any
+            # import-observation. A declaration file is authoritative; an
+            # import-observation is just where the name was mentioned.
+            file_stem = e.file.rsplit("/", 1)[-1].rsplit(".", 1)[0] if e.file else ""
+            is_declaration = file_stem == name
+            if not existing or is_declaration:
+                l2.service_registry[name] = {"role": role, "file": e.file}
 
     # ── Domain glossary ────────────────────────────────────────────────────────
 

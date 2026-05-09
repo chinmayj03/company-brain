@@ -583,13 +583,20 @@ RETURN count(r) AS c
         entity_urn: str,
         props: dict[str, Any],
     ) -> None:
-        """Upsert a BusinessContext node and attach it to the entity node."""
+        """Upsert a BusinessContext node and attach it to the entity node.
+
+        Standard Neo4j Docker images don't ship APOC, so the previous
+        apoc.create.addLabels call would 500. Use a static dual-label MERGE
+        and rely on the type=BusinessContext property for queries that
+        need to distinguish context nodes from regular entity nodes.
+        """
+        # Force a type marker on the props so MATCH (n:CBNode {type:'BusinessContext'})
+        # works as a substitute for the missing :BusinessContext label.
+        props = {**props, "type": "BusinessContext"}
         cypher = """
 MERGE (ctx:CBNode { id: $id })
 SET ctx += $props
 WITH ctx
-CALL apoc.create.addLabels(ctx, ['BusinessContext']) YIELD node
-WITH node AS ctx
 MATCH (entity:CBNode { id: $entity_urn })
 MERGE (entity)-[:HAS_CONTEXT]->(ctx)
 RETURN ctx

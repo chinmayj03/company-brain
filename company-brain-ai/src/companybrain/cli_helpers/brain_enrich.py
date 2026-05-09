@@ -61,30 +61,38 @@ def _load_env_for_cli() -> None:
         print("[enrich] python-dotenv not installed — relying on already-exported env")
         return
     here = Path(__file__).resolve()
-    # Order matters with override=False: the FIRST file to define a var wins,
-    # subsequent files only fill in vars that were missing.  We list the most
-    # authoritative file first (company-brain repo root) so an outdated /
-    # incomplete company-brain-ai/.env can no longer shadow the real key.
-    candidates = [
+    # The repo-root file is the source of truth — load it WITH override=True so
+    # a stale ANTHROPIC_API_KEY left in the shell env (from `make backend` or a
+    # previous terminal) cannot shadow the correct key in .env.  The other
+    # candidates load with override=False to only fill in missing vars.
+    repo_root_env = here.parent.parent.parent.parent.parent / ".env"  # company-brain/.env
+    fallback_candidates = [
         Path.cwd() / ".env",
-        here.parent.parent.parent.parent.parent / ".env",   # company-brain/.env (repo root) — preferred
-        here.parent.parent.parent.parent / ".env",          # company-brain-ai/.env (sub-package fallback)
+        here.parent.parent.parent.parent / ".env",          # company-brain-ai/.env
         here.parent.parent.parent.parent.parent.parent / ".env",  # one above repo root
     ]
+
+    pre_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    pre_src = "shell" if pre_key else "(unset)"
+
     loaded_any = False
-    seen: set[str] = set()
-    for c in candidates:
+    if repo_root_env.is_file():
+        load_dotenv(repo_root_env, override=True)
+        print(f"[enrich] loaded env from {repo_root_env} (override=True)")
+        loaded_any = True
+
+    seen: set[str] = {str(repo_root_env.resolve())} if repo_root_env.is_file() else set()
+    for c in fallback_candidates:
         try:
             real = c.resolve()
         except OSError:
             continue
-        key = str(real)
-        if key in seen:
+        if str(real) in seen:
             continue
-        seen.add(key)
+        seen.add(str(real))
         if real.is_file():
             load_dotenv(real, override=False)
-            print(f"[enrich] loaded env from {real}")
+            print(f"[enrich] loaded env from {real} (override=False)")
             loaded_any = True
 
     if not loaded_any:
@@ -99,11 +107,18 @@ def _load_env_for_cli() -> None:
 
     # Surface a clear error early if the API key didn't make it through, rather
     # than letting the LLM client raise an opaque 401 a few seconds later.
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    final_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not final_key:
         print(
             "[enrich] WARNING: ANTHROPIC_API_KEY not set after .env load. "
             "Stage 2 (relationships) and Stage 3 (context) will 401."
         )
+    else:
+        # Print just the prefix and tail (~10 chars total) — enough for the
+        # user to recognise WHICH key is being used without leaking the secret.
+        masked = f"{final_key[:7]}…{final_key[-4:]}"
+        changed = "CHANGED" if pre_key and pre_key != final_key else "kept"
+        print(f"[enrich] ANTHROPIC_API_KEY in use: {masked}  (was {pre_src}, now {changed})")
 
 
 _load_env_for_cli()

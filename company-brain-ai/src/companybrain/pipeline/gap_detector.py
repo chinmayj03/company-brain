@@ -183,7 +183,10 @@ class GapDetector:
                 ChatMessage(role="system", content=GAP_DETECTION_SYSTEM_PROMPT),
                 ChatMessage(role="user", content=user_content),
             ],
-            role=TaskRole.SYNTHESIS,   # REASONING (qwen3-32b) rate-limits on Groq free tier
+            role=TaskRole.FAST,        # JSON classification task — Haiku is sufficient.
+                                   # Was SYNTHESIS (Opus on Anthropic) at $15/$75 per MTok,
+                                   # accounting for ~$0.21–0.35 per endpoint run alone.
+                                   # Groq note: if Groq rate-limits FAST, switch to BALANCED.
             max_tokens=settings.max_tokens_gap_detection,
         )
 

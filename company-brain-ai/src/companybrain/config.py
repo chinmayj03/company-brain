@@ -52,8 +52,13 @@ class Settings(BaseSettings):
     anthropic_model_synthesis: str = "claude-sonnet-4-6"   # was opus — 5× cheaper, 90% quality
     anthropic_model_reasoning: str = "claude-sonnet-4-6"
     anthropic_model_query:     str = "claude-sonnet-4-6"
-    # Set to true to use Anthropic's Batch API (async, 24hr, 50% cost reduction)
-    anthropic_use_batch_api: bool = False
+    # Set to true to use Anthropic's Batch API (async, 24hr, 50% cost reduction).
+    # The BatchProcessor in batch_processor.py is fully implemented — this was the only
+    # thing preventing it from being used. Enable for all non-blocking pipeline stages
+    # (context synthesis, gap detection, relationship extraction). Tradeoff: results
+    # arrive in a polling loop (up to 24h) rather than synchronously — acceptable for
+    # background indexing, not for interactive queries.
+    anthropic_use_batch_api: bool = True
 
     # OpenAI — used when llm_provider=openai
     openai_api_key: str = ""
@@ -155,12 +160,15 @@ class Settings(BaseSettings):
     # for files with many classes/methods.
     # Groq llama-3.1-8b-instant supports up to 8K output tokens.
     # Diff-based extraction can produce large JSON arrays — 6K gives ample headroom.
-    max_tokens_entity_extraction:  int = 6_000   # Stage 1  — raised from 2048
-    max_tokens_intent_synthesis:   int = 2_048   # Stage 1.5
-    max_tokens_relationship:       int = 4_096   # Stage 2
-    max_tokens_context_synthesis:  int = 2_048   # Stage 3
-    max_tokens_gap_detection:      int = 4_096   # Stage 4
-    max_tokens_query:              int = 4_096   # Live query responses
+    # max_tokens sets the billing ceiling per LLM call — right-size these to P95 actual output.
+    # Overly generous ceilings waste buffer on retries and inflate tail latency.
+    # Use Langfuse to audit actual output token distributions and tighten further.
+    max_tokens_entity_extraction:  int = 4_000   # Stage 1  — was 6000; entity JSON is bounded
+    max_tokens_intent_synthesis:   int = 1_024   # Stage 1.5 — was 2048; label+description is short
+    max_tokens_relationship:       int = 2_048   # Stage 2  — was 4096; max 20 edges × ~50 tokens
+    max_tokens_context_synthesis:  int = 1_024   # Stage 3  — was 2048; 9-field context object
+    max_tokens_gap_detection:      int = 1_500   # Stage 4  — was 4096; 3-8 gap objects × ~100 tok
+    max_tokens_query:              int = 4_096   # Live query responses — keep generous
 
 
 settings = Settings()

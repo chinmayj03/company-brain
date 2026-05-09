@@ -1,14 +1,15 @@
 """
 AnthropicProvider — Claude models via the Anthropic API.
 
-Model assignment per task role:
-  FAST        → claude-haiku-4-5-20251001
-  BALANCED    → claude-sonnet-4-6
-  SYNTHESIS   → claude-opus-4-6
-  REASONING   → claude-sonnet-4-6
-  QUERY       → claude-opus-4-6
+Model assignment per task role (reads from config.py / env vars):
+  FAST        → claude-haiku-4-5-20251001   ($0.80/$4.00 per MTok)
+  BALANCED    → claude-sonnet-4-6           ($3/$15 per MTok)
+  SYNTHESIS   → claude-sonnet-4-6           ($3/$15 per MTok)  ← was opus, 5× cheaper
+  REASONING   → claude-sonnet-4-6           ($3/$15 per MTok)
+  QUERY       → claude-sonnet-4-6           ($3/$15 per MTok)  ← was opus, 5× cheaper
 
-Override per role: ANTHROPIC_MODEL_<ROLE>=<model>
+Override per role via env: ANTHROPIC_MODEL_<ROLE>=<model>
+Or set in config.py: anthropic_model_fast / balanced / synthesis / reasoning / query
 Requires: ANTHROPIC_API_KEY env var
 """
 
@@ -24,16 +25,24 @@ from companybrain.llm.base import (
     LLMProvider, TaskRole, ChatMessage, ChatResponse,
     LLMCallRecord, compute_cost_usd, log_llm_call,
 )
+from companybrain.config import settings
 
 log = structlog.get_logger(__name__)
 
-_DEFAULT_MODELS: dict[TaskRole, str] = {
-    TaskRole.FAST:      "claude-haiku-4-5-20251001",
-    TaskRole.BALANCED:  "claude-sonnet-4-6",
-    TaskRole.SYNTHESIS: "claude-opus-4-6",
-    TaskRole.REASONING: "claude-sonnet-4-6",
-    TaskRole.QUERY:     "claude-opus-4-6",
-}
+# Model defaults read from config.py so a single source of truth controls costs.
+# config.py values can be overridden via env vars (ANTHROPIC_MODEL_FAST, etc.).
+# Previously this dict was hardcoded with claude-opus-4-6 for SYNTHESIS and QUERY,
+# causing ~$0.35/endpoint overspend because config.py changes were silently ignored.
+def _build_default_models() -> dict[TaskRole, str]:
+    return {
+        TaskRole.FAST:      settings.anthropic_model_fast,
+        TaskRole.BALANCED:  settings.anthropic_model_balanced,
+        TaskRole.SYNTHESIS: settings.anthropic_model_synthesis,
+        TaskRole.REASONING: settings.anthropic_model_reasoning,
+        TaskRole.QUERY:     settings.anthropic_model_query,
+    }
+
+_DEFAULT_MODELS: dict[TaskRole, str] = _build_default_models()
 
 _ENV_OVERRIDES: dict[TaskRole, str] = {
     role: os.environ[f"ANTHROPIC_MODEL_{role.value.upper()}"]

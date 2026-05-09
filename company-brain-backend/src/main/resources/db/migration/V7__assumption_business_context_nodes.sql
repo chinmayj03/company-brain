@@ -17,7 +17,7 @@ WITH source AS (
     nc.id            AS old_ctx_id,
     nc.workspace_id,
     n.urn            AS parent_urn,
-    n.repo           AS parent_repo,
+    split_part(n.urn, ':', 4) AS parent_repo,
     nc.context_type,
     nc.title         AS qualified_name,
     encode(nc.body, 'escape') AS body_text,

@@ -388,7 +388,9 @@ class IntentSynthesizer:
         try:
             response = await self._provider.chat(
                 messages=messages,
-                role=TaskRole.BALANCED,
+                role=TaskRole.FAST,   # Label classification into fixed taxonomy — Haiku-grade.
+                                      # Was BALANCED (Sonnet) at $3/$15 per MTok. Each class
+                                      # costs ~$0.02–0.04 at Sonnet; ~$0.002–0.004 at Haiku.
                 max_tokens=settings.max_tokens_intent_synthesis,
                 temperature=0.0,
             )

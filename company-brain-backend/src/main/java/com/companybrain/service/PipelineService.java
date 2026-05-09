@@ -207,19 +207,58 @@ public class PipelineService {
                 });
             }
 
-            // 1 batch INSERT … ON CONFLICT DO UPDATE
-            // The ON CONFLICT guard covers re-runs: same (workspace, type, extId) → upsert.
-            // nodes.urn is written when the AI service supplies it (ADR-0013 transition).
-            jdbc.batchUpdate("""
-                    INSERT INTO nodes (id, workspace_id, node_type, entity_type, external_id, name, metadata, urn)
-                    VALUES (?::uuid, ?::uuid, ?, ?, ?, ?, ?::jsonb, ?)
-                    ON CONFLICT (workspace_id, node_type, external_id)
-                    DO UPDATE SET
-                        name        = EXCLUDED.name,
-                        metadata    = EXCLUDED.metadata,
-                        entity_type = EXCLUDED.entity_type,
-                        urn         = COALESCE(EXCLUDED.urn, nodes.urn)
-                    """, rows);
+            // Batch INSERT split by URN presence (ADR-0013 transition):
+            //
+            // Rows WITH a URN use ON CONFLICT (workspace_id, urn) — URN is the canonical
+            // identity per ADR-0013. Without this split, rows whose external_id changed
+            // between runs (e.g. path format change) would skip the (workspace, type, extId)
+            // conflict and crash on uq_nodes_urn.
+            //
+            // Rows WITHOUT a URN keep the legacy (workspace_id, node_type, external_id) target
+            // so old AI service versions still work during the rollout window.
+            List<Object[]> rowsWithUrn    = rows.stream().filter(r -> r[7] != null).toList();
+            List<Object[]> rowsWithoutUrn = rows.stream().filter(r -> r[7] == null).toList();
+
+            if (!rowsWithUrn.isEmpty()) {
+                jdbc.batchUpdate("""
+                        INSERT INTO nodes (id, workspace_id, node_type, entity_type, external_id, name, metadata, urn)
+                        VALUES (?::uuid, ?::uuid, ?, ?, ?, ?, ?::jsonb, ?)
+                        ON CONFLICT (workspace_id, urn)
+                        DO UPDATE SET
+                            node_type   = EXCLUDED.node_type,
+                            entity_type = EXCLUDED.entity_type,
+                            external_id = EXCLUDED.external_id,
+                            name        = EXCLUDED.name,
+                            metadata    = EXCLUDED.metadata
+                        """, rowsWithUrn);
+            }
+
+            if (!rowsWithoutUrn.isEmpty()) {
+                jdbc.batchUpdate("""
+                        INSERT INTO nodes (id, workspace_id, node_type, entity_type, external_id, name, metadata, urn)
+                        VALUES (?::uuid, ?::uuid, ?, ?, ?, ?, ?::jsonb, ?)
+                        ON CONFLICT (workspace_id, node_type, external_id)
+                        DO UPDATE SET
+                            name        = EXCLUDED.name,
+                            metadata    = EXCLUDED.metadata,
+                            entity_type = EXCLUDED.entity_type,
+                            urn         = COALESCE(EXCLUDED.urn, nodes.urn)
+                        """, rowsWithoutUrn);
+            }
+
+            // Re-sync nodeIds after upsert.
+            // When ON CONFLICT (workspace_id, urn) fires, Postgres keeps the EXISTING row UUID —
+            // not the UUID we generated above. Any node whose external_id changed between runs
+            // (URN match, extId mismatch) will have a phantom UUID in nodeIds that doesn't exist
+            // in the DB, causing FK violations in phases 2–5 (edges, contexts, artifact_links).
+            // A fresh SELECT by the now-current external_ids overwrites every entry with the
+            // actual DB UUID before any downstream phase runs.
+            nodeRepository.findByWorkspaceIdAndExternalIdIn(workspaceId, extIds)
+                    .forEach(n -> {
+                        String typeKey = n.getNodeType() + ":" + n.getExternalId();
+                        nodeIds.put(typeKey, n.getId());
+                        nodeIds.put(n.getExternalId(), n.getId()); // plain key for edges
+                    });
 
             entityCount = rows.size();
             log.info("[pipeline] Upserted {} entities  jobId={}", entityCount, jobId);

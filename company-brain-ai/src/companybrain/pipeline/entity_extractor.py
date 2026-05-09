@@ -476,10 +476,32 @@ class EntityExtractor:
             # which methods are relevant to the target endpoint.  Only those
             # methods (plus always the entry method) are sent for full extraction.
             # This replaces sending all N method bodies when only K << N matter.
+            #
+            # EXCEPT for repository / DAO units: the whole point of a repository
+            # is its query bodies (jOOQ DSL chains, JPQL @Query strings). The
+            # skeleton-prefilter throws those away because their names don't
+            # mention the endpoint, so 'what tables does X read' becomes
+            # un-answerable. Always send full bodies for repository files.
+            unit_role = (unit.role or "").lower()
+            is_repository_unit = (
+                "repository" in unit_role
+                or "dao" in unit_role
+                or (unit.file_path and (
+                    "Repository" in unit.file_path
+                    or "Dao" in unit.file_path
+                    or "RepositoryImpl" in unit.file_path))
+            )
+
             content_len = len(unit.content or "")
-            if content_len > 600 and len(method_chunks) > 1:
+            if content_len > 600 and len(method_chunks) > 1 and not is_repository_unit:
                 method_chunks = await self._apply_skeleton_prefilter(
                     method_chunks, symbol_table, unit, focal_context, entry_method
+                )
+            elif is_repository_unit:
+                log.info(
+                    "Repository unit — skipping skeleton-prefilter, sending all method bodies",
+                    unit=unit.brief(),
+                    method_count=len(method_chunks),
                 )
 
             log.info(

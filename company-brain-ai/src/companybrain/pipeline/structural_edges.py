@@ -95,6 +95,124 @@ def _new_rel(
     )
 
 
+# ── SQL / jOOQ DSL → table & column edges ────────────────────────────────────
+#
+# Patterns we match on a DatabaseQuery entity's query_text or code_snippet:
+#   jOOQ DSL  →  PLAN_INFO.LOB         → table "plan_info", column "lob"
+#                COMP_PROVIDERS.PAYER_ID
+#                .from(PLAN_INFO)      → just the table
+#   raw SQL   →  FROM plan_info        → table "plan_info"
+#                INSERT INTO charges   → table "charges"
+#                SELECT amount, status FROM ...  → SELECT cols are READS
+#                SET status = ?, amount = ?       → SET cols are WRITES
+#
+# Output is a flat list of (table, column) pairs. We tag each with a role
+# (READS_COLUMN / WRITES_COLUMN / READS_TABLE) so the caller can build
+# specific edge types. Names are normalised to snake_case lower.
+
+_JOOQ_TABLE_COL = _re.compile(
+    r"\b([A-Z][A-Z0-9_]{2,})\.([A-Z][A-Z0-9_]+)\b"
+)
+_JOOQ_FROM     = _re.compile(r"\.from\s*\(\s*([A-Z][A-Z0-9_]{2,})\b")
+_SQL_FROM      = _re.compile(r"\bFROM\s+([a-z_][\w.]*)", _re.IGNORECASE)
+_SQL_JOIN      = _re.compile(r"\bJOIN\s+([a-z_][\w.]*)", _re.IGNORECASE)
+_SQL_INSERT    = _re.compile(r"\bINSERT\s+INTO\s+([a-z_][\w.]*)", _re.IGNORECASE)
+_SQL_UPDATE    = _re.compile(r"\bUPDATE\s+([a-z_][\w.]*)", _re.IGNORECASE)
+_SQL_DELETE    = _re.compile(r"\bDELETE\s+FROM\s+([a-z_][\w.]*)", _re.IGNORECASE)
+_SQL_SET       = _re.compile(r"\bSET\s+([\w,\s=?]+)", _re.IGNORECASE)
+_SQL_SELECT    = _re.compile(r"\bSELECT\s+(.+?)\s+FROM\b", _re.IGNORECASE | _re.DOTALL)
+
+
+def _normalise(name: str) -> str:
+    return name.strip().rstrip(",").lower()
+
+
+def extract_sql_edges(
+    entity_name: str,
+    entity_type: str,
+    query_text: str,
+) -> list["ExtractedRelationship"]:
+    """Deterministically derive READS_COLUMN / WRITES_COLUMN / etc. edges from SQL/DSL.
+
+    Caller passes the entity that owns the query_text; we emit edges with
+    from_entity = that entity, to_entity = "table.column" or "table".
+    """
+    if not query_text:
+        return []
+    out: list["ExtractedRelationship"] = []
+    text = query_text
+
+    # Detect mutation vs read intent. INSERT/UPDATE/DELETE → write.
+    is_write = bool(
+        _SQL_INSERT.search(text)
+        or _SQL_UPDATE.search(text)
+        or _SQL_DELETE.search(text)
+    )
+
+    # ── jOOQ-style TABLE.COLUMN references ───────────────────────────────────
+    for m in _JOOQ_TABLE_COL.finditer(text):
+        tbl, col = _normalise(m.group(1)), _normalise(m.group(2))
+        # Skip Java constants that look like jOOQ but aren't (Logger.LOG, etc.)
+        if tbl in {"log", "logger", "string", "integer", "long", "math",
+                   "collections", "objects", "files", "paths"}:
+            continue
+        edge_type = "WRITES_COLUMN" if is_write else "READS_COLUMN"
+        out.append(_new_rel(
+            from_entity=entity_name, from_type=entity_type,
+            edge_type=edge_type,
+            to_entity=f"{tbl}.{col}", to_type="DatabaseColumn",
+            evidence=f"{tbl}.{col}",
+        ))
+
+    # ── jOOQ .from(TABLE) — table-level read ─────────────────────────────────
+    for m in _JOOQ_FROM.finditer(text):
+        tbl = _normalise(m.group(1))
+        out.append(_new_rel(
+            from_entity=entity_name, from_type=entity_type,
+            edge_type="READS_COLUMN",  # collapse to reads at table-level too
+            to_entity=tbl, to_type="DatabaseTable",
+            evidence=f".from({m.group(1)})",
+            confidence=0.9,
+        ))
+
+    # ── Raw-SQL FROM / JOIN / INSERT / UPDATE / DELETE ───────────────────────
+    for pat, edge in (
+        (_SQL_FROM,   "READS_COLUMN"),
+        (_SQL_JOIN,   "READS_COLUMN"),
+        (_SQL_INSERT, "WRITES_COLUMN"),
+        (_SQL_UPDATE, "WRITES_COLUMN"),
+        (_SQL_DELETE, "WRITES_COLUMN"),
+    ):
+        for m in pat.finditer(text):
+            tbl = _normalise(m.group(1))
+            out.append(_new_rel(
+                from_entity=entity_name, from_type=entity_type,
+                edge_type=edge,
+                to_entity=tbl, to_type="DatabaseTable",
+                evidence=m.group(0)[:80],
+                confidence=0.95,
+            ))
+
+    # ── Raw-SQL SELECT cols → READS_COLUMN per identifier ────────────────────
+    sel = _SQL_SELECT.search(text)
+    if sel:
+        cols_blob = sel.group(1)
+        for col_token in _re.findall(r"\b([a-z_][\w]+)\b", cols_blob):
+            if col_token in {"select", "as", "distinct", "from", "case", "when",
+                             "then", "else", "end", "and", "or", "null", "true",
+                             "false", "count", "sum", "avg", "min", "max"}:
+                continue
+            out.append(_new_rel(
+                from_entity=entity_name, from_type=entity_type,
+                edge_type="READS_COLUMN",
+                to_entity=col_token, to_type="DatabaseColumn",
+                evidence=f"SELECT … {col_token}",
+                confidence=0.7,
+            ))
+
+    return out
+
+
 def extract_structural_edges(
     units: Iterable["CodeUnit"],
     entities: list["ExtractedEntity"],
@@ -203,6 +321,23 @@ def extract_structural_edges(
                     confidence=0.85,
                 ))
 
+    # ── SQL / jOOQ edges from any entity that carries query_text ─────────────
+    # Cheapest, highest-leverage edges — no LLM. Catches READS_COLUMN /
+    # WRITES_COLUMN that the relationship LLM almost never finds because it
+    # rarely sees the full query body.
+    for e in entities:
+        qtext = getattr(e, "query_text", None) or ""
+        if not qtext:
+            # Also try the entity's code_snippet — jOOQ DSL chains usually
+            # live in the method body for repository implementations.
+            qtext = getattr(e, "code_snippet", None) or ""
+        if qtext:
+            out.extend(extract_sql_edges(
+                entity_name=e.name,
+                entity_type=e.entity_type,
+                query_text=qtext,
+            ))
+
     # Dedup on (from, edge_type, to) — first-wins keeps highest-confidence.
     seen: set[tuple[str, str, str]] = set()
     deduped: list["ExtractedRelationship"] = []
@@ -218,7 +353,8 @@ def extract_structural_edges(
         units=len(list(units)) if not isinstance(units, list) else len(units),
         edges_emitted=len(deduped),
         by_type={t: sum(1 for r in deduped if r.edge_type == t)
-                 for t in {"CONTAINS", "EXTENDS", "IMPLEMENTS", "INSTANTIATES", "IMPORTS"}},
+                 for t in {"CONTAINS", "EXTENDS", "IMPLEMENTS", "INSTANTIATES",
+                           "IMPORTS", "READS_COLUMN", "WRITES_COLUMN"}},
     )
     return deduped
 

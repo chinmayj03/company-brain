@@ -47,28 +47,63 @@ import structlog
 
 # ── Eager env loading - must happen BEFORE anything imports settings ─────────
 def _load_env_for_cli() -> None:
-    """Walk parents of CWD looking for a .env, load it without overriding existing env."""
+    """Load .env from every candidate path (company-brain-ai/, company-brain/, cwd).
+
+    Loads ALL of them, not just the first match — an incomplete .env in
+    company-brain-ai/ used to shadow the real one in company-brain/. With
+    override=False, the first file that defines a var wins, but later files
+    can fill in vars the earlier ones missed.
+    """
     try:
         from dotenv import load_dotenv  # type: ignore
     except ImportError:
         # python-dotenv may not be installed in slimmer envs - fall back silently.
+        print("[enrich] python-dotenv not installed — relying on already-exported env")
         return
     here = Path(__file__).resolve()
+    # Order matters with override=False: the FIRST file to define a var wins,
+    # subsequent files only fill in vars that were missing.  We list the most
+    # authoritative file first (company-brain repo root) so an outdated /
+    # incomplete company-brain-ai/.env can no longer shadow the real key.
     candidates = [
         Path.cwd() / ".env",
-        here.parent.parent.parent.parent / ".env",          # company-brain-ai/.env
-        here.parent.parent.parent.parent.parent / ".env",   # company-brain/.env
+        here.parent.parent.parent.parent.parent / ".env",   # company-brain/.env (repo root) — preferred
+        here.parent.parent.parent.parent / ".env",          # company-brain-ai/.env (sub-package fallback)
+        here.parent.parent.parent.parent.parent.parent / ".env",  # one above repo root
     ]
+    loaded_any = False
+    seen: set[str] = set()
     for c in candidates:
-        if c.is_file():
-            load_dotenv(c, override=False)
-            break
+        try:
+            real = c.resolve()
+        except OSError:
+            continue
+        key = str(real)
+        if key in seen:
+            continue
+        seen.add(key)
+        if real.is_file():
+            load_dotenv(real, override=False)
+            print(f"[enrich] loaded env from {real}")
+            loaded_any = True
+
+    if not loaded_any:
+        print("[enrich] No .env file found in any candidate path; "
+              "relying on already-exported env vars")
 
     # Standalone CLI cannot resolve the Docker network alias `neo4j`. Fall back
     # to localhost when the env var is unset or still references the alias.
     uri = os.environ.get("NEO4J_URI", "")
     if not uri or "neo4j:7687" in uri:
         os.environ["NEO4J_URI"] = "bolt://localhost:7687"
+
+    # Surface a clear error early if the API key didn't make it through, rather
+    # than letting the LLM client raise an opaque 401 a few seconds later.
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        print(
+            "[enrich] WARNING: ANTHROPIC_API_KEY not set after .env load. "
+            "Stage 2 (relationships) and Stage 3 (context) will 401."
+        )
 
 
 _load_env_for_cli()

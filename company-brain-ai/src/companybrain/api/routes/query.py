@@ -97,7 +97,11 @@ async def query_graph(request: QueryRequest):
 
     # ── Step 1c: Hybrid retrieval fallback (ADR-0015) ─────────────────────────
     if not assembled_context:
-        assembled_context = await _hybrid_retrieve(request.question, request.workspace_id)
+        assembled_context = await _hybrid_retrieve(
+            request.question,
+            request.workspace_id,
+            getattr(request, "repo_path", None),
+        )
         if assembled_context:
             log.info("[query] Using hybrid retrieval context (SmartZone + Java unavailable)")
 
@@ -272,17 +276,27 @@ async def _assemble_context(
         return None, {}
 
 
-async def _hybrid_retrieve(question: str, workspace_id: str) -> str | None:
-    """Retrieve relevant entities via HybridSearcher as a fallback context source."""
+async def _hybrid_retrieve(
+    question: str, workspace_id: str, repo_path: str | None = None
+) -> str | None:
+    """Retrieve relevant entities via HybridSearcher as a fallback context source.
+
+    Resolves brain_root from (in order):
+      1. Caller-supplied repo_path (typically request.repo_path)
+      2. BRAIN_ROOT env var
+
+    Returns None if neither is set OR neither contains a usable .brain/ directory —
+    callers treat None as "no fallback context available."
+    """
     try:
         from pathlib import Path
         from companybrain.retrieval.hybrid_search import HybridSearcher
         from companybrain.store.identity import workspace_slug_for
 
-        brain_root_env = os.environ.get("BRAIN_ROOT", "")
-        if not brain_root_env:
+        effective_root = repo_path or os.environ.get("BRAIN_ROOT", "")
+        if not effective_root:
             return None
-        brain_root = Path(brain_root_env)
+        brain_root = Path(effective_root)
         workspace_slug = workspace_slug_for(workspace_id)
         searcher = HybridSearcher(brain_root=brain_root, workspace_slug=workspace_slug)
         hits = searcher.search(question, top_k=10)

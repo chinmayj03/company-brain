@@ -217,6 +217,7 @@ class QueryRequest(BaseModel):
     context_symbol: Optional[str] = None   # Symbol the cursor is on (from VS Code)
     file_path: Optional[str] = None        # Current file in editor
     workspace_id: str
+    repo_path: Optional[str] = None        # Repo root containing .brain/; falls back to BRAIN_ROOT env var
     max_hops: int = Field(default=3, ge=1, le=5)
 
 

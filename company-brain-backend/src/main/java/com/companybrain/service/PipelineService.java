@@ -520,29 +520,66 @@ public class PipelineService {
             }
 
             if (!insertRows.isEmpty()) {
-                // 1 parameterized DELETE using PostgreSQL ANY(?) — no string concatenation
-                jdbc.update(con -> {
-                    var ps = con.prepareStatement(
-                            "DELETE FROM artifact_links "
-                            + "WHERE workspace_id = ?::uuid "
-                            + "  AND link_role = 'derived_from' "
-                            + "  AND node_id = ANY(?::uuid[])");
-                    ps.setString(1, workspaceId.toString());
-                    ps.setArray(2, con.createArrayOf("uuid",
-                            affectedNodeIds.stream().map(UUID::fromString).toArray()));
-                    return ps;
-                });
+                // ── SAFETY NET ─────────────────────────────────────────────────
+                // Verify every node_id we're about to FK-reference actually exists in DB.
+                // Even with the URN re-sync above, if any code path leaves an orphan UUID
+                // in nodeIds we drop those rows with a loud log instead of crashing the
+                // whole transaction (which leaves the job stuck in "running" forever).
+                final Set<String> nodeIdsToCheck = Set.copyOf(affectedNodeIds);
+                Set<String> orphanNodeIds = new HashSet<>(nodeIdsToCheck);
+                jdbc.query(
+                        "SELECT id::text FROM nodes "
+                      + "WHERE workspace_id = ?::uuid AND id = ANY(?::uuid[])",
+                        ps -> {
+                            ps.setString(1, workspaceId.toString());
+                            ps.setArray(2, ps.getConnection()
+                                    .createArrayOf("uuid", nodeIdsToCheck.toArray()));
+                        },
+                        rs -> { orphanNodeIds.remove(rs.getString(1)); });
 
-                // 1 batch INSERT — artifact_links PK is (artifact_id, node_id, link_role),
-                // there is no synthetic id column (see V3__create_artifact_tables.sql)
-                jdbc.batchUpdate("""
-                        INSERT INTO artifact_links
-                            (artifact_id, workspace_id, node_id, link_role, confidence)
-                        VALUES (?::uuid, ?::uuid, ?::uuid, ?, ?::numeric)
-                        ON CONFLICT DO NOTHING
-                        """, insertRows);
+                if (!orphanNodeIds.isEmpty()) {
+                    log.error("[pipeline] ⚠ {} orphan node_id(s) in artifact_links cache  jobId={}  nodeIds={}",
+                            orphanNodeIds.size(), jobId, orphanNodeIds);
+                    // Reverse-lookup which entity externalIds these came from so we can fix the root cause
+                    nodeIds.entrySet().stream()
+                            .filter(e -> orphanNodeIds.contains(e.getValue().toString()))
+                            .forEach(e -> log.error("[pipeline]   orphan: nodeIds[{}] = {}", e.getKey(), e.getValue()));
+                    insertRows = insertRows.stream()
+                            .filter(r -> !orphanNodeIds.contains((String) r[2]))
+                            .collect(Collectors.toList());
+                    affectedNodeIds = affectedNodeIds.stream()
+                            .filter(id -> !orphanNodeIds.contains(id))
+                            .collect(Collectors.toCollection(LinkedHashSet::new));
+                }
 
-                log.info("[pipeline] Wrote {} artifact links  jobId={}", insertRows.size(), jobId);
+                if (insertRows.isEmpty()) {
+                    log.warn("[pipeline] All artifact_link rows filtered as orphans — skipping insert  jobId={}", jobId);
+                } else {
+                    // 1 parameterized DELETE using PostgreSQL ANY(?) — no string concatenation
+                    final Set<String> affected = affectedNodeIds;
+                    jdbc.update(con -> {
+                        var ps = con.prepareStatement(
+                                "DELETE FROM artifact_links "
+                                + "WHERE workspace_id = ?::uuid "
+                                + "  AND link_role = 'derived_from' "
+                                + "  AND node_id = ANY(?::uuid[])");
+                        ps.setString(1, workspaceId.toString());
+                        ps.setArray(2, con.createArrayOf("uuid",
+                                affected.stream().map(UUID::fromString).toArray()));
+                        return ps;
+                    });
+
+                    // 1 batch INSERT — artifact_links PK is (artifact_id, node_id, link_role),
+                    // there is no synthetic id column (see V3__create_artifact_tables.sql)
+                    jdbc.batchUpdate("""
+                            INSERT INTO artifact_links
+                                (artifact_id, workspace_id, node_id, link_role, confidence)
+                            VALUES (?::uuid, ?::uuid, ?::uuid, ?, ?::numeric)
+                            ON CONFLICT DO NOTHING
+                            """, insertRows);
+
+                    log.info("[pipeline] Wrote {} artifact links  jobId={}", insertRows.size(), jobId);
+                }
             }
         }
 

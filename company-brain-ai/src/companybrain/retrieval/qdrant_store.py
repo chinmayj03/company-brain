@@ -107,13 +107,17 @@ class QdrantBrainStore:
 
 def _build_indexable_text(e: Any) -> str:
     """Concatenate all human-relevant fields for retrieval."""
+    meta = getattr(e, "metadata", {}) or {}
     parts = [
         getattr(e, "qualified_name", ""),
         getattr(e, "t1_summary", ""),
         getattr(e, "t0_token", ""),
         getattr(e, "t1_token", ""),
-        (getattr(e, "metadata", {}) or {}).get("signature", ""),
-        (getattr(e, "metadata", {}) or {}).get("code_snippet", "") or "",
+        meta.get("signature", ""),
+        meta.get("code_snippet", "") or "",
+        # Tier 3.A: include SQL/JPQL so DatabaseQuery and InterfaceMethod entities
+        # are retrievable by SQL keywords (SELECT, WHERE, etc.) and table names.
+        meta.get("query_text", "") or "",
     ]
     return " \n".join(p for p in parts if p)
 

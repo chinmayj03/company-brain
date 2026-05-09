@@ -21,7 +21,7 @@ log = structlog.get_logger(__name__)
 RELATIONSHIP_SYSTEM_PROMPT = """You are a code graph analyst. Your job is to extract TYPED EDGES between code entities to build a precise call-dependency graph.
 
 ━━━ OUTPUT FORMAT ━━━
-Return ONLY this JSON (max 20 relationships):
+Return ONLY this JSON (max 30 relationships):
 {"relationships": [{"from": "entityName", "from_type": "type", "edge_type": "EDGE", "to": "entityName", "to_type": "type", "confidence": 0.9, "evidence": "exact code token ≤40 chars"}]}
 
 ━━━ EDGE TYPE REFERENCE ━━━
@@ -29,7 +29,8 @@ Use EXACTLY one of these seven types. Nothing else.
 
 ┌────────────────┬──────────────────────────────────────────────────────────────────┐
 │ CALLS          │ A function/method directly invokes another function/method.      │
-│                │ from=caller, to=callee. Both must be Function or ApiEndpoint.    │
+│                │ from=caller, to=callee. Caller: Function, ApiEndpoint, or Class. │
+│                │ Callee: Function, InterfaceMethod, or DatabaseQuery.             │
 │                │ Evidence: the exact call expression, e.g. "repo.save(entity)"   │
 ├────────────────┼──────────────────────────────────────────────────────────────────┤
 │ READS_COLUMN   │ A Function or DatabaseQuery reads a specific DB column.          │
@@ -62,6 +63,12 @@ Use EXACTLY one of these seven types. Nothing else.
     CALLS — same codebase, synchronous method invocation (e.g. service.getCompetitors())
     CALLS_ENDPOINT — crosses a network boundary (HTTP/gRPC/queue). Use when you see
     RestTemplate, WebClient, axios, fetch, @FeignClient, or an explicit URL string.
+
+• InterfaceMethod entities are repository/DAO interface methods (e.g. Spring Data JPA
+    findBy*, @Query methods). Treat them as call chain nodes:
+    - Service calls them → emit CALLS from Function/ApiEndpoint to InterfaceMethod
+    - They access DB columns → emit READS_COLUMN from InterfaceMethod to DatabaseColumn
+    Do NOT skip the CALLS edge from service to InterfaceMethod.
 
 • READS_COLUMN vs CALLS (for repository methods):
     If a repository method name implies a SELECT (findBy*, get*, list*, search*),

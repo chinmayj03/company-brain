@@ -40,6 +40,39 @@ exists, HOW it evolved, and WHAT risks it carries.
 This record will be stored permanently in a knowledge graph and used by engineers to
 understand code they've never seen before. Precision and honesty matter more than completeness.
 
+━━━ USE YOUR DOMAIN KNOWLEDGE ━━━
+You have extensive background knowledge about software systems and their business domains.
+USE IT. Do not treat industry-standard terms as unknowns — interpret them confidently.
+
+Healthcare / Managed-Care terms you will encounter:
+  • payer        — a health insurance company or health plan (e.g. UnitedHealth, Aetna, BCBS)
+  • LOB          — Line of Business: the insurance product segment, e.g. Commercial, Medicare
+                   Advantage (MA), Medicaid, Exchange/ACA
+  • provider     — a healthcare provider: physician, hospital, specialist, group practice
+  • provider type — a physician specialty category (e.g. PCP, cardiologist, oncologist)
+  • market       — a geographic or competitive region where payers compete for members
+  • market share — percentage of covered lives or revenue a payer holds in a market
+  • competitor   — another payer offering the same LOB in the same market
+  • member       — an individual enrolled in a health plan
+  • NIQ          — Network Intelligence Quotient or similar network analytics product
+  • mcheck       — typically "market check" — a tool for evaluating market positioning
+  • competitiveness — how a plan's benefits/network/premium compare to market peers
+  • summary      — aggregated analytics view (e.g. competitor summary = rolled-up payer stats)
+  • NPI          — National Provider Identifier, the unique US physician/facility ID
+  • INN / OON    — In-Network / Out-of-Network (contract status of a provider)
+  • prior auth    — prior authorization, a cost-control gate before a service is rendered
+  • claim         — a billing record submitted by a provider to a payer for reimbursement
+
+General enterprise software terms:
+  • workspace    — a tenant/org isolation boundary
+  • job          — an async pipeline run (ingestion, analysis, etc.)
+  • upsert       — insert-or-update, idempotent write
+  • BM25         — lexical keyword search algorithm used in retrieval
+  • embedding    — dense vector representation of text for semantic search
+
+When you see these terms in entity names, signatures, or SQL, interpret them using this
+knowledge and write a CONCRETE, SPECIFIC purpose — not a generic placeholder.
+
 ━━━ OUTPUT FORMAT ━━━
 Return ONLY valid JSON — start with { end with }. No markdown, no preamble, nothing else.
 
@@ -110,11 +143,13 @@ source_confidence — Set automatically by caller, but you can override:
   medium — Rich PR description or ticket summary (>100 chars) references this entity.
   low    — Inferred from code and short commit messages only.
 
-gaps — Surface honest unknowns as questions for human annotation:
+gaps — Surface GENUINE unknowns only — questions that a human must answer:
   • What business rules exist that the code doesn't capture?
-  • What do domain terms (LOB, payer, market) mean in this context?
   • What is the SLA or performance expectation for this query?
   • What happens on failure — is there a fallback?
+  • Which downstream consumers depend on the return contract?
+  • DO NOT list domain terms (LOB, payer, market, provider type, etc.) as gaps —
+    you know what these mean; use that knowledge to write the purpose instead.
   • If you have high confidence in everything, return [].
 
 ━━━ FEW-SHOT EXAMPLES ━━━
@@ -154,6 +189,25 @@ Expected output:
   "external_dependencies": [],
   "source_confidence": "low",
   "gaps": ["Which downstream consumers call this endpoint — internal services only or external partners?", "Is idempotency required (duplicate charge prevention)?"]
+}
+
+EXAMPLE 3 — Repository interface method with @Query SQL:
+Entity: InterfaceMethod findCompetitorsByPayerAndLob | File: CompetitorsRepository.java
+Signature: List<CompetitorDto> findCompetitorsByPayerAndLob(String payerId, String lob)
+Query: SELECT c.payer_name, c.market_share FROM competitors c WHERE c.payer_id = :payerId AND c.lob = :lob
+No commit history.
+
+Expected output:
+{
+  "purpose": "Fetches all competing health insurance plans for a given payer and line of business (e.g. Commercial, Medicare Advantage), returning their market share data for use in competitive positioning analysis.",
+  "history_summary": "No commit history available; method appears stable. Inferred from @Query annotation and signature.",
+  "invariants": ["payerId must be non-null and match a valid payer in the competitors table", "lob must match a recognized line-of-business value; unrecognised values will return empty results"],
+  "change_risk": "MEDIUM",
+  "change_risk_reason": "MEDIUM — returns data consumed by the competitor analysis UI; changing column aliases or filter semantics requires coordinated frontend update.",
+  "owner_team": null,
+  "external_dependencies": [],
+  "source_confidence": "low",
+  "gaps": ["What is the valid enumeration of lob values — is it enforced by a DB constraint or application enum?"]
 }
 
 CRITICAL: Output ONLY the raw JSON object. Start with { end with }. Nothing else.
@@ -275,8 +329,9 @@ class ContextSynthesizer:
         if entity.code_snippet:
             parts.append(f"\n## Method Body\n```java\n{entity.code_snippet[:500]}\n```")
 
-        # For database queries include the SQL/JPQL directly
-        if entity.entity_type == "DatabaseQuery" and entity.query_text:
+        # For database queries and interface methods include the SQL/JPQL directly.
+        # InterfaceMethod may have @Query body in query_text (e.g. Spring Data JPA).
+        if entity.query_text and entity.entity_type in ("DatabaseQuery", "InterfaceMethod"):
             parts.append(f"\n## Query\n```sql\n{entity.query_text}\n```")
 
         if context.get("human_annotations"):
@@ -294,7 +349,14 @@ class ContextSynthesizer:
                     line += f" | PR: {commit['pr_title'][:80]}"
                 parts.append(line)
         elif not entity.code_snippet:
-            parts.append("\n## Note\nNo commit history or code body available — infer from name/signature only.")
+            parts.append(
+                "\n## Instruction\n"
+                "No commit history or code body is available for this entity. "
+                "Infer its purpose from the entity name, file path, and signature — "
+                "apply your healthcare/managed-care and software domain knowledge "
+                "to write a SPECIFIC, concrete purpose sentence. "
+                "Do not write generic placeholders like 'processes data' or 'handles requests'."
+            )
 
         return "\n".join(parts)
 

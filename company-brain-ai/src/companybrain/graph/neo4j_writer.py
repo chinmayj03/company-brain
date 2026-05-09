@@ -64,14 +64,16 @@ _ENTITY_LABEL_MAP: dict[str, str] = {
     "Interface":   "Interface",
     "Enum":        "Enum",
     # Extended types from the pipeline
-    "apiendpoint": "Function",
-    "ApiEndpoint": "Function",
-    "schemafield": "Module",
-    "SchemaField": "Module",
+    "apiendpoint":    "Function",
+    "ApiEndpoint":    "Function",
+    "schemafield":    "Module",
+    "SchemaField":    "Module",
     "databasecolumn": "Module",
     "DatabaseColumn": "Module",
-    "databasequery": "Function",
-    "DatabaseQuery": "Function",
+    "databasequery":  "Function",
+    "DatabaseQuery":  "Function",
+    "interfacemethod": "Function",
+    "InterfaceMethod": "Function",
 }
 
 # Python edge_type → CB relationship type (matches TypeScript edge types)
@@ -711,8 +713,8 @@ def _build_node_summary(entity: "ExtractedEntity") -> str:  # noqa: F821
     if purpose:
         return f"{etype} {name} ({file}) — {purpose}"
     if sig:
-        # For DatabaseQuery, the signature often IS the SQL — include it verbatim
-        if etype in ("DatabaseQuery",):
+        # For DatabaseQuery/InterfaceMethod, the signature may include SQL — include verbatim
+        if etype in ("DatabaseQuery", "InterfaceMethod"):
             return f"{etype} {name}: {sig[:200]}"
         return f"{etype} {name} in {file} — signature: {sig[:150]}"
     # Minimal fallback

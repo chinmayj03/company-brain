@@ -76,27 +76,105 @@ _ENTITY_LABEL_MAP: dict[str, str] = {
     "InterfaceMethod": "Function",
 }
 
-# Python edge_type → CB relationship type (matches TypeScript edge types)
-_EDGE_TYPE_MAP: dict[str, str] = {
-    "calls":        "calls",
-    "CALLS":        "calls",
-    "imports":      "imports",
-    "IMPORTS":      "imports",
-    "extends":      "extends",
-    "EXTENDS":      "extends",
-    "implements":   "implements",
-    "IMPLEMENTS":   "implements",
-    "reads":        "reads",
-    "READS":        "reads",
-    "reads_column": "reads",
-    "READS_COLUMN": "reads",
-    "writes":       "writes",
-    "WRITES":       "writes",
-    "renders_field": "reads",
-    "RENDERS_FIELD": "reads",
-    "calls_endpoint": "calls",
-    "CALLS_ENDPOINT": "calls",
+# Python edge_type → CB relationship type. Lowercased and normalised so
+# Cypher edge labels are consistent and so the LLM's case sensitivity doesn't
+# multiply edge labels for the same relationship (CALLS vs calls).
+#
+# Some types collapse to a canonical name to keep the graph readable:
+#   - column-level reads/writes collapse to reads/writes
+#   - RENDERS_FIELD collapses to reads (frontend reads a field)
+#   - INVOKES collapses to calls
+#   - DEPENDS_ON collapses to uses
+# Most types stay distinct so dependency / impact queries remain precise.
+def _norm(name: str) -> str:
+    """Normalise an edge type to lower-snake-case."""
+    return name.strip().lower().replace("-", "_")
+
+
+_CANONICAL_EDGE_TYPES: dict[str, str] = {
+    # structure / inheritance
+    "extends":          "extends",
+    "implements":       "implements",
+    "overrides":        "overrides",
+    "contains":         "contains",
+    "annotates":        "annotates",
+    "imports":          "imports",
+    # behavior / call flow
+    "calls":            "calls",
+    "invokes":          "calls",        # synonym
+    "awaits":           "awaits",
+    "calls_endpoint":   "calls_endpoint",
+    "delegates_to":     "delegates_to",
+    "instantiates":     "instantiates",
+    "uses":             "uses",
+    "depends_on":       "uses",         # synonym
+    # data flow
+    "reads_column":     "reads_column",
+    "writes_column":    "writes_column",
+    "reads_field":      "reads_field",
+    "writes_field":     "writes_field",
+    "reads":            "reads_column", # legacy alias
+    "writes":           "writes_column",# legacy alias
+    "renders_field":    "renders_field",
+    "returns":          "returns",
+    "accepts_param":    "accepts_param",
+    "transforms":       "transforms",
+    "serializes_to":    "serializes_to",
+    # persistence
+    "persists_to":      "persists_to",
+    "cached_by":        "cached_by",
+    "indexed_by":       "indexed_by",
+    "constrained_by":   "constrained_by",
+    # validation
+    "validates":        "validates",
+    "enforces":         "enforces",
+    "sanitizes":        "sanitizes",
+    # error flow
+    "throws":           "throws",
+    "catches":          "catches",
+    "wraps_exception":  "wraps_exception",
+    "handles_error":    "handles_error",
+    # ui
+    "renders":          "renders",
+    "binds_to":         "binds_to",
+    "routed_by":        "routed_by",
+    "listens_to":       "listens_to",
+    # authz / security
+    "authorized_by":    "authorized_by",
+    "protected_by":     "protected_by",
+    "audited_by":       "audited_by",
+    # async / eventing
+    "publishes_to":     "publishes_to",
+    "subscribes_to":    "subscribes_to",
+    "scheduled_by":     "scheduled_by",
+    # observability
+    "logs_to":          "logs_to",
+    "emits_metric":     "emits_metric",
+    "traced_by":        "traced_by",
+    # testing
+    "tested_by":        "tested_by",
+    "mocks":            "mocks",
+    "fixture_for":      "fixture_for",
+    # config / lifecycle
+    "configured_by":    "configured_by",
+    "initialized_by":   "initialized_by",
+    "rate_limited_by":  "rate_limited_by",
 }
+
+
+class _EdgeTypeMap:
+    """Case-insensitive lookup that delegates to _CANONICAL_EDGE_TYPES."""
+    def get(self, key: str, default: str = "") -> str:
+        return _CANONICAL_EDGE_TYPES.get(_norm(key), default)
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and _norm(key) in _CANONICAL_EDGE_TYPES
+
+    def __getitem__(self, key: str) -> str:
+        return _CANONICAL_EDGE_TYPES[_norm(key)]
+
+
+_EDGE_TYPE_MAP = _EdgeTypeMap()
 
 # Confidence label → numeric score (mirrors builder.py)
 _CONFIDENCE_SCORE: dict[str, float] = {
@@ -758,13 +836,60 @@ _EDGE_VERB: dict[str, str] = {
     "implements":   "implements",
     "reads":        "reads",
     "writes":       "writes",
-    "CALLS":        "calls",
-    "READS_COLUMN": "reads column",
-    "WRITES_COLUMN":"writes column",
-    "RENDERS_FIELD":"renders field",
-    "CALLS_ENDPOINT":"calls endpoint",
-    "VALIDATES":    "validates",
-    "TESTED_BY":    "is tested by",
+    "CALLS":           "calls",
+    "READS_COLUMN":    "reads column",
+    "WRITES_COLUMN":   "writes column",
+    "RENDERS_FIELD":   "renders field",
+    "CALLS_ENDPOINT":  "calls endpoint",
+    "VALIDATES":       "validates",
+    "TESTED_BY":       "is tested by",
+    "USES":            "uses",
+    "DEPENDS_ON":      "depends on",
+    "THROWS":          "throws",
+    "INVOKES":         "invokes",
+    "EXTENDS":         "extends",
+    "IMPLEMENTS":      "implements",
+    # Expanded taxonomy — keep human-readable verbs aligned with the prompt.
+    "OVERRIDES":       "overrides",
+    "CONTAINS":        "contains",
+    "ANNOTATES":       "is annotated by",
+    "IMPORTS":         "imports",
+    "AWAITS":          "awaits",
+    "DELEGATES_TO":    "delegates to",
+    "INSTANTIATES":    "instantiates",
+    "READS_FIELD":     "reads field",
+    "WRITES_FIELD":    "writes field",
+    "RETURNS":         "returns",
+    "ACCEPTS_PARAM":   "accepts parameter",
+    "TRANSFORMS":      "transforms to",
+    "SERIALIZES_TO":   "serializes to",
+    "PERSISTS_TO":     "persists to",
+    "CACHED_BY":       "is cached by",
+    "INDEXED_BY":      "is indexed by",
+    "CONSTRAINED_BY":  "is constrained by",
+    "ENFORCES":        "enforces",
+    "SANITIZES":       "sanitizes",
+    "CATCHES":         "catches",
+    "WRAPS_EXCEPTION": "wraps exception",
+    "HANDLES_ERROR":   "handles error",
+    "RENDERS":         "renders",
+    "BINDS_TO":        "binds to",
+    "ROUTED_BY":       "is routed by",
+    "LISTENS_TO":      "listens to",
+    "AUTHORIZED_BY":   "is authorized by",
+    "PROTECTED_BY":    "is protected by",
+    "AUDITED_BY":      "is audited by",
+    "PUBLISHES_TO":    "publishes to",
+    "SUBSCRIBES_TO":   "subscribes to",
+    "SCHEDULED_BY":    "is scheduled by",
+    "LOGS_TO":         "logs to",
+    "EMITS_METRIC":    "emits metric",
+    "TRACED_BY":       "is traced by",
+    "MOCKS":           "mocks",
+    "FIXTURE_FOR":     "is a fixture for",
+    "CONFIGURED_BY":   "is configured by",
+    "INITIALIZED_BY":  "is initialized by",
+    "RATE_LIMITED_BY": "is rate-limited by",
 }
 
 

@@ -21,42 +21,90 @@ log = structlog.get_logger(__name__)
 RELATIONSHIP_SYSTEM_PROMPT = """You are a code graph analyst. Your job is to extract TYPED EDGES between code entities to build a precise call-dependency graph.
 
 ━━━ OUTPUT FORMAT ━━━
-Return ONLY this JSON (max 30 relationships):
+Return ONLY this JSON (up to 80 relationships — emit ALL high-confidence edges
+you can find; do NOT artificially limit to a small number):
 {"relationships": [{"from": "entityName", "from_type": "type", "edge_type": "EDGE", "to": "entityName", "to_type": "type", "confidence": 0.9, "evidence": "exact code token ≤40 chars"}]}
 
 ━━━ EDGE TYPE REFERENCE ━━━
-Use EXACTLY one of these seven types. Nothing else.
+Use EXACTLY one of the types below. Group headers are reading aids only —
+emit only the all-caps type name. If a candidate edge does not fit any of
+these, SKIP IT. Do NOT invent new types.
 
-┌────────────────┬──────────────────────────────────────────────────────────────────┐
-│ CALLS          │ A function/method directly invokes another function/method.      │
-│                │ from=caller, to=callee. Caller: Function, ApiEndpoint, or Class. │
-│                │ Callee: Function, InterfaceMethod, or DatabaseQuery.             │
-│                │ Evidence: the exact call expression, e.g. "repo.save(entity)"   │
-├────────────────┼──────────────────────────────────────────────────────────────────┤
-│ READS_COLUMN   │ A Function or DatabaseQuery reads a specific DB column.          │
-│                │ to must be a DatabaseColumn (format: table.column).             │
-│                │ Evidence: SQL fragment or ORM accessor, e.g. "SELECT amount"    │
-├────────────────┼──────────────────────────────────────────────────────────────────┤
-│ WRITES_COLUMN  │ A Function or DatabaseQuery inserts/updates a DB column.        │
-│                │ to must be a DatabaseColumn. Use for INSERT/UPDATE/MERGE ops.   │
-│                │ Evidence: SQL fragment or ORM setter, e.g. "SET status = ?"     │
-├────────────────┼──────────────────────────────────────────────────────────────────┤
-│ RENDERS_FIELD  │ A FrontendComponent displays or binds a SchemaField.             │
-│                │ from=FrontendComponent, to=SchemaField. TypeScript/JSX only.    │
-│                │ Evidence: JSX expression, e.g. "item.providerTypes.map(...)"    │
-├────────────────┼──────────────────────────────────────────────────────────────────┤
-│ CALLS_ENDPOINT │ A Function or FrontendComponent calls an external HTTP endpoint. │
-│                │ to must be an ApiEndpoint or ExternalService.                   │
-│                │ Evidence: HTTP call, e.g. "axios.get('/api/v1/competitors')"    │
-├────────────────┼──────────────────────────────────────────────────────────────────┤
-│ VALIDATES      │ A Function enforces a business rule or constraint on a field.    │
-│                │ to must be a SchemaField or DatabaseColumn.                     │
-│                │ Evidence: validation expression, e.g. "if (lob == null) throw"  │
-├────────────────┼──────────────────────────────────────────────────────────────────┤
-│ TESTED_BY      │ A production Function/ApiEndpoint is exercised by a test.        │
-│                │ from=production entity, to=test function. NEVER reverse.        │
-│                │ Evidence: test class/method name, e.g. "CompetitorServiceTest"  │
-└────────────────┴──────────────────────────────────────────────────────────────────┘
+# STRUCTURE / INHERITANCE
+- EXTENDS         child Class → parent Class                           ("extends Base")
+- IMPLEMENTS      Class → Interface                                     ("implements Foo")
+- OVERRIDES       method → parent method it overrides                   (@Override)
+- CONTAINS        Class → its method, Package → its class               (member-of)
+- ANNOTATES       Annotation/Decorator → annotated entity               (@Transactional, @Component)
+- IMPORTS         Module → imported module (only first-party, not std-lib)
+
+# BEHAVIOR / CALL FLOW
+- CALLS           caller → callee, synchronous in-process invocation
+- INVOKES         alias for CALLS where source is an event/handler dispatch
+- AWAITS          async caller → awaited callee (await, .then, CompletableFuture)
+- CALLS_ENDPOINT  client → ApiEndpoint/ExternalService (HTTP/gRPC/queue)
+- DELEGATES_TO    wrapper/proxy → inner implementation it forwards to
+- INSTANTIATES    factory/caller → Class it creates via `new X()` / builder
+- USES            holder → collaborator (field, @Autowired, ctor param, type arg)
+
+# DATA FLOW
+- READS_COLUMN    Function/Query → DatabaseColumn (SELECT, ORM getter)
+- WRITES_COLUMN   Function/Query → DatabaseColumn (INSERT/UPDATE/MERGE)
+- READS_FIELD     Function → object field (non-DB)
+- WRITES_FIELD    Function → object field it mutates
+- RETURNS         Function → named return type / DTO
+- ACCEPTS_PARAM   Function → named parameter type
+- TRANSFORMS      mapper Function → produced type (source → target)
+- SERIALIZES_TO   Class/DTO → schema/format it serializes to (JSON, Avro, ProtoBuf)
+
+# PERSISTENCE / STORAGE
+- PERSISTS_TO     Entity → table/collection it's stored in
+- CACHED_BY       Entity → caching layer (Redis, in-mem, @Cacheable)
+- INDEXED_BY      DatabaseColumn → index/constraint that covers it
+- CONSTRAINED_BY  SchemaField/DatabaseColumn → constraint (NOT NULL, FK, CHECK)
+
+# VALIDATION
+- VALIDATES       Function → SchemaField/DatabaseColumn it validates
+- ENFORCES        Function → business rule it enforces
+- SANITIZES       Function → input it sanitizes/escapes
+
+# ERROR / EXCEPTION FLOW
+- THROWS          Function → Exception type it throws
+- CATCHES         Function → Exception type it catches
+- WRAPS_EXCEPTION Function → Exception it rethrows as a different type
+- HANDLES_ERROR   ErrorHandler/Endpoint → Exception type it maps to response
+
+# UI / FRONTEND
+- RENDERS         Component → child Component
+- RENDERS_FIELD   Component → SchemaField it displays
+- BINDS_TO        Component → state/store/form it reads/writes
+- ROUTED_BY       Component → Route that mounts it
+- LISTENS_TO      Component → event/message it subscribes to
+
+# AUTHZ / SECURITY
+- AUTHORIZED_BY   Endpoint → permission/role required
+- PROTECTED_BY    Endpoint → guard/middleware/filter chain
+- AUDITED_BY      Function → audit-log emitter / category
+
+# ASYNC / EVENTING
+- PUBLISHES_TO    Function → topic/queue/exchange it publishes to
+- SUBSCRIBES_TO   Handler → topic/queue/exchange it consumes
+- SCHEDULED_BY    Function → schedule/cron/trigger that fires it
+
+# OBSERVABILITY
+- LOGS_TO         Function → logger / log category
+- EMITS_METRIC    Function → metric/counter/gauge name
+- TRACED_BY       Function → tracer/span/feature it's instrumented under
+
+# TESTING
+- TESTED_BY       production entity → test that exercises it (NEVER reverse)
+- MOCKS           test → dependency it mocks/stubs
+- FIXTURE_FOR     fixture/builder → entity it produces
+
+# CONFIG / LIFECYCLE
+- CONFIGURED_BY   Entity → config/property/env-var it reads
+- INITIALIZED_BY  Bean/Service → lifecycle hook that initializes it
+- RATE_LIMITED_BY Endpoint → policy/limiter that throttles it
 
 ━━━ DISAMBIGUATION RULES ━━━
 • CALLS vs CALLS_ENDPOINT:
@@ -84,12 +132,20 @@ Use EXACTLY one of these seven types. Nothing else.
     0.85 — test class name follows *ServiceTest → *Service or *ControllerTest → *Controller
     0.70 — test is in same package as production code and accesses same entity
 
+• EMIT structural edges using the new types:
+    - Class inheritance        → EXTENDS    (child Class → parent Class)
+    - Interface implementation → IMPLEMENTS (Class → Interface)
+    - Constructor / @Autowired / @Inject collaborators → USES (using entity → used entity)
+    - Field declarations of domain types (private FooService foo;) → USES
+    - Thrown exceptions       → THROWS     (Function → Exception class)
+  These give the graph richer context — change-impact analysis, dependency
+  inversion checks, and exception-flow tracing all need them.
+
 • DO NOT EMIT edges for:
-    - Class inheritance (extends / implements)
     - Module imports (import statements)
-    - Field declarations (private Foo bar;)
-    - Constructor injection (@Autowired / @Inject) — these are structural, not behavioral
     - Lombok-generated methods (equals, hashCode, toString, builder)
+    - Primitive / JDK / language-builtin field types (String, int, List, Optional)
+      — only emit USES when the target is a NAMED entity in the provided list.
 
 ━━━ CONFIDENCE SCALE ━━━
 1.0 — Explicit: exact token found in code snippet ("repo.findByLob(lob)" is right there)
@@ -148,6 +204,28 @@ Expected:
 {"relationships": [
   {"from": "getPayerCompetitors", "from_type": "Function", "edge_type": "TESTED_BY", "to": "getCompetitors_returnsFilteredList", "to_type": "Function", "confidence": 1.0, "evidence": "service.getPayerCompetitors(lob,types)"},
   {"from": "getPayerCompetitors", "from_type": "Function", "edge_type": "TESTED_BY", "to": "CompetitorServiceTest",              "to_type": "Function", "confidence": 0.85, "evidence": "CompetitorServiceTest class"}
+]}
+
+EXAMPLE 5 — Structural edges (collaborators / inheritance / exceptions):
+Entities: CompetitorController (Class), CompetitorService (Class), BaseController (Class),
+          AuditLogger (Class), CompetitorRepository (Class), InvalidLobException (Class),
+          getCompetitors (ApiEndpoint)
+Snippet:
+  public class CompetitorController extends BaseController {
+      private final CompetitorService competitorService;
+      private final AuditLogger logger;
+      public CompetitorController(CompetitorService s, AuditLogger l) { ... }
+      public ResponseEntity<List<CompetitorDto>> getCompetitors(...) {
+          if (lob == null) throw new InvalidLobException("lob required");
+          ...
+      }
+  }
+Expected:
+{"relationships": [
+  {"from": "CompetitorController", "from_type": "Class",       "edge_type": "EXTENDS", "to": "BaseController",        "to_type": "Class", "confidence": 1.0, "evidence": "extends BaseController"},
+  {"from": "CompetitorController", "from_type": "Class",       "edge_type": "USES",    "to": "CompetitorService",     "to_type": "Class", "confidence": 1.0, "evidence": "private final CompetitorService"},
+  {"from": "CompetitorController", "from_type": "Class",       "edge_type": "USES",    "to": "AuditLogger",           "to_type": "Class", "confidence": 1.0, "evidence": "private final AuditLogger"},
+  {"from": "getCompetitors",       "from_type": "ApiEndpoint", "edge_type": "THROWS",  "to": "InvalidLobException",   "to_type": "Class", "confidence": 1.0, "evidence": "throw new InvalidLobException"}
 ]}
 
 CRITICAL: Output ONLY the raw JSON. Start with { end with }. Nothing before, nothing after.
@@ -314,9 +392,12 @@ class RelationshipExtractor:
         # find call sites it cannot see. Now we expose up to 30 entities and
         # let each get up to 1500 chars (matches ADR-0040 Tier 1.B snippet size),
         # subject to the overall 60k-char budget.
+        # Include Class entities as well so the LLM can find EXTENDS / IMPLEMENTS
+        # / USES (constructor injection, @Autowired) edges. Without Class bodies,
+        # the new structural-edge types in the prompt have nothing to anchor on.
         snippets = [
             e for e in entities
-            if e.entity_type in ("Function", "ApiEndpoint") and e.code_snippet
+            if e.entity_type in ("Function", "ApiEndpoint", "Class") and e.code_snippet
         ]
         if snippets:
             _add("\n## Method Body Snippets (find CALLS relationships from these)")

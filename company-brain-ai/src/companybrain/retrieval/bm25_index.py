@@ -89,7 +89,10 @@ class Bm25Index:
         if not tokens:
             return []
         k = min(top_k, len(self._doc_ids))
-        scores, idx = self._bm25.retrieve([tokens], k=k)
+        # bm25s.BM25.retrieve returns a named tuple (documents, scores) — documents
+        # first. Unpacking the other way silently produced garbage results
+        # (scores treated as int indices via `int(3.29)=3`, real scores never used).
+        idx, scores = self._bm25.retrieve([tokens], k=k)
         return [
             (self._doc_ids[int(idx[0][i])], float(scores[0][i]))
             for i in range(len(idx[0]))

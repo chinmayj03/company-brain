@@ -309,13 +309,14 @@ ask:
 	@echo "$(CYAN)→ Asking via Python /query (uses Sonnet 4.6)$(NC)"
 	@echo "  Q: $(Q)"
 	@echo ""
-	@curl -sS -X POST http://localhost:$(AI_PORT)/query \
+	@SYMBOL_JSON=$$([ -n "$(SYMBOL)" ] && echo ', "context_symbol": "$(SYMBOL)"' || echo ""); \
+	curl -sS -X POST http://localhost:$(AI_PORT)/query \
 	    -H 'Content-Type: application/json' \
-	    -d '{ \
-	      "question":     "$(Q)", \
-	      "workspace_id": "$(WORKSPACE_ID)", \
-	      "repo_path":    "$(TARGET_REPO)" \
-	    }' | jq
+	    -d "{ \
+	      \"question\":     \"$(Q)\", \
+	      \"workspace_id\": \"$(WORKSPACE_ID)\", \
+	      \"repo_path\":    \"$(TARGET_REPO)\"$$SYMBOL_JSON \
+	    }" | jq
 
 # ── Cumulative cost ───────────────────────────────────────────────────────────
 .PHONY: cost

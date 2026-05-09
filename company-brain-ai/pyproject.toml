@@ -80,7 +80,11 @@ dependencies = [
     # (jinaai/jina-embeddings-v2-base-code, 768 dims) — no API key required.
     # voyageai is OPTIONAL: only needed when VOYAGE_API_KEY is set (paid, best quality).
     # embedder.py auto-selects: voyage → fastembed → ollama → BM25-only.
-    "qdrant-client[fastembed]>=1.9.0",  # vector store + FREE local embeddings via fastembed
+    # Pinned to ==1.9.x because docker-compose.infra.yml uses qdrant/qdrant:v1.9.2.
+    # The client's /points/query API (introduced in v1.10) returns 404 against v1.9
+    # servers, silently breaking dense retrieval. Bump server image AND this pin
+    # together; do not let pip pull a newer client by accident.
+    "qdrant-client[fastembed]>=1.9.0,<1.10",  # vector store + FREE local embeddings via fastembed
     "bm25s>=0.2",                        # ADR-0015: fast BM25S for entity-based retrieval
     "rank-bm25>=0.2.2",                  # legacy BM25 for file-based retrieval (code_tracer)
     "sentence-transformers>=3.0.0",      # bge-reranker-v2-m3 cross-encoder reranking (free, local)

@@ -352,6 +352,28 @@ public class PipelineService {
                         });
             }
 
+            // After BOTH re-syncs above, nodeIds[extId/urn/typeKey] point at the
+            // CANONICAL DB UUIDs. But during Phase 1's upsert loop we also
+            // registered bare-qname and legacy-form aliases (commit e4ab97115)
+            // that may still point at PHANTOM UUIDs computeIfAbsent generated
+            // (when ON CONFLICT picked the existing row's id). Phase 2 then
+            // looks up the alias, finds the phantom, and the edge INSERT fails
+            // with edges_source_id_fkey. Walk the original DTOs and refresh
+            // every alias from the canonical extId entry.
+            for (var dto : result.getEntities()) {
+                String extId   = dto.getRepo() + "/" + dto.getFile() + "::" + dto.getName();
+                UUID canonical = nodeIds.get(extId);
+                if (canonical == null) continue;
+                if (dto.getName() != null && !dto.getName().isBlank()) {
+                    nodeIds.put(dto.getName(), canonical);
+                    nodeIds.put(dto.getRepo() + "::" + dto.getEntityType() + "::"
+                                + dto.getName(), canonical);
+                }
+                if (dto.getUrn() != null && !dto.getUrn().isBlank()) {
+                    nodeIds.put(dto.getUrn(), canonical);
+                }
+            }
+
             entityCount = rows.size();
             log.info("[pipeline] Upserted {} entities  jobId={}", entityCount, jobId);
         }

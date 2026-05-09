@@ -254,19 +254,68 @@ public class PipelineService {
                         """, rowsWithoutUrn);
             }
 
-            // Re-sync nodeIds after upsert.
-            // When ON CONFLICT (workspace_id, urn) fires, Postgres keeps the EXISTING row UUID —
-            // not the UUID we generated above. Any node whose external_id changed between runs
-            // (URN match, extId mismatch) will have a phantom UUID in nodeIds that doesn't exist
-            // in the DB, causing FK violations in phases 2–5 (edges, contexts, artifact_links).
-            // A fresh SELECT by the now-current external_ids overwrites every entry with the
-            // actual DB UUID before any downstream phase runs.
-            nodeRepository.findByWorkspaceIdAndExternalIdIn(workspaceId, extIds)
-                    .forEach(n -> {
-                        String typeKey = n.getNodeType() + ":" + n.getExternalId();
-                        nodeIds.put(typeKey, n.getId());
-                        nodeIds.put(n.getExternalId(), n.getId()); // plain key for edges
-                    });
+            // Re-sync nodeIds after upsert — uses raw JDBC (NOT JpaRepository) for two reasons:
+            //   1. ON CONFLICT (workspace_id, urn) within a single batch silently drops the
+            //      second row's generated UUID and keeps the first row's. Any subsequent
+            //      reference to the second entity would point at a phantom UUID and trigger
+            //      a foreign-key violation in Phases 2–5 (edges/contexts/artifact_links).
+            //   2. SET LOCAL app.workspace_id was issued via this same JdbcTemplate, so
+            //      using it here guarantees the SELECT sees the workspace context. Going
+            //      through JPA's EntityManager session is unreliable — depending on
+            //      DataSource proxy / Hibernate Session connection acquisition, the
+            //      SET LOCAL may or may not be visible there.
+            //
+            // Re-sync by URN AND by external_id so both conflict paths are covered:
+            //   - rowsWithUrn:    URN-conflict can leave the second row with the FIRST row's
+            //                     id but the SECOND row's external_id (we UPDATE external_id
+            //                     in the conflict clause). Lookup by URN is canonical.
+            //   - rowsWithoutUrn: legacy (workspace_id, node_type, external_id) path —
+            //                     extId is canonical there.
+            List<String> urnsForResync = rowsWithUrn.stream()
+                    .map(r -> (String) r[7])
+                    .filter(Objects::nonNull)
+                    .distinct()
+                    .toList();
+            if (!urnsForResync.isEmpty()) {
+                jdbc.query(
+                        "SELECT id, node_type, external_id, urn FROM nodes "
+                      + "WHERE workspace_id = ?::uuid AND urn = ANY(?::text[])",
+                        ps -> {
+                            ps.setString(1, workspaceId.toString());
+                            ps.setArray(2, ps.getConnection()
+                                    .createArrayOf("text", urnsForResync.toArray()));
+                        },
+                        rs -> {
+                            UUID dbId  = UUID.fromString(rs.getString("id"));
+                            String nt  = rs.getString("node_type");
+                            String eid = rs.getString("external_id");
+                            nodeIds.put(eid, dbId);
+                            nodeIds.put(nt + ":" + eid, dbId);
+                        });
+            }
+
+            List<String> extIdsForResync = rowsWithoutUrn.stream()
+                    .map(r -> (String) r[4])
+                    .filter(Objects::nonNull)
+                    .distinct()
+                    .toList();
+            if (!extIdsForResync.isEmpty()) {
+                jdbc.query(
+                        "SELECT id, node_type, external_id FROM nodes "
+                      + "WHERE workspace_id = ?::uuid AND external_id = ANY(?::text[])",
+                        ps -> {
+                            ps.setString(1, workspaceId.toString());
+                            ps.setArray(2, ps.getConnection()
+                                    .createArrayOf("text", extIdsForResync.toArray()));
+                        },
+                        rs -> {
+                            UUID dbId  = UUID.fromString(rs.getString("id"));
+                            String nt  = rs.getString("node_type");
+                            String eid = rs.getString("external_id");
+                            nodeIds.put(eid, dbId);
+                            nodeIds.put(nt + ":" + eid, dbId);
+                        });
+            }
 
             entityCount = rows.size();
             log.info("[pipeline] Upserted {} entities  jobId={}", entityCount, jobId);

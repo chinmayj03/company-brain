@@ -201,6 +201,16 @@ public class PipelineService {
                 if (dto.getUrn() != null && !dto.getUrn().isBlank()) {
                     nodeIds.putIfAbsent(dto.getUrn(), id);
                 }
+                // Belt-and-suspenders aliases — different extractors emit edge
+                // endpoints in different identifier shapes. Index them all so
+                // Phase 2's resolveId() succeeds regardless of which the extractor
+                // used. putIfAbsent → first wins; ambiguous names lose precision
+                // but we'd rather have an edge than no edge for the demo.
+                if (dto.getName() != null && !dto.getName().isBlank()) {
+                    nodeIds.putIfAbsent(dto.getName(), id);                                  // bare qname
+                    nodeIds.putIfAbsent(dto.getRepo() + "::" + dto.getEntityType() + "::"
+                                        + dto.getName(), id);                                // legacy ADR-0013 form
+                }
 
                 Map<String, Object> meta = new LinkedHashMap<>();
                 meta.put("file",                  dto.getFile());
@@ -353,12 +363,19 @@ public class PipelineService {
         if (result.getRelationships() != null && !result.getRelationships().isEmpty()) {
             List<Object[]> rows = new ArrayList<>();
 
+            int skipped = 0;
+            String sampleKeys = nodeIds.keySet().stream()
+                    .limit(3).collect(Collectors.joining(" | "));
             for (var dto : result.getRelationships()) {
                 UUID sourceId = resolveId(nodeIds, workspaceId, dto.getFromEntity());
                 UUID targetId = resolveId(nodeIds, workspaceId, dto.getToEntity());
                 if (sourceId == null || targetId == null) {
-                    log.debug("[pipeline] Skipping edge — node not found  from={}  to={}",
-                            dto.getFromEntity(), dto.getToEntity());
+                    if (skipped < 3) {
+                        // Only log first few so we don't flood the log on systemic mismatches.
+                        log.warn("[pipeline] Skipping edge — node not found  edgeType={}  from={}  to={}  sampleNodeKeys=[{}]",
+                                dto.getEdgeType(), dto.getFromEntity(), dto.getToEntity(), sampleKeys);
+                    }
+                    skipped++;
                     continue;
                 }
                 rows.add(new Object[]{
@@ -387,7 +404,8 @@ public class PipelineService {
                     """, rows);
 
             edgeCount = rows.size();
-            log.info("[pipeline] Upserted {} edges  jobId={}", edgeCount, jobId);
+            log.info("[pipeline] Upserted {} edges  jobId={}  skipped={}  totalSubmitted={}",
+                    edgeCount, jobId, skipped, result.getRelationships().size());
         }
 
         // ── Phase 3: Batch context replace ───────────────────────────────────

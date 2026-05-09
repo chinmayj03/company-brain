@@ -48,6 +48,7 @@ from companybrain.pipeline.context_hierarchy import L2SharedContext
 from companybrain.pipeline.context_manager_agent import ContextManagerAgent
 from companybrain.pipeline.shared_context_accumulator import SharedContextAccumulator
 from companybrain.pipeline.assumption_miner import mine_assumptions  # ADR-0017
+from companybrain.pipeline.derived_query_extractor import DerivedQueryExtractor  # Tier 1.C
 from companybrain.graph.java_client import JavaGraphClient, ArtifactFreshnessResult
 from companybrain.models.entities import PipelineStartRequest, ExtractedEntity
 from companybrain.store.base import BrainEntity as _BrainEntity  # ADR-0017
@@ -551,13 +552,35 @@ async def run_pipeline(
             api_snapshot = {"path": request.endpoint_path, "method": request.http_method, "handler_code": ""}
             entities = await extractor.extract_from_clusters(git_clusters, api_snapshot)
 
+        # ── Stage 1 post-processing: derived query extraction (Tier 1.C) ────────
+        # Zero-cost structural scan for interface/repository methods that the LLM
+        # misses (no body = no extraction). Runs before the filter so that
+        # InterfaceMethod entities survive (weight=9 in filter).
+        if focal_context.code_units:
+            _dqe = DerivedQueryExtractor()
+            _first_unit = focal_context.code_units[0]
+            _dq_entities = _dqe.extract(
+                focal_context.code_units,
+                repo_name=getattr(_first_unit, "repo_name", ""),
+                commit_sha=getattr(_first_unit, "commit_sha", ""),
+            )
+            if _dq_entities:
+                existing_names = {e.name for e in entities}
+                _new = [e for e in _dq_entities if e.name not in existing_names]
+                entities.extend(_new)
+                log.info(
+                    "Derived query extractor added entities",
+                    new=len(_new),
+                    total=len(entities),
+                )
+
         # ── Stage 1 post-processing: relevance filter ─────────────────────────
         # Strips diff-artifact constants, test classes, and noise-suffix classes
         # (e.g. JsonKeyMapping, *Constants) before they enter any LLM stage.
         # Only endpoint-relevant code units (controllers, services, repos, DB queries)
         # are forwarded, keeping context tight and reducing token spend.
         raw_entity_count = len(entities)
-        entities = filter_entities(entities, endpoint=request.endpoint_path, max_entities=25)
+        entities = filter_entities(entities, endpoint=request.endpoint_path)
 
         entity_names = [f"{e.entity_type}:{e.name}" for e in entities[:10]]
         stage_1 = {

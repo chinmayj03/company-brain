@@ -531,10 +531,13 @@ class EntityExtractor:
 
         entities = self._parse_entities(raw)
 
-        # Populate code_snippet from the chunk content (method body)
+        # Populate code_snippet from the chunk content (method body).
+        # Tier 1.B: extend to InterfaceMethod and Class so the relationship
+        # extractor can cite the actual body, not just the name.
         for entity in entities:
-            if entity.entity_type in ("Function", "ApiEndpoint"):
-                entity.code_snippet = _extract_snippet(chunk.content, entity.name)
+            if entity.entity_type in ("Function", "ApiEndpoint", "InterfaceMethod", "Class"):
+                if not entity.code_snippet:
+                    entity.code_snippet = _extract_snippet(chunk.content, entity.name)
 
         return entities
 
@@ -591,12 +594,12 @@ class EntityExtractor:
 
         entities = self._parse_entities(raw)
 
-        # Populate code_snippet for Function/ApiEndpoint entities from the unit content.
-        # This lets the RelationshipExtractor see call sites (e.g. service.method() calls)
-        # without needing the full method body in the relationship prompt.
+        # Populate code_snippet from unit content for entities that need it.
+        # Tier 1.B: include InterfaceMethod and Class in addition to Function/ApiEndpoint.
         for entity in entities:
-            if entity.entity_type in ("Function", "ApiEndpoint"):
-                entity.code_snippet = _extract_snippet(unit.content, entity.name)
+            if entity.entity_type in ("Function", "ApiEndpoint", "InterfaceMethod", "Class"):
+                if not entity.code_snippet:
+                    entity.code_snippet = _extract_snippet(unit.content, entity.name)
 
         # For Repository/DAO units: also run deterministic JPA query extraction.
         # This catches @Query annotations, createNativeQuery, derived findBy... methods

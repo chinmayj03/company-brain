@@ -11,9 +11,11 @@ What gets filtered out:
     they contain no methods (just static final fields).
   - Test classes: *Test, *Tests, *Spec, *IT — rarely relevant to endpoint logic.
   - Low-confidence extractions below the threshold.
+  - DatabaseQuery entities with no query_text (1.A: they carry no actionable data).
 
 What gets prioritised (kept even at lower confidence):
   - Controllers, Services, Repositories, Clients — core business logic.
+  - InterfaceMethod entities — call-chain anchors (e.g. JPA-derived queries).
   - DatabaseQuery entities — always relevant to understanding data access.
   - Entities whose file path matches a relevant-files top hit.
 
@@ -39,10 +41,14 @@ log = structlog.get_logger(__name__)
 _MIN_CONFIDENCE = 0.5
 
 # Entity type priority: higher = more likely to survive the filter.
+# InterfaceMethod added at 9 — these are call-chain anchors (JPA-derived queries,
+# interface contracts) that downstream stages use to follow the call graph.
 _TYPE_PRIORITY: dict[str, int] = {
     "ApiEndpoint":       10,
     "DatabaseQuery":     9,
+    "InterfaceMethod":   9,   # Tier 1.E: interface methods are call-chain anchors
     "Function":          8,
+    "Class":             7,
     "class":             7,
     "SchemaField":       4,
     "DatabaseColumn":    3,
@@ -75,7 +81,7 @@ def filter_entities(
     entities: list[ExtractedEntity],
     endpoint: str,
     *,
-    max_entities: int = 25,
+    max_entities: int = 60,
 ) -> list[ExtractedEntity]:
     """
     Filter and rank entities by relevance to the endpoint.
@@ -127,6 +133,12 @@ def _drop_reason(entity: ExtractedEntity) -> str | None:
     #    entity_type="Constant", name="ROLES"). These are diff noise, not business logic.
     if entity.entity_type.lower() in ("constant", "configkey"):
         return "constant_type"
+
+    # 2b. DatabaseQuery with no query_text carries no actionable data — the LLM
+    #     extracted a name but no SQL/JPQL, so it cannot help the retriever cite code.
+    #     Keep any DatabaseQuery that has actual query text (even empty string is ok).
+    if entity.entity_type == "DatabaseQuery" and not entity.query_text:
+        return "empty_query_text"
 
     # 3. Low confidence
     if entity.confidence < _MIN_CONFIDENCE:

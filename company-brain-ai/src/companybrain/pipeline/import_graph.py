@@ -140,6 +140,12 @@ _JAVA_AUTOWIRED = re.compile(
     r'(?:final\s+)?(\w+)\s+(\w+)\s*;',
     re.MULTILINE,
 )
+# Tier 1.D: private-final-field injection (Lombok @RequiredArgsConstructor pattern
+# and plain Spring @Service with final fields — no @Autowired annotation required).
+_JAVA_PRIVATE_FINAL_FIELD = re.compile(
+    r'private\s+final\s+(\w+)\s+(\w+)\s*;',
+    re.MULTILINE,
+)
 _JAVA_CONSTRUCTOR_PARAM = re.compile(
     r'public\s+\w+\s*\(([^)]+)\)',   # constructor signature
 )
@@ -159,11 +165,14 @@ def _analyze_java(unit: CodeUnit, entity_by_class: dict[str, ExtractedEntity]) -
     if not source_entity:
         return []   # source class not in entity list
 
+    seen_types: set[str] = set()
+
     # @Autowired / @Inject fields — highest confidence (explicit DI)
     for m in _JAVA_AUTOWIRED.finditer(content):
         injected_type = m.group(1)
         field_name    = m.group(2)
         if injected_type in entity_by_class:
+            seen_types.add(injected_type)
             edges.append(ImportEdge(
                 from_entity=source_entity.external_id,
                 from_name=class_name,
@@ -171,6 +180,22 @@ def _analyze_java(unit: CodeUnit, entity_by_class: dict[str, ExtractedEntity]) -
                 to_class=injected_type,
                 confidence=0.95,
                 evidence=f"@Autowired {injected_type} {field_name}",
+            ))
+
+    # Tier 1.D: private final fields — Lombok @RequiredArgsConstructor / Spring convention.
+    # Confidence 0.88: strong structural signal even without explicit @Autowired.
+    for m in _JAVA_PRIVATE_FINAL_FIELD.finditer(content):
+        injected_type = m.group(1)
+        field_name    = m.group(2)
+        if injected_type in entity_by_class and injected_type not in seen_types:
+            seen_types.add(injected_type)
+            edges.append(ImportEdge(
+                from_entity=source_entity.external_id,
+                from_name=class_name,
+                from_type=source_entity.entity_type,
+                to_class=injected_type,
+                confidence=0.88,
+                evidence=f"private final {injected_type} {field_name}",
             ))
 
     # Constructor injection — high confidence (Spring standard pattern)
@@ -182,9 +207,8 @@ def _analyze_java(unit: CodeUnit, entity_by_class: dict[str, ExtractedEntity]) -
             if len(parts) >= 2:
                 param_type = parts[-2]
                 param_name = parts[-1]
-                if param_type in entity_by_class and not any(
-                    e.to_class == param_type for e in edges
-                ):
+                if param_type in entity_by_class and param_type not in seen_types:
+                    seen_types.add(param_type)
                     edges.append(ImportEdge(
                         from_entity=source_entity.external_id,
                         from_name=class_name,

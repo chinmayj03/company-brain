@@ -855,6 +855,11 @@ async def run_pipeline(
             username=os.getenv("NEO4J_USERNAME"),
             password=os.getenv("NEO4J_PASSWORD"),
         )
+        # Connect explicitly — without this, the first session() call inside
+        # commit_run() raises RuntimeError("Neo4jWriter not connected") which
+        # FanoutBrainStore.commit_run silently swallows via gather(return_exceptions=True).
+        # That's the root cause of "Neo4j stays at 0 nodes after every successful run".
+        await neo4j_writer.connect()
         neo4j_store = Neo4jBrainStore(neo4j_writer, workspace_id=request.workspace_id)
 
         from companybrain.retrieval.qdrant_store import QdrantBrainStore
@@ -866,24 +871,29 @@ async def run_pipeline(
 
         store = FanoutBrainStore(primary=json_store, mirrors=[pg_store, neo4j_store, qdrant_store])
 
-        # Convert every ExtractedEntity → canonical BrainEntity and write through
-        for ee in entities:
-            be = _to_brain_entity(
-                ee,
-                contexts.get(ee.external_id),
-                memory_tokens.get(ee.external_id),
-                relationships,
-                request.workspace_id,
-            )
-            await store.write(be, run_id=job_id, workspace_id=request.workspace_id)
+        try:
+            # Convert every ExtractedEntity → canonical BrainEntity and write through
+            for ee in entities:
+                be = _to_brain_entity(
+                    ee,
+                    contexts.get(ee.external_id),
+                    memory_tokens.get(ee.external_id),
+                    relationships,
+                    request.workspace_id,
+                )
+                await store.write(be, run_id=job_id, workspace_id=request.workspace_id)
 
-        # ADR-0017: write assumption entities (already BrainEntity, no conversion needed).
-        # JsonFileBrainStore writes .brain/assumption/<qname>.json automatically.
-        for assumption_be in _assumption_brain_entities:
-            await store.write(assumption_be, run_id=job_id, workspace_id=request.workspace_id)
+            # ADR-0017: write assumption entities (already BrainEntity, no conversion needed).
+            # JsonFileBrainStore writes .brain/assumption/<qname>.json automatically.
+            for assumption_be in _assumption_brain_entities:
+                await store.write(assumption_be, run_id=job_id, workspace_id=request.workspace_id)
 
 
-        await store.commit_run(job_id)
+            await store.commit_run(job_id)
+        finally:
+            # Always close the Neo4j driver to release pool connections, even if
+            # the run errors out partway through.
+            await neo4j_writer.close()
 
         stage_5 = {"stage": "5", "label": "Graph Population", "status": "done",
                    "brain_root": str(brain_root)}

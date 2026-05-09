@@ -38,8 +38,23 @@ class FanoutBrainStore(BrainStore):
 
     async def commit_run(self, run_id: str) -> None:
         await self.primary.commit_run(run_id)
-        await asyncio.gather(*[m.commit_run(run_id) for m in self.mirrors],
-                              return_exceptions=True)
+        # gather with return_exceptions=True so one failing mirror doesn't poison
+        # the others — but log every failure so we don't end up with empty
+        # mirrors that look like "everything succeeded" from the outside.
+        # (This is how Neo4j silently stayed at 0 nodes for runs and runs.)
+        results = await asyncio.gather(
+            *[m.commit_run(run_id) for m in self.mirrors],
+            return_exceptions=True,
+        )
+        for mirror, result in zip(self.mirrors, results):
+            if isinstance(result, BaseException):
+                log.warning(
+                    "Mirror store commit_run failed (non-fatal)",
+                    store=type(mirror).__name__,
+                    run_id=run_id,
+                    error=str(result),
+                    error_type=type(result).__name__,
+                )
 
     async def _safe_write(
         self, mirror: BrainStore, entity: BrainEntity, run_id: str, workspace_id: str

@@ -266,7 +266,10 @@ class JavaGraphClient:
             # ── Extraction results ──
             "entities":      [_entity_to_dict(e, self.workspace_id)   for e in entities],
             "relationships": [_rel_to_dict(r)       for r in relationships],
-            "contexts":      [_ctx_to_dict(eid, c)  for eid, c in contexts.items()],
+            # Java DTO is Map<String, ContextDto> keyed by entity external_id.
+            # Sending a JSON array used to silently 400 here on rich payloads
+            # (smoke tests with empty contexts passed because [] deserialised to null).
+            "contexts":      {eid: _ctx_to_dict(eid, c) for eid, c in contexts.items()},
 
             # ── ADR-003: Intent contexts (FunctionContext per entity) ──
             # Maps entity external_id → FunctionContext dict from IntentSynthesizer.
@@ -366,6 +369,10 @@ def _entity_to_dict(e: ExtractedEntity, workspace_id: str = "") -> dict:
         "firstAppearedCommit": e.first_appeared_commit,
         "lastModifiedCommit":  e.last_modified_commit,
     }
+    # ADR-0040 Tier 1.B: include code body so PipelineService can persist
+    # nodes.metadata.code_snippet for L2.A depth checks and call-graph BFS.
+    if getattr(e, "code_snippet", None):
+        d["codeSnippet"] = e.code_snippet
     # Include query_text in metadata for DatabaseQuery entities
     # so the frontend / Ask AI can display the raw SQL/JPQL
     if e.query_text:

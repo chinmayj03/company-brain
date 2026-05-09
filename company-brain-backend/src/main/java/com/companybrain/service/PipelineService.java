@@ -389,10 +389,14 @@ public class PipelineService {
             }
 
             // 1 batch INSERT … ON CONFLICT DO UPDATE
-            // NB: edges schema renamed observed_source → source (text NOT NULL).
-            // The old name caused Phase 2 to throw BatchUpdateException
-            // ('column "observed_source" of relation "edges" does not exist'),
-            // which surfaced as a generic 500 on every pipeline-result request.
+            // NB on the schema:
+            //   - column was renamed observed_source → source (text NOT NULL)
+            //   - unique constraint is uq_edge_identity
+            //       (workspace_id, edge_type, source_id, target_id, source)
+            //     so the ON CONFLICT target must list those exact columns in that order.
+            //     Listing a different column set (or omitting `source`) yields
+            //     "no unique or exclusion constraint matching the ON CONFLICT specification"
+            //     and the entire batch aborts.
             jdbc.batchUpdate("""
                     INSERT INTO edges
                         (id, workspace_id, source_id, target_id, edge_type,
@@ -400,7 +404,7 @@ public class PipelineService {
                     VALUES
                         (?::uuid, ?::uuid, ?::uuid, ?::uuid, ?,
                          ?, false, now(), 'llm_extraction')
-                    ON CONFLICT (workspace_id, source_id, target_id, edge_type)
+                    ON CONFLICT (workspace_id, edge_type, source_id, target_id, source)
                     DO UPDATE SET
                         confidence = GREATEST(EXCLUDED.confidence, edges.confidence),
                         is_pruned  = false,

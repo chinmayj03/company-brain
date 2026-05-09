@@ -12,6 +12,7 @@ Subcommands:
     brain query       — natural-language query against the brain
     brain blast-radius — BFS over Neo4j for an entity
     brain rebuild-from-json — rebuild Postgres + Neo4j + Qdrant from .brain/
+    brain enrich      — re-run Stage 2 + Stage 3 over existing .brain/ entities
     brain push        — copy the .brain/ to platform-brain (Stage 2)
 """
 from __future__ import annotations
@@ -20,6 +21,58 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional
+
+
+# ── Eager .env load — MUST run BEFORE any `from companybrain.*` import ───────
+# pydantic_settings.BaseSettings in companybrain.config reads .env from cwd at
+# instance-construction time (line `settings = Settings()` runs when the module
+# is first imported). When the CLI is invoked from company-brain-ai/, pydantic
+# loads company-brain-ai/.env — which may carry a stale ANTHROPIC_API_KEY that
+# 401s. We pre-populate os.environ from the repo-root .env so settings sees
+# the correct value the moment it constructs.
+def _bootstrap_env() -> None:
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except ImportError:
+        print("[cli-bootstrap] python-dotenv not installed; relying on shell env",
+              file=sys.stderr)
+        return
+    here = Path(__file__).resolve()
+    repo_root_env = here.parent.parent.parent.parent / ".env"
+    sub_env       = here.parent.parent.parent / ".env"
+    cwd_env       = Path.cwd() / ".env"
+
+    # company-brain/.env is the source of truth — override=True so it beats any
+    # stale value in shell env or sub-package .env.
+    if repo_root_env.is_file():
+        load_dotenv(repo_root_env, override=True)
+    if sub_env.is_file() and sub_env.resolve() != repo_root_env.resolve():
+        load_dotenv(sub_env, override=False)
+    if cwd_env.is_file() and cwd_env.resolve() not in {
+        repo_root_env.resolve() if repo_root_env.is_file() else None,
+        sub_env.resolve()       if sub_env.is_file()       else None,
+    }:
+        load_dotenv(cwd_env, override=False)
+
+    # Standalone CLI cannot resolve Docker network alias `neo4j:7687`.
+    uri = os.environ.get("NEO4J_URI", "")
+    if not uri or "neo4j:7687" in uri:
+        os.environ["NEO4J_URI"] = "bolt://localhost:7687"
+
+    # One-line diagnostic — shows masked key + which file won so we can debug
+    # 401s without printing the secret.
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    masked = f"{key[:8]}...{key[-4:]}" if len(key) > 12 else "(unset)"
+    print(
+        f"[cli-bootstrap] ANTHROPIC_API_KEY={masked} (len={len(key)}) "
+        f"repo_root_env={repo_root_env.is_file()} sub_env={sub_env.is_file()}",
+        file=sys.stderr,
+    )
+
+
+_bootstrap_env()
+# ── End env bootstrapping. Now safe to import companybrain.* ──────────────────
+
 
 import structlog
 import typer

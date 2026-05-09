@@ -65,26 +65,66 @@ class HybridSearcher:
             "component", "screen", "api_contract",
             "data_model", "assumption", "business_context",
         ]
+        # Ask Qdrant once which collections actually exist so we don't fire
+        # 404s for entity types we never wrote (cuts log noise + saves
+        # round-trips on every search). Cached on the instance.
+        existing = self._existing_collections()
         all_hits: list[SearchHit] = []
         for et in types:
+            coll = collection_name(self.workspace_slug, et)
+            if existing is not None and coll not in existing:
+                # No Qdrant collection for this type — fall back to BM25-only
+                # for this type so we still surface text matches.
+                all_hits.extend(self._search_one_type(
+                    query, et, top_k=top_k * 2, qdrant_known_missing=True,
+                ))
+                continue
             all_hits.extend(self._search_one_type(query, et, top_k=top_k * 2))
         all_hits.sort(key=lambda h: h.score, reverse=True)
         return all_hits[:top_k]
 
+    def _existing_collections(self) -> set[str] | None:
+        """Return the set of Qdrant collection names that exist for this
+        workspace, or None if Qdrant is unreachable (in which case we let the
+        search fall through and let each per-type call handle its own error).
+        Cached on the instance after first call.
+        """
+        if hasattr(self, "_existing_cache"):
+            return self._existing_cache
+        try:
+            cols = self.qdrant.get_collections()
+            names = {c.name for c in getattr(cols, "collections", [])}
+            self._existing_cache: set[str] | None = names
+            return names
+        except Exception as exc:
+            log.warning("Qdrant get_collections failed (will fall back to BM25)",
+                        error=str(exc))
+            self._existing_cache = None
+            return None
+
     def _search_one_type(self, query: str, entity_type: str,
-                         *, top_k: int) -> list[SearchHit]:
+                         *, top_k: int,
+                         qdrant_known_missing: bool = False) -> list[SearchHit]:
         bm25_results = self._bm25(entity_type).search(query, top_k=top_k * 2)
         bm25_rank = {urn: i + 1 for i, (urn, _) in enumerate(bm25_results)}
 
-        dense_query = self.embedder.embed(query)
         coll = collection_name(self.workspace_slug, entity_type)
-        try:
-            dense_hits = _qdrant_search(
-                self.qdrant, coll, dense_query, top_k * 2
-            )
-        except Exception as exc:
-            log.warning("Qdrant dense search failed", coll=coll, error=str(exc))
+        if qdrant_known_missing:
+            # Cached check told us the collection isn't there — skip Qdrant
+            # entirely so we don't burn a round-trip just to log a 404.
             dense_hits = []
+        else:
+            dense_query = self.embedder.embed(query)
+            try:
+                dense_hits = _qdrant_search(
+                    self.qdrant, coll, dense_query, top_k * 2
+                )
+            except Exception as exc:
+                # Demoted to debug — the collection-existence pre-check above
+                # already filters the common 404 case. Genuine errors still
+                # surface but won't drown the operator in noise.
+                log.debug("Qdrant dense search failed", coll=coll, error=str(exc))
+                dense_hits = []
         # Dense hits use UUID point IDs; recover URN from payload for RRF fusion.
         dense_rank = {
             (h.payload or {}).get("urn", str(h.id)): i + 1

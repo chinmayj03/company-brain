@@ -550,7 +550,35 @@ class Neo4jWriter:
         procedure apoc.create.addLabels". Switched to plain Cypher and rely
         on the n.type property + :CBNode label, which is what all our queries
         already filter on. No functional loss, no APOC dependency.
+
+        Property cleanup: Neo4j only accepts primitives, strings, booleans,
+        and arrays-of-primitives as property values. Pass-through dicts /
+        lists-of-dicts / None values cause "Property values can only be
+        of primitive types or arrays thereof" and abort the entire batch.
+        We strip Nones and stringify any non-primitive nested values up front.
         """
+
+        def _clean_props(props: dict) -> dict:
+            cleaned = {}
+            for k, v in props.items():
+                if v is None:
+                    continue
+                if isinstance(v, (str, bool, int, float)):
+                    cleaned[k] = v
+                elif isinstance(v, list):
+                    # Keep lists of primitives; flatten any stray nested objects to strings.
+                    safe = [
+                        x if isinstance(x, (str, bool, int, float)) else str(x)
+                        for x in v if x is not None
+                    ]
+                    cleaned[k] = safe
+                else:
+                    # dict, set, custom obj — cast to string so the property survives.
+                    cleaned[k] = str(v)
+            return cleaned
+
+        clean_rows = [{**r, "props": _clean_props(r.get("props", {}))} for r in rows]
+
         cypher = """
 UNWIND $rows AS row
 MERGE (n:CBNode { id: row.id })
@@ -559,13 +587,48 @@ SET n += row.props,
     n.scope = $scope
 RETURN count(n) AS c
 """
-        async with self._session() as session:
-            await session.run(cypher, rows=rows, scope=self.workspace_id)
+        try:
+            async with self._session() as session:
+                await session.run(cypher, rows=clean_rows, scope=self.workspace_id)
+        except Exception as exc:
+            # Surface the FIRST row's keys + types alongside the error so the
+            # actual cause (NaN / nested dict / unknown property type) is
+            # visible in logs instead of just "ALL batches failed".
+            sample = clean_rows[0] if clean_rows else {}
+            sample_keys = list((sample.get("props") or {}).keys())
+            log.error(
+                "Neo4j upsert_node_batch failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                rows=len(clean_rows),
+                sample_id=sample.get("id"),
+                sample_prop_keys=sample_keys[:25],
+            )
+            raise
 
     async def _upsert_edge_batch(
         self, cb_type: str, rows: list[dict[str, Any]]
     ) -> None:
         """UNWIND batch of edge rows into MERGE statements for a single edge type."""
+
+        def _clean_props(props: dict) -> dict:
+            cleaned = {}
+            for k, v in props.items():
+                if v is None:
+                    continue
+                if isinstance(v, (str, bool, int, float)):
+                    cleaned[k] = v
+                elif isinstance(v, list):
+                    cleaned[k] = [
+                        x if isinstance(x, (str, bool, int, float)) else str(x)
+                        for x in v if x is not None
+                    ]
+                else:
+                    cleaned[k] = str(v)
+            return cleaned
+
+        clean_rows = [{**r, "props": _clean_props(r.get("props", {}))} for r in rows]
+
         # Dynamic relationship type — use backtick quoting (mirrors TypeScript)
         cypher = f"""
 UNWIND $rows AS row
@@ -575,8 +638,19 @@ MERGE (src)-[r:`{cb_type}` {{ id: row.edge_id }}]->(tgt)
 SET r += row.props
 RETURN count(r) AS c
 """
-        async with self._session() as session:
-            await session.run(cypher, rows=rows)
+        try:
+            async with self._session() as session:
+                await session.run(cypher, rows=clean_rows)
+        except Exception as exc:
+            log.error(
+                "Neo4j upsert_edge_batch failed",
+                cb_type=cb_type,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                rows=len(clean_rows),
+                sample=clean_rows[0] if clean_rows else None,
+            )
+            raise
 
     async def _upsert_context_node(
         self,

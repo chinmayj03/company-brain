@@ -11,6 +11,7 @@ import com.companybrain.repository.NodeContextRepository;
 import com.companybrain.repository.NodeRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -64,6 +65,7 @@ public class ContextAssemblerService {
     private final NodeRepository        nodeRepository;
     private final EdgeRepository        edgeRepository;
     private final NodeContextRepository nodeContextRepository;
+    private final JdbcTemplate          jdbc;
 
     // ── Public API ────────────────────────────────────────────────────────────
 
@@ -72,6 +74,18 @@ public class ContextAssemblerService {
         UUID workspaceId = request.getWorkspaceId();
         int  maxHops     = Math.min(Math.max(request.getMaxHops(), 1), MAX_HOPS_CEILING);
         int  tokenBudget = request.getTokenBudget() > 0 ? request.getTokenBudget() : 4096;
+
+        // Internal endpoint — no JWT, RlsInterceptor never set app.workspace_id.
+        // Without this, FORCE'd RLS on nodes/edges/node_context filters every row,
+        // so resolveFocalNode would 404 even for valid focal nodes.
+        if (workspaceId != null) {
+            try {
+                jdbc.execute("SET LOCAL app.workspace_id = '" + workspaceId + "'");
+            } catch (Exception e) {
+                log.warn("[assembler] Failed to set RLS session variable  workspace={}  err={}",
+                        workspaceId, e.getMessage());
+            }
+        }
 
         // ── Step 1: Resolve focal node ────────────────────────────────────────
         Node focalNode = resolveFocalNode(workspaceId, request);

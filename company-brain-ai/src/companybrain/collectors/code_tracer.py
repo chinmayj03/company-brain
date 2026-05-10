@@ -126,6 +126,158 @@ _SKIP_DIRS = frozenset({
 _CODE_EXTS  = {".java", ".kt", ".ts", ".tsx", ".js", ".jsx", ".py"}
 
 
+# ── Endpoint-not-found error + route discovery ────────────────────────────────
+# Background: when the user passes an endpoint string that doesn't match any
+# real controller route (e.g. `/v1/payers/{id}/competitors` when the actual
+# route is `/competitiveness/summary/competitors/payer`), the previous code
+# fell through to a hybrid-BM25 search that returned whatever scored highest
+# for the literal query string. That populated focal_context with unrelated
+# files (StaticDataController, HTML generators, the interface-only
+# CompetitivenessRepository) and the pipeline silently produced 18 useless
+# entries. Better: fail loud, list the real routes, let the operator pick.
+
+class NoMatchingEndpointError(ValueError):
+    """Raised when no controller route matches the supplied endpoint string.
+
+    The exception message includes a list of routes discovered in the repo
+    so the operator can re-run with the correct endpoint+method.
+    """
+
+    def __init__(self, endpoint: str, http_method: str, routes: list[tuple]):
+        self.endpoint = endpoint
+        self.http_method = http_method
+        self.routes = routes
+        # Show up to 30 closest matches by simple substring score
+        ranked = _rank_route_candidates(endpoint, routes)[:30]
+        sample = "\n  ".join(f"{m:6s} {p}  ({fp})" for m, p, fp in ranked) or "(no routes discovered)"
+        super().__init__(
+            f"No controller route matches '{http_method} {endpoint}'.\n"
+            f"Closest discovered routes (top 30 by name similarity):\n  {sample}\n"
+            f"Total routes discovered: {len(routes)}.\n"
+            f"Re-run with the exact METHOD + path from this list."
+        )
+
+
+def discover_routes(repo_path: Path) -> list[tuple[str, str, str]]:
+    """Scan all controllers in `repo_path` and return [(METHOD, path, file)].
+
+    Java Spring: `@RequestMapping`/`@GetMapping`/etc. on @Controller classes.
+    Python:      `@router.get` / `@app.post` style.
+    Returns the union, deduped by (METHOD, path).
+    """
+    routes: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    # Java
+    _java_anno_to_method = {
+        "GetMapping": "GET", "PostMapping": "POST", "PutMapping": "PUT",
+        "DeleteMapping": "DELETE", "PatchMapping": "PATCH",
+        "RequestMapping": "REQUEST",   # without method= we don't know
+    }
+    for jf in repo_path.rglob("*.java"):
+        if any(skip in jf.parts for skip in _SKIP_DIRS):
+            continue
+        try:
+            text = jf.read_text(errors="ignore")
+        except OSError:
+            continue
+        if "@RestController" not in text and "@Controller" not in text:
+            continue
+        # Class-level base path. The boundary is "first method declaration",
+        # but we have to walk BACK from that point past any @-annotations that
+        # belong to that method — otherwise an annotation like @PostMapping
+        # placed immediately above the first method gets mis-classified as
+        # class-level and overwrites the real @RequestMapping. (find_entry_handler
+        # in code_tools.py has the same bug; we work around it locally.)
+        class_path = ""
+        method_decl_pos = _first_method_pos(text)
+        first_method_pos = _annotation_start_before(text, method_decl_pos)
+        for m in _JAVA_MAPPING_RE.finditer(text):
+            anno, raw_path = m.group(1), m.group(2)
+            if m.start() < first_method_pos:
+                class_path = raw_path.rstrip("/")
+            else:
+                full = (class_path + "/" + raw_path.lstrip("/")).rstrip("/") or "/"
+                http = _java_anno_to_method.get(anno, "REQUEST")
+                key = (http, full)
+                if key in seen:
+                    continue
+                seen.add(key)
+                routes.append((http, full, str(jf)))
+
+    # Python (FastAPI / Flask)
+    for pf in repo_path.rglob("*.py"):
+        if any(skip in pf.parts for skip in _SKIP_DIRS):
+            continue
+        try:
+            text = pf.read_text(errors="ignore")
+        except OSError:
+            continue
+        for m in _PY_ROUTE_RE.finditer(text):
+            http, full = m.group(1).upper(), m.group(2)
+            key = (http, full)
+            if key in seen:
+                continue
+            seen.add(key)
+            routes.append((http, full, str(pf)))
+
+    return routes
+
+
+def _first_method_pos(text: str) -> int:
+    """Position of first method-ish line in a Java class. Used to split
+    class-level annotations from method-level ones. Mirrors the helper in
+    code_tools.py — kept local to avoid a circular import."""
+    m = re.search(r'(?:public|protected|private)\s+[\w<>?,\s\[\]]+\s+\w+\s*\(', text)
+    return m.start() if m else len(text)
+
+
+def _annotation_start_before(text: str, pos: int) -> int:
+    """Walk backwards from `pos` past blank lines + leading @-annotations.
+
+    Returns the offset of the FIRST `@` that decorates the method at `pos`.
+    Used to find the true 'class-vs-method annotation' boundary so we don't
+    mis-attribute the method's own @PostMapping to the class.
+    """
+    if pos <= 0:
+        return pos
+    head = text[:pos]
+    # Walk line-by-line backwards until we hit a non-annotation, non-blank line.
+    lines = head.split("\n")
+    cut = pos
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped or re.match(r'@\w+(\s*\([^)]*\))?\s*$', stripped):
+            cut -= len(line) + 1   # +1 for the newline
+        else:
+            break
+    return max(0, cut)
+
+
+def _rank_route_candidates(
+    endpoint: str, routes: list[tuple[str, str, str]],
+) -> list[tuple[str, str, str]]:
+    """Rank routes by how 'close' they are to the user-supplied endpoint.
+
+    Cheap heuristic: count overlapping path segments (case-insensitive,
+    ignoring `v1`/`api` and any `{var}` parts). Good enough for a CLI hint;
+    a perfect match is a bonus, not the goal.
+    """
+    def _segs(p: str) -> set[str]:
+        return {
+            s.lower() for s in p.split("/")
+            if s and not re.match(r"^v\d+$", s) and s.lower() != "api" and "{" not in s
+        }
+
+    target = _segs(endpoint)
+    scored: list[tuple[int, tuple[str, str, str]]] = []
+    for r in routes:
+        score = len(target & _segs(r[1]))
+        scored.append((score, r))
+    scored.sort(key=lambda x: -x[0])
+    return [r for _, r in scored]
+
+
 # ── Data models ───────────────────────────────────────────────────────────────
 
 @dataclass(init=False)
@@ -422,12 +574,20 @@ class CodeTracer:
             if nodes:
                 units = []
                 for node in nodes:
+                    # ADR-0047: chunker reads files directly from disk via
+                    # Path(file_path).read_text(). It needs an ABSOLUTE path —
+                    # a relative path here causes Path.exists() to silently
+                    # return False (cwd is the AI service, not the repo root)
+                    # and the chunker falls back to the LLM-summarized
+                    # `unit.content`, which is missing 95% of the file.
+                    # _knowledge_to_code_units already does this correctly
+                    # via str(p.resolve()); this fallback path now matches.
                     try:
-                        rel_path = str(Path(node.file_path).relative_to(repo_path))
-                    except ValueError:
-                        rel_path = node.file_path
+                        abs_path = str(Path(node.file_path).resolve())
+                    except (OSError, RuntimeError):
+                        abs_path = node.file_path
                     units.append(CodeUnit(
-                        file_path=rel_path,
+                        file_path=abs_path,
                         repo_name=repo_name,
                         role=node.role,
                         language=_detect_language_from_path(entry_file_str),
@@ -445,8 +605,19 @@ class CodeTracer:
                 )], entry_method_name
 
         # ── Step 2: Language-specific regex fallback ──────────────────────────
+        # The regex fallback used to silently invoke hybrid search when it
+        # too came up empty — that's how unrelated files (StaticDataController,
+        # html generators) got into the brain on a wrong-endpoint run.
+        # The fallback now raises NoMatchingEndpointError; we surface it to
+        # the caller so the operator can re-run with the correct route.
         log.info("LLMHandlerFinder found nothing — falling back to regex tracers", endpoint=endpoint)
-        units = await self._trace_backend_regex_fallback(repo_path, repo_name, endpoint, method)
+        try:
+            units = await self._trace_backend_regex_fallback(repo_path, repo_name, endpoint, method)
+        except NoMatchingEndpointError:
+            # Re-raise — the message lists discovered routes; the caller
+            # (orchestrator) will render it as a job error rather than
+            # producing 18 nodes from random files.
+            raise
         return units, ""
 
     async def _trace_backend_regex_fallback(self, repo_path: Path, repo_name: str, endpoint: str, method: str) -> list[CodeUnit]:
@@ -506,29 +677,18 @@ class CodeTracer:
         else:
             handler_file, handler_content = self._find_java_handler(repo_path, endpoint)
             if not handler_file:
-                # Hybrid search fallback: find most relevant files using BM25 + dense
-                search_results = await _get_hybrid_searcher().search(
-                    query=f"{endpoint} {method}",
-                    repo_name=repo_name,
-                    repo_path=repo_path,
-                    top_k=10,
+                # Both deterministic finders missed. Hybrid search used to fire
+                # here, but it returns whatever scores high on BM25 for the
+                # literal query — that gave us 18 useless entries from the
+                # CompetitivenessRepository *interface* + StaticDataController
+                # + an HTML generator, all unrelated to /competitiveness/...
+                # Failing loud with the route list is dramatically more useful.
+                routes = discover_routes(repo_path)
+                log.error(
+                    "No Java handler found — refusing to fall back to hybrid search",
+                    endpoint=endpoint, http_method=method, routes_in_repo=len(routes),
                 )
-                if search_results:
-                    # Use top result as handler
-                    handler_file = repo_path / search_results[0].path
-                    try:
-                        handler_content = handler_file.read_text(errors="ignore")
-                    except OSError:
-                        handler_content = ""
-                    log.info(
-                        "HybridSearch: found handler candidate",
-                        path=search_results[0].path,
-                        score=search_results[0].score,
-                        source=search_results[0].source,
-                    )
-                else:
-                    log.info("No Java handler found", repo=repo_name, endpoint=endpoint)
-                    return []
+                raise NoMatchingEndpointError(endpoint, method, routes)
             entry_file_str    = str(handler_file)
             entry_class       = _extract_class_name(handler_content, "java")
             entry_method_name = ""

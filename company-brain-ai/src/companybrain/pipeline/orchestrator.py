@@ -151,6 +151,25 @@ async def run_pipeline(
             return_exceptions=True,
         )
 
+        # Surface NoMatchingEndpointError as a job-level error rather than
+        # silently producing 18 nodes from random files when the user passes
+        # a bogus endpoint string. The exception message lists discovered
+        # routes so the user can re-run with the correct one.
+        from companybrain.collectors.code_tracer import NoMatchingEndpointError as _NoMatch
+        if isinstance(focal_context, _NoMatch):
+            await progress(
+                "0a", "❌",
+                f"Endpoint {request.http_method} {request.endpoint_path} matches no controller route",
+                error=str(focal_context),
+            )
+            raise focal_context
+        if isinstance(focal_context, Exception):
+            # Any other exception from the tracer — surface and re-raise so
+            # the orchestrator's outer error handler can mark the job failed.
+            await progress("0a", "❌", f"Code tracing failed: {focal_context}",
+                           error=str(focal_context))
+            raise focal_context
+
         # Unpack git result (may be an exception if collection failed)
         git_clusters: list = []
         git_commits = 0

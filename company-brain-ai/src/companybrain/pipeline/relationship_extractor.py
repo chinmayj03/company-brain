@@ -241,6 +241,58 @@ CRITICAL: Output ONLY the raw JSON. Start with { end with }. Nothing before, not
 """
 
 
+def _chunk_entities_for_extraction(
+    entities: list[ExtractedEntity],
+    batch_size: int = 25,
+    max_chars_per_batch: int = 60_000,
+) -> list[list[ExtractedEntity]]:
+    """
+    ADR-0042 E8: Co-locality chunking — group entities for multi-pass extraction.
+
+    Strategy:
+      1. Group by file (entities from the same file share call-site context).
+      2. Within a file group, preserve original order (class before methods).
+      3. Pack groups into batches of at most `batch_size` entities whose combined
+         snippet+signature length stays under `max_chars_per_batch`.
+
+    This ensures each LLM call sees a coherent slice of the call graph rather
+    than arbitrary interleaving across unrelated files.
+    """
+    if not entities:
+        return []
+
+    # Group by file path, preserving insertion order
+    from collections import defaultdict
+    by_file: dict[str, list[ExtractedEntity]] = defaultdict(list)
+    for e in entities:
+        by_file[e.file or ""].append(e)
+
+    batches: list[list[ExtractedEntity]] = []
+    current_batch: list[ExtractedEntity] = []
+    current_chars = 0
+
+    def _entity_size(e: ExtractedEntity) -> int:
+        return len(e.signature or "") + len(e.code_snippet or "") + len(e.name)
+
+    for file_group in by_file.values():
+        for entity in file_group:
+            size = _entity_size(entity)
+            if (len(current_batch) >= batch_size
+                    or current_chars + size > max_chars_per_batch):
+                if current_batch:
+                    batches.append(current_batch)
+                current_batch = [entity]
+                current_chars = size
+            else:
+                current_batch.append(entity)
+                current_chars += size
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
+
+
 class RelationshipExtractor:
     """
     Runs LLM Pass 2 (relationship extraction) in a single LLM call.
@@ -260,12 +312,41 @@ class RelationshipExtractor:
         api_snapshot: dict,
     ) -> list[ExtractedRelationship]:
         """
-        Extract relationships between entities using a single LLM call.
-        Returns a list of ExtractedRelationship.
+        Extract relationships between entities.
+
+        ADR-0042 E8: When entities > 25, chunks by co-locality and runs the
+        existing single-call logic per batch, then merges and deduplicates.
         """
         if not entities:
             return []
 
+        # E8: multi-pass for large entity sets
+        if len(entities) > 25:
+            batches = _chunk_entities_for_extraction(entities)
+            log.info("RelationshipExtractor multi-pass", batches=len(batches),
+                     entities=len(entities))
+            all_rels: list[ExtractedRelationship] = []
+            seen: set[tuple] = set()
+            for batch in batches:
+                batch_rels = await self._extract_single_batch(batch, clusters, api_snapshot)
+                for r in batch_rels:
+                    key = (r.from_entity, r.edge_type, r.to_entity)
+                    if key not in seen:
+                        seen.add(key)
+                        all_rels.append(r)
+            log.info("RelationshipExtractor multi-pass complete",
+                     total_edges=len(all_rels))
+            return all_rels
+
+        return await self._extract_single_batch(entities, clusters, api_snapshot)
+
+    async def _extract_single_batch(
+        self,
+        entities: list[ExtractedEntity],
+        clusters: list[CommitCluster],
+        api_snapshot: dict,
+    ) -> list[ExtractedRelationship]:
+        """Run the existing single-LLM-call relationship extraction on one batch."""
         # Apply distilled patterns first (active learning — tier 2, no LLM cost)
         from companybrain.pipeline.pattern_distiller import PatternDistiller
         distiller = PatternDistiller()

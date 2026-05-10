@@ -510,6 +510,18 @@ class EntityExtractor:
                 method_chunks=len(method_chunks),
                 original_chars=len(unit.content or ""),
             )
+            # E4: skip chunks whose body_hash the backend confirmed as unchanged
+            _fresh_hashes: set[str] = getattr(unit, "_fresh_method_hashes", set())
+            if _fresh_hashes:
+                _before = len(method_chunks)
+                method_chunks = [c for c in method_chunks if c.body_hash not in _fresh_hashes]
+                log.info(
+                    "E4 method freshness filter applied",
+                    unit=unit.brief(),
+                    skipped=_before - len(method_chunks),
+                    remaining=len(method_chunks),
+                )
+
             all_entities: list[ExtractedEntity] = []
             for chunk in method_chunks:
                 try:

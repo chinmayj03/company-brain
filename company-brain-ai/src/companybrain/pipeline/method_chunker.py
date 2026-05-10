@@ -37,6 +37,7 @@ The caller re-assembles them as:
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 
@@ -58,6 +59,12 @@ class MethodChunk:
     role:         str
     line_start:   int             # 1-based line number of method declaration
     content:      str             # class header + method body, ready for LLM
+    body_hash:    str = ""        # sha256 of the raw method body (E4 freshness)
+
+
+def _sha256_body(body: str) -> str:
+    """SHA-256 of the whitespace-normalised method body for stable freshness comparison."""
+    return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -200,6 +207,7 @@ def _split_java(content: str, unit) -> list[MethodChunk]:
             role=unit.role,
             line_start=start_idx + 1,
             content=assembled,
+            body_hash=_sha256_body(body),
         ))
 
     return chunks
@@ -255,6 +263,7 @@ def _split_python(content: str, unit) -> list[MethodChunk]:
             role=unit.role,
             line_start=line_start,
             content=assembled,
+            body_hash=_sha256_body(body),
         ))
 
     return chunks
@@ -327,6 +336,7 @@ def _split_typescript(content: str, unit) -> list[MethodChunk]:
             role=unit.role,
             line_start=start_idx + 1,
             content=assembled,
+            body_hash=_sha256_body(body),
         ))
 
     return chunks

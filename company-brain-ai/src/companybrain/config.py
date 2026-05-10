@@ -191,5 +191,24 @@ class Settings(BaseSettings):
     # for fast iteration / demo runs where gaps aren't being acted on.
     skip_gap_detection:    bool = False
 
+    # ── ADR-0042: per-pass token budgets ─────────────────────────────────────
+    # Each budget sits ~2× the empirical p95 for that pass to prevent truncation.
+    max_tokens_annotation_pass:       int = 800     # E2 — ANNOTATES edges
+    max_tokens_storage_target_pass:   int = 1_500   # E3 — DatabaseTable entities
+    max_tokens_schema_migration_pass: int = 2_500   # E5 — migration schema
+    max_tokens_client_call_pass:      int = 1_500   # E6 — CALLS_ENDPOINT edges
+    max_tokens_test_coverage_pass:    int = 2_500   # E7 — TESTED_BY edges
+    max_tokens_intent_router:         int = 300     # E10 — intent classification
+
+    # ── ADR-0042: job cost guard ──────────────────────────────────────────────
+    # Abort the pipeline if cumulative cost exceeds this threshold.
+    # Override via env var: BRAIN_JOB_BUDGET_USD=0.50
+    brain_job_budget_usd: float = 0.50
+
+    # ── ADR-0042 E10: intent router ────────────────────────────────────────────
+    # When True, the intent router is called before SmartZoneAssembler.
+    # Adds ~200ms per query but dramatically improves subgraph selection.
+    enable_intent_router: bool = True
+
 
 settings = Settings()

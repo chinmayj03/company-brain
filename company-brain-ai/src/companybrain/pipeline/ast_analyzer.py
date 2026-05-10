@@ -48,6 +48,7 @@ paid once per process, not once per file.
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -249,6 +250,7 @@ class SymbolTable:
                     role=unit.role,
                     line_start=method.start_line,
                     content=assembled,
+                    body_hash=hashlib.sha256(method.body_text.strip().encode("utf-8")).hexdigest(),
                 ))
 
         return chunks

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# post_query hook — fires after a /query LLM call returns to the user.
+#
+# Stdin (JSON):
+#   {
+#     "query":      "where is the lob field stored",
+#     "answer":     "...",
+#     "citations":  [{"urn": "urn:method:...", "score": 0.83}, ...],
+#     "cost_usd":   0.012
+#   }
+#
+# Use this hook to log every Q&A pair into your own analytics store, or to
+# kick off offline relevance grading.
+
+set -euo pipefail
+PAYLOAD="$(cat)"
+echo "[brain] query answered: $PAYLOAD" >&2
+echo "{}"

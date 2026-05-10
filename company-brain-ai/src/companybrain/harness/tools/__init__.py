@@ -22,19 +22,34 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+from companybrain.harness.permissions import Capability
 from companybrain.llm.base import ToolDefinition, ToolParameter
 
 ToolHandler = Callable[[dict[str, Any], dict[str, Any]], Awaitable[Any]]
 
 
+# Default capability profile when a tool doesn't declare one. Read tools
+# (most of P1's tools) need only read_repo + read_brain. Tools with side
+# effects MUST opt in by passing `requires=` explicitly.
+DEFAULT_CAPABILITIES: tuple[Capability, ...] = (
+    Capability.READ_REPO,
+    Capability.READ_BRAIN,
+)
+
+
 @dataclass
 class Tool:
-    """One registered harness tool — schema for the model + handler for the harness."""
+    """One registered harness tool — schema for the model + handler for the harness.
+
+    `requires` is consumed by the harness loop's permission gate before
+    dispatch (ADR-0051 P4). Empty tuple = no capabilities required.
+    """
     definition: ToolDefinition
     handler: ToolHandler
+    requires: tuple[Capability, ...] = field(default_factory=lambda: DEFAULT_CAPABILITIES)
 
     @property
     def name(self) -> str:
@@ -56,6 +71,7 @@ def register_tool(
     name: str,
     description: str,
     parameters: list[ToolParameter] | None = None,
+    requires: tuple[Capability, ...] | list[Capability] | None = None,
 ) -> Callable[[ToolHandler], ToolHandler]:
     """Decorator: bind a (name, schema, handler) triple into TOOL_REGISTRY.
 
@@ -80,6 +96,7 @@ def register_tool(
                 parameters=list(parameters or []),
             ),
             handler=fn,
+            requires=tuple(requires) if requires is not None else DEFAULT_CAPABILITIES,
         )
         return fn
     return deco

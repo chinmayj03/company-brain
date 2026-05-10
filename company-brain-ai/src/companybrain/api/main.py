@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from companybrain.api.routes import pipeline, query, health, repo, feedback
+from companybrain.api.routes import pipeline, query, health, repo, feedback, stream
 from companybrain.config import settings
 from companybrain.db import init_db_pool, close_db_pool
 
@@ -53,6 +53,9 @@ app.include_router(pipeline.router, prefix="/pipeline", tags=["pipeline"])
 app.include_router(query.router, prefix="/query", tags=["query"])
 app.include_router(repo.router, prefix="/repo", tags=["repo"])
 app.include_router(feedback.router, prefix="/feedback", tags=["feedback"])
+# ADR-0051 P4 — SSE feed of harness TodoList progress for /pipeline/jobs/{id}.
+# Path is fully embedded in the route so no prefix is set here.
+app.include_router(stream.router, tags=["stream"])
 
 
 @app.exception_handler(Exception)

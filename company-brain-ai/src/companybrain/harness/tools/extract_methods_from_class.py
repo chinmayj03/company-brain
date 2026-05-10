@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from companybrain.agents.context_agent import ContextAgent, ContextAgentResult
+from companybrain.harness.permissions import Capability
 from companybrain.harness.tools import register_tool
 from companybrain.llm.base import ToolParameter
 from companybrain.pipeline.code_chunker import _LANGUAGE_MAP, MethodChunk
@@ -31,6 +32,7 @@ from companybrain.util.file_cache import FileCache
                       "Inferred from file extension when omitted.",
                       required=False),
     ],
+    requires=(Capability.READ_REPO, Capability.LLM_CALL),
 )
 async def handler(args: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
     file_path = args["file"]

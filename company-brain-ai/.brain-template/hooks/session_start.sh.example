@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# session_start hook — fires once when a new pipeline run is created.
+#
+# Stdin (JSON):
+#   {
+#     "session_id": "job-abc123",
+#     "endpoint":   "/lob",
+#     "method":     "GET",
+#     "repo_path":  "/abs/path/to/repo",
+#     "started_at": "2026-05-10T18:00:00Z"
+#   }
+#
+# Use this hook to start a per-job log file, page someone, or post a Slack
+# "extraction starting" announcement.
+
+set -euo pipefail
+echo "{}"

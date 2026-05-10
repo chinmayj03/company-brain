@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# post_extraction hook — fires after extract_methods_from_class returns.
+#
+# Stdin (JSON):
+#   {
+#     "file":       "src/.../Foo.java",
+#     "entities":   42,
+#     "edges":      87,
+#     "tokens_in":  1840,
+#     "tokens_out": 920
+#   }
+#
+# Stdout (optional, JSON):
+#   { "warn": "..." }   — surfaces a warning into the run telemetry.
+#
+# Use this hook to ship per-file extraction stats to your own observability
+# stack (Datadog, Honeycomb, etc.) without touching pipeline code.
+
+set -euo pipefail
+
+# Read the payload from stdin so we can log it; ignore it for the default behaviour.
+PAYLOAD="$(cat)"
+
+# Example: append a one-line summary to a per-run log file.
+RUN_LOG="${BRAIN_RUN_LOG:-/tmp/brain-extraction.log}"
+echo "$(date -u +%FT%TZ) $PAYLOAD" >> "$RUN_LOG"
+
+# Emit no JSON → harness applies no modification.
+echo "{}"

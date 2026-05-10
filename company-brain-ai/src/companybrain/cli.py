@@ -527,28 +527,290 @@ def mcp_cmd(
 
 @app.command(name="plugin")
 def plugin_cmd(
-    action: str = typer.Argument(..., help="install (stub for P5; full impl in P6)"),
-    target: Optional[str] = typer.Argument(None, help="Plugin name or URL"),
+    action: str = typer.Argument(..., help="install | list | uninstall"),
+    target: Optional[str] = typer.Argument(None, help="Plugin name, URL or .zip path"),
 ):
-    """Plugin marketplace stub (ADR-0052 P5; full impl ships in P6).
+    """Plugin marketplace (ADR-0052 P6).
 
-    Currently records the request and exits non-zero so CI scripts can detect
-    the gap. The P6 PR replaces this body with the real installer.
+        brain plugin install ./fixtures/plugins/acme-spring-boot.zip
+        brain plugin install https://example.com/acme.zip
+        brain plugin list
+        brain plugin uninstall acme-spring-boot
     """
-    if action != "install":
-        typer.secho(f"Unknown action: {action!r}. Only 'install' is supported.",
-                    fg=typer.colors.RED)
-        raise typer.Exit(2)
-    if not target:
-        typer.secho("plugin install requires a name or URL argument.",
-                    fg=typer.colors.RED)
-        raise typer.Exit(2)
-    typer.echo(
-        "brain plugin install is a P5 stub — the marketplace lands in ADR-0052 P6.\n"
-        f"  requested: {target}\n"
-        "  Track progress: docs/adrs/ADR-0052-comprehensive-feature-adoption.md §Phase 6"
+    from companybrain.harness import plugins as plugins_mod
+
+    action = action.strip().lower()
+    if action == "install":
+        if not target:
+            typer.secho("plugin install requires a name, URL or path.",
+                        fg=typer.colors.RED)
+            raise typer.Exit(2)
+        try:
+            plugin = plugins_mod.install(target)
+        except Exception as exc:
+            typer.secho(f"plugin install failed: {exc}", fg=typer.colors.RED)
+            raise typer.Exit(1) from exc
+        typer.secho(f"✓ installed {plugin.name} {plugin.version}",
+                    fg=typer.colors.GREEN)
+        typer.echo(f"  root: {plugin.root}")
+        if plugin.capabilities:
+            typer.echo(f"  capabilities: {', '.join(plugin.capabilities)}")
+        return
+
+    if action == "list":
+        installed = plugins_mod.list_installed()
+        if not installed:
+            typer.echo("(no plugins installed)")
+            return
+        for p in installed:
+            caps = ",".join(p.capabilities) if p.capabilities else "(none)"
+            typer.echo(f"  {p.name:24s}  {p.version:10s}  [{caps}]  {p.root}")
+        return
+
+    if action == "uninstall":
+        if not target:
+            typer.secho("plugin uninstall requires a name.", fg=typer.colors.RED)
+            raise typer.Exit(2)
+        if plugins_mod.uninstall(target):
+            typer.secho(f"✓ uninstalled {target}", fg=typer.colors.GREEN)
+        else:
+            typer.secho(f"plugin {target!r} not installed", fg=typer.colors.YELLOW)
+            raise typer.Exit(1)
+        return
+
+    typer.secho(f"Unknown action: {action!r}. Valid: install | list | uninstall",
+                fg=typer.colors.RED)
+    raise typer.Exit(2)
+
+
+# ── ADR-0052 P6: brain schedule ──────────────────────────────────────────────
+
+
+@app.command(name="schedule")
+def schedule_cmd(
+    action: str = typer.Argument(..., help="add | list | cancel | run-now"),
+    name: Optional[str] = typer.Argument(None, help="Job id (required for add/cancel/run-now)"),
+    repo: Optional[str] = typer.Option(None, help="Repo path (add only)"),
+    endpoint: Optional[str] = typer.Option(None, help="Endpoint path (add only)"),
+    method: str = typer.Option("GET", help="HTTP method (add only)"),
+    cron: Optional[str] = typer.Option(None, help="Cron expression (add only)"),
+    workspace_id: str = typer.Option(
+        os.getenv("BRAIN_WORKSPACE_ID", "00000000-0000-0000-0000-000000000001"),
+    ),
+):
+    """Manage cron-triggered extractions (ADR-0052 P6).
+
+        brain schedule add daily-rebuild --repo /path --endpoint /api/x --cron "0 2 * * *"
+        brain schedule list
+        brain schedule cancel daily-rebuild
+        brain schedule run-now daily-rebuild
+    """
+    from companybrain.harness import scheduler as scheduler_mod
+
+    action = action.strip().lower()
+    try:
+        if action == "add":
+            for required, label in (
+                (name, "<name>"), (repo, "--repo"),
+                (endpoint, "--endpoint"), (cron, "--cron"),
+            ):
+                if not required:
+                    typer.secho(f"`brain schedule add` requires {label}.",
+                                fg=typer.colors.RED)
+                    raise typer.Exit(2)
+            job_id = asyncio.run(scheduler_mod.schedule(
+                name=name, repo=repo, endpoint=endpoint,
+                method=method, cron=cron, workspace_id=workspace_id,
+            ))
+            typer.secho(f"✓ scheduled {job_id} ({cron})", fg=typer.colors.GREEN)
+            return
+
+        if action == "list":
+            jobs = scheduler_mod.list_jobs()
+            if not jobs:
+                typer.echo("(no scheduled jobs)")
+                return
+            for j in jobs:
+                next_at = j.next_run_at.isoformat() if j.next_run_at else "(paused)"
+                typer.echo(
+                    f"  {j.id:24s}  next={next_at:25s}  "
+                    f"{j.method:6s} {j.endpoint:32s}  {j.repo}"
+                )
+            return
+
+        if action == "cancel":
+            if not name:
+                typer.secho("`brain schedule cancel` requires <name>.",
+                            fg=typer.colors.RED)
+                raise typer.Exit(2)
+            ok = scheduler_mod.cancel(name)
+            if ok:
+                typer.secho(f"✓ cancelled {name}", fg=typer.colors.GREEN)
+            else:
+                typer.secho(f"job {name!r} not found", fg=typer.colors.YELLOW)
+                raise typer.Exit(1)
+            return
+
+        if action == "run-now":
+            if not name:
+                typer.secho("`brain schedule run-now` requires <name>.",
+                            fg=typer.colors.RED)
+                raise typer.Exit(2)
+            outcome = asyncio.run(scheduler_mod.run_now(name))
+            if outcome.get("ok"):
+                typer.secho(f"✓ ran {name}", fg=typer.colors.GREEN)
+            else:
+                typer.secho(f"✗ {name}: {outcome.get('error', 'failed')}",
+                            fg=typer.colors.RED)
+                raise typer.Exit(1)
+            return
+    except scheduler_mod.MissingSchedulerDependency as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+
+    typer.secho(f"Unknown action: {action!r}. Valid: add | list | cancel | run-now",
+                fg=typer.colors.RED)
+    raise typer.Exit(2)
+
+
+# ── ADR-0052 P6: brain note ──────────────────────────────────────────────────
+
+
+@app.command(name="note")
+def note_cmd(
+    action: str = typer.Argument(..., help="add | list | delete"),
+    target: Optional[str] = typer.Argument(None, help="URN (add/list) or note id (delete)"),
+    text: Optional[str] = typer.Argument(None, help="Note body (add only)"),
+    author: Optional[str] = typer.Option(None, help="Author tag (add only)"),
+    workspace_id: str = typer.Option(
+        os.getenv("BRAIN_WORKSPACE_ID", "00000000-0000-0000-0000-000000000001"),
+    ),
+):
+    """Per-entity sticky notes (ADR-0052 P6).
+
+        brain note add urn:cb:dev:code:repo:method:Foo.bar "Deprecated 2026-Q4"
+        brain note list urn:cb:dev:code:repo:method:Foo.bar
+        brain note delete 42
+    """
+    from companybrain.harness import notes as notes_mod
+
+    action = action.strip().lower()
+    if action == "add":
+        if not target or not text:
+            typer.secho("`brain note add` requires <urn> and <text>.",
+                        fg=typer.colors.RED)
+            raise typer.Exit(2)
+        n = asyncio.run(notes_mod.add_note(
+            workspace_id=workspace_id, entity_urn=target, note=text, author=author,
+        ))
+        typer.secho(f"✓ note #{n.id} added to {n.entity_urn}", fg=typer.colors.GREEN)
+        return
+
+    if action == "list":
+        if not target:
+            typer.secho("`brain note list` requires <urn>.", fg=typer.colors.RED)
+            raise typer.Exit(2)
+        rows = asyncio.run(notes_mod.list_notes(
+            workspace_id=workspace_id, entity_urn=target,
+        ))
+        if not rows:
+            typer.echo("(no notes)")
+            return
+        for r in rows:
+            ts = r.created_at.isoformat() if r.created_at else "?"
+            who = r.author or "-"
+            typer.echo(f"  #{r.id}  {ts}  [{who}]  {r.note}")
+        return
+
+    if action == "delete":
+        if not target or not target.isdigit():
+            typer.secho("`brain note delete` requires a numeric note id.",
+                        fg=typer.colors.RED)
+            raise typer.Exit(2)
+        ok = asyncio.run(notes_mod.delete_note(note_id=int(target)))
+        if ok:
+            typer.secho(f"✓ deleted note #{target}", fg=typer.colors.GREEN)
+        else:
+            typer.secho(f"note #{target} not found", fg=typer.colors.YELLOW)
+            raise typer.Exit(1)
+        return
+
+    typer.secho(f"Unknown action: {action!r}. Valid: add | list | delete",
+                fg=typer.colors.RED)
+    raise typer.Exit(2)
+
+
+# ── ADR-0052 P6: brain pin / unpin / propose ─────────────────────────────────
+
+
+@app.command(name="pin")
+def pin_cmd(
+    urn: str = typer.Argument(..., help="Entity URN"),
+    workspace_id: str = typer.Option(
+        os.getenv("BRAIN_WORKSPACE_ID", "00000000-0000-0000-0000-000000000001"),
+    ),
+):
+    """Pin an entity so rebuild passes don't overwrite it (ADR-0052 P6)."""
+    asyncio.run(_set_node_flag(workspace_id, urn, pinned=True))
+    typer.secho(f"✓ pinned {urn}", fg=typer.colors.GREEN)
+
+
+@app.command(name="unpin")
+def unpin_cmd(
+    urn: str = typer.Argument(..., help="Entity URN"),
+    workspace_id: str = typer.Option(
+        os.getenv("BRAIN_WORKSPACE_ID", "00000000-0000-0000-0000-000000000001"),
+    ),
+):
+    """Remove the pin from an entity (ADR-0052 P6)."""
+    asyncio.run(_set_node_flag(workspace_id, urn, pinned=False))
+    typer.secho(f"✓ unpinned {urn}", fg=typer.colors.GREEN)
+
+
+@app.command(name="propose")
+def propose_cmd(
+    urn: str = typer.Argument(..., help="Entity URN"),
+    workspace_id: str = typer.Option(
+        os.getenv("BRAIN_WORKSPACE_ID", "00000000-0000-0000-0000-000000000001"),
+    ),
+    revert: bool = typer.Option(False, "--revert", help="Clear the proposed flag."),
+):
+    """Mark an entity as a draft suggestion hidden from /query (ADR-0052 P6)."""
+    asyncio.run(_set_node_flag(workspace_id, urn, proposed=not revert))
+    msg = f"✓ {'un-' if revert else ''}proposed {urn}"
+    typer.secho(msg, fg=typer.colors.GREEN)
+
+
+async def _set_node_flag(workspace_id: str, urn: str, *,
+                         pinned: Optional[bool] = None,
+                         proposed: Optional[bool] = None) -> None:
+    """Toggle pinned / proposed on the nodes row for ``urn``.
+
+    Uses asyncpg directly so the CLI doesn't pull in the full SQLAlchemy
+    machinery for a single UPDATE.
+    """
+    import asyncpg
+    db_url = os.environ.get("DATABASE_URL", "postgresql://localhost/companybrain")
+    db_url = db_url.replace("postgresql+asyncpg://", "postgresql://")
+    sets, params = [], []
+    if pinned is not None:
+        params.append(pinned)
+        sets.append(f"pinned = ${len(params)}")
+    if proposed is not None:
+        params.append(proposed)
+        sets.append(f"proposed = ${len(params)}")
+    if not sets:
+        return
+    params.extend([workspace_id, urn])
+    sql = (
+        f"UPDATE nodes SET {', '.join(sets)} "
+        f"WHERE workspace_id = ${len(params) - 1}::uuid AND urn = ${len(params)}"
     )
-    raise typer.Exit(3)
+    conn = await asyncpg.connect(db_url)
+    try:
+        await conn.execute(sql, *params)
+    finally:
+        await conn.close()
 
 
 if __name__ == "__main__":

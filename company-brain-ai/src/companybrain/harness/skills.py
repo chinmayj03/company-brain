@@ -116,7 +116,30 @@ def load_skill(framework: str) -> str:
 
     The harness injects the returned text under a `# Framework Skill: <name>`
     heading, so the file should not lead with its own H1.
+
+    ADR-0052 P6: when an installed plugin ships a SKILL.md for the same
+    framework name, the plugin version takes precedence over the bundled tree.
+    This is how teams override our built-in spring-boot skill with their own
+    house-style ``acme-spring-boot``.
     """
+    # Plugin-supplied skill wins. Imported locally so the cheap-detect path
+    # never pays for the plugin scan when no skill is being loaded.
+    try:
+        from companybrain.harness import plugins as _plugins
+        plugin_skills = _plugins.discover_skills()
+    except Exception as exc:                  # pragma: no cover — diagnostic
+        log.debug("skills.load.plugin_discovery_failed", error=str(exc))
+        plugin_skills = {}
+    if framework in plugin_skills:
+        try:
+            text = plugin_skills[framework].read_text()
+            log.info("skills.load.from_plugin",
+                     framework=framework, path=str(plugin_skills[framework]))
+            return text
+        except OSError as exc:
+            log.warning("skills.load.plugin_read_error",
+                        framework=framework, error=str(exc))
+
     if framework not in _FRAMEWORK_MARKERS:
         return ""
     skill = _FRAMEWORKS_DIR / framework / "SKILL.md"

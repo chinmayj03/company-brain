@@ -163,6 +163,9 @@ async def query_graph(request: QueryRequest):
     # ── Step 4: Parse structured response ────────────────────────────────────
     query_response = _parse_llm_response(response.content, assembled_context)
 
+    # ── Step 4b: Surface per-entity sticky notes (ADR-0052 P6) ───────────────
+    await _attach_notes(query_response, str(request.workspace_id))
+
     # ── Step 5: Render markdown blob ──────────────────────────────────────────
     render_to_markdown(query_response)
     # ADR-0049 O5a-5: expose raw markdown without double-encoding.
@@ -457,3 +460,36 @@ def _symbol_from_file(file_path: str | None) -> str | None:
     if "." in base:
         base = base.rsplit(".", 1)[0]
     return base or None
+
+
+# ── ADR-0052 P6: per-entity sticky notes ─────────────────────────────────────
+
+async def _attach_notes(response: QueryResponse, workspace_id: str) -> None:
+    """Bulk-fetch sticky notes for every URN the response cites.
+
+    Best-effort: if the entity_notes table doesn't exist (rebuilt prod from
+    a pre-V14 dump) or asyncpg can't connect, we leave ``response.notes``
+    empty and log at debug level so /query still answers.
+    """
+    urns: set[str] = set()
+    for c in response.affected_entities:
+        if c.urn:
+            urns.add(c.urn)
+    for step in response.call_chain:
+        if step.urn:
+            urns.add(step.urn)
+    if not urns:
+        return
+    try:
+        from companybrain.harness import notes as notes_mod
+        by_urn = await notes_mod.list_notes_for_urns(
+            workspace_id=workspace_id,
+            entity_urns=urns,
+        )
+    except Exception as exc:
+        log.debug("[query] notes lookup skipped", error=str(exc))
+        return
+    out: list[dict] = []
+    for urn in sorted(by_urn):
+        out.extend(notes_mod.render_for_query(by_urn[urn]))
+    response.notes = out

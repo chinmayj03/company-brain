@@ -427,6 +427,7 @@ class CodeTracer:
     ) -> None:
         self._workspace_id = workspace_id
         self._structural: Optional[object] = None  # StructuralIndexHelper, type-erased to avoid hard dep
+        self._specialist_skip_dto: list[str] = []  # populated by _trace_java_specialist
 
         if workspace_id and db_url:
             try:
@@ -645,12 +646,119 @@ class CodeTracer:
 
     async def _trace_java(self, repo_path: Path, repo_name: str, endpoint: str, method: str = "GET") -> list[CodeUnit]:
         """
-        Agentic codebase navigation via KnowledgeNavigatorAgent.
+        ADR-0048: dispatches to SpecialistAgent (default) or KnowledgeNavigatorAgent
+        (BRAIN_USE_LEGACY_NAVIGATOR=true).
+        """
+        from companybrain.config import settings as _settings
+        if not _settings.use_legacy_navigator:
+            return await self._trace_java_specialist(repo_path, repo_name, endpoint, method)
+        return await self._trace_java_legacy(repo_path, repo_name, endpoint, method)
 
-        The agent is language-agnostic: it uses read_file, find_class, search_code,
-        and extract_method tools in a ReAct loop to navigate the full call chain.
-        It understands any architecture pattern (Spring MVC, hexagonal, CQRS, DDD,
-        FastAPI, NestJS, etc.) because the LLM does the structural reasoning.
+    async def _trace_java_specialist(self, repo_path: Path, repo_name: str, endpoint: str, method: str = "GET") -> list[CodeUnit]:
+        """ADR-0048: single SpecialistAgent call replaces 26-turn ReAct loop."""
+        from companybrain.agents.tools.code_tools import find_entry_handler
+        from companybrain.agents.specialist_agent import SpecialistAgent
+
+        # Step 1: entry handler (cheap regex, no LLM)
+        entry = find_entry_handler(endpoint, method, str(repo_path))
+        if not entry:
+            routes = discover_routes(repo_path)
+            log.error(
+                "SpecialistAgent: no Java handler found",
+                endpoint=endpoint, http_method=method, routes_in_repo=len(routes),
+            )
+            raise NoMatchingEndpointError(endpoint, method, routes)
+
+        entry_file_str = entry["file"]
+        entry_method_name = entry.get("method", "")
+
+        # Step 2: build candidate manifest from hybrid searcher (top 20 files)
+        candidates: list[tuple[str, str, int]] = []
+        try:
+            searcher = _get_hybrid_searcher()
+            hits = await searcher.search(
+                query=endpoint,
+                repo_name=repo_name,
+                repo_path=str(repo_path),
+                top_k=20,
+            )
+            for hit in hits:
+                p = Path(hit.path) if hasattr(hit, "path") else None
+                if p is None:
+                    continue
+                size_kb = int(p.stat().st_size / 1024) if p.exists() else 0
+                role = _infer_role(p.stem)
+                candidates.append((str(p), role, size_kb))
+        except Exception as exc:
+            log.warning("SpecialistAgent: hybrid search failed, using entry file only", error=str(exc))
+            candidates = [(entry_file_str, "controller", 0)]
+
+        # Step 3: SpecialistAgent — ONE LLM call
+        plan = await SpecialistAgent().plan(
+            endpoint=endpoint,
+            http_method=method,
+            entry_handler_path=entry_file_str,
+            candidate_files=candidates,
+        )
+
+        # Step 4: convert plan → CodeUnit list
+        units: list[CodeUnit] = []
+        seen_paths: set[str] = set()
+        for entry_plan in plan.plan:
+            raw_file = entry_plan.get("file", "")
+            if not raw_file:
+                continue
+            try:
+                abs_path = str(Path(raw_file).resolve())
+            except (OSError, RuntimeError):
+                abs_path = raw_file
+            if abs_path in seen_paths:
+                continue
+            seen_paths.add(abs_path)
+            role = entry_plan.get("role", _infer_role(Path(raw_file).stem))
+            units.append(CodeUnit(
+                file_path=abs_path,
+                repo_name=repo_name,
+                role=role,
+                language="java",
+                class_name=Path(raw_file).stem,
+                imports=[],
+                discovery_reason=entry_plan.get("reason", "specialist_plan"),
+                relevance_score=float(entry_plan.get("relevance", 0.8)),
+            ))
+
+        # Stash skip_dto list on the tracer for the orchestrator to pick up
+        self._specialist_skip_dto: list[str] = plan.skip_dto
+
+        if not units:
+            # Fallback: return just the handler file
+            try:
+                abs_entry = str(Path(entry_file_str).resolve())
+            except (OSError, RuntimeError):
+                abs_entry = entry_file_str
+            units = [CodeUnit(
+                file_path=abs_entry,
+                repo_name=repo_name,
+                role="controller",
+                language="java",
+                class_name=Path(entry_file_str).stem,
+                imports=[],
+                discovery_reason="specialist_fallback",
+                relevance_score=1.0,
+            )]
+
+        log.info(
+            "SpecialistAgent trace complete",
+            endpoint=endpoint,
+            units=len(units),
+            skip_dto=len(self._specialist_skip_dto),
+            entry_method=entry_method_name,
+        )
+        return units
+
+    async def _trace_java_legacy(self, repo_path: Path, repo_name: str, endpoint: str, method: str = "GET") -> list[CodeUnit]:
+        """
+        Original KnowledgeNavigatorAgent ReAct loop (kept behind BRAIN_USE_LEGACY_NAVIGATOR=true).
 
         Strategy:
         1. Fast regex-based handler discovery to find the entry file + method (no LLM).

@@ -520,12 +520,20 @@ async def run_pipeline(
                     batches=len(_batches),
                 )
 
-                # Drain the queue with parallel workers
-                _chunk_results = await drain_queue(
-                    job_id=job_id,
-                    workspace_id=request.workspace_id,
-                    max_workers=_adr44_settings.chunk_queue_max_workers,
-                )
+                # ADR-0048: route drain through ContextAgent unless legacy flag set
+                if not _adr44_settings.use_legacy_navigator:
+                    from companybrain.pipeline.worker import drain_queue_batched
+                    _chunk_results = await drain_queue_batched(
+                        job_id=job_id,
+                        workspace_id=request.workspace_id,
+                        batch_size=_adr44_settings.context_agent_batch_size,
+                    )
+                else:
+                    _chunk_results = await drain_queue(
+                        job_id=job_id,
+                        workspace_id=request.workspace_id,
+                        max_workers=_adr44_settings.chunk_queue_max_workers,
+                    )
 
                 # Collect raw entities + edges from all chunk results
                 _raw_chunk_entities, _raw_chunk_edges = collect_entities_and_edges(_chunk_results)
@@ -577,6 +585,29 @@ async def run_pipeline(
                     for ce in _merged
                 ]
                 entities = extractor._deduplicate(fresh_entities + entities)
+
+                # ADR-0048: emit structural Class entities for DTO fast-path
+                if not _adr44_settings.use_legacy_navigator:
+                    _tracer = getattr(focal_context, "_tracer", None)
+                    _skip_dtos: list[str] = []
+                    # The tracer stores skip_dto on self; retrieve via code_units if available
+                    for _unit in focal_context.code_units:
+                        _tracer_obj = getattr(_unit, "_tracer_ref", None)
+                        if _tracer_obj and hasattr(_tracer_obj, "_specialist_skip_dto"):
+                            _skip_dtos = _tracer_obj._specialist_skip_dto
+                            break
+                    # Also check request for repo_path to locate DTO files
+                    _repo_path_for_dto = ""
+                    if request.repos:
+                        _repo_path_for_dto = request.repos[0].get("path", "")
+                    if _skip_dtos and _repo_path_for_dto:
+                        from companybrain.pipeline.entity_extractor import _entities_from_dto_plan
+                        _dto_entities = _entities_from_dto_plan(
+                            _skip_dtos, _repo_path_for_dto, _repo_name,
+                        )
+                        if _dto_entities:
+                            entities = extractor._deduplicate(entities + _dto_entities)
+                            log.info("ADR-0048 DTO fast-path", dto_count=len(_dto_entities))
 
                 await progress(
                     "1", "✅",

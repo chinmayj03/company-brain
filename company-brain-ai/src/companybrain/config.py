@@ -257,5 +257,14 @@ class Settings(BaseSettings):
     # M5: controllers larger than this get a skeleton input instead of full text.
     adr0050_skeleton_threshold_bytes: int = 50_000
 
+    # ── ADR-0051 P1: agentic harness migration ───────────────────────────────
+    # When True, run_pipeline() delegates to companybrain.harness.HarnessLoop
+    # instead of the linear stage machine in this file. The harness wraps the
+    # existing pipeline tools (discover_routes, find_entry_handler, ContextAgent,
+    # write_to_brain, etc.) and lets the model decide call order.
+    # Override via env var: BRAIN_USE_HARNESS=true. Default false until the P4
+    # acceptance suite is green for two weeks (per ADR-0051).
+    use_harness: bool = False
+
 
 settings = Settings()

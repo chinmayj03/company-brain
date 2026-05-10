@@ -123,6 +123,14 @@ async def run_pipeline(
         workspace=request.workspace_id,
     )
 
+    # ── ADR-0051 P1: optional agentic-harness path ────────────────────────────
+    # When BRAIN_USE_HARNESS=true (or settings.use_harness=True), delegate the
+    # whole run to the prompt-controlled HarnessLoop. The legacy linear stage
+    # machine below stays intact as the default until the P4 acceptance suite
+    # is green for two weeks.
+    if _harness_enabled():
+        return await _run_via_harness(request, job_id=job_id, on_progress=on_progress)
+
     try:
         repos = [_repo_dict(r) for r in request.repos]
 
@@ -2066,3 +2074,109 @@ _ENTITY_TYPE_MAP: dict[str, str] = {
     "business_context":   "business_context",
     "function_node":      "function_node",
 }
+
+
+# ── ADR-0051 Phase 1: optional agentic-harness path ──────────────────────────
+# Kept at the bottom so the legacy code above is untouched. The module-level
+# `if _harness_enabled():` check at the top of run_pipeline() delegates to
+# _run_via_harness() when the flag is set; otherwise the legacy path runs.
+
+def _harness_enabled() -> bool:
+    """True when BRAIN_USE_HARNESS=true OR settings.use_harness is True.
+
+    Env var wins so operators can flip it without restarting the worker via a
+    code path that recomputes Settings.
+    """
+    if os.environ.get("BRAIN_USE_HARNESS", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    try:
+        from companybrain.config import settings as _adr0051_settings
+        return bool(getattr(_adr0051_settings, "use_harness", False))
+    except Exception:
+        return False
+
+
+async def _run_via_harness(
+    request: PipelineStartRequest,
+    *,
+    job_id: str,
+    on_progress: ProgressFn | None,
+) -> PipelineResult:
+    """Delegate the entire pipeline run to the HarnessLoop.
+
+    Phase-1 scope: the harness wraps the existing tools (discover_routes,
+    find_entry_handler, list_candidate_files, ContextAgent extraction,
+    write_to_brain, finalize_brain). It returns one PipelineResult shaped
+    like the legacy path's so downstream callers (Java callback, FastAPI
+    response, tests) need no changes.
+    """
+    from companybrain.harness import HarnessLoop
+    from companybrain.util.file_cache import FileCache
+
+    repo = request.repos[0] if request.repos else None
+    repo_path = (repo.local_path or repo.url) if repo else ""
+
+    if on_progress:
+        await on_progress("harness", "🤖", "Delegating to HarnessLoop (ADR-0051 P1)",
+                          {"endpoint": request.endpoint_path, "method": request.http_method})
+
+    context: dict = {
+        "request":         request,
+        "workspace_id":    request.workspace_id,
+        "endpoint_path":   request.endpoint_path,
+        "http_method":     request.http_method,
+        "repo_path":       repo_path,
+        "branch":          request.branch,
+        "job_id":          job_id,
+        "run_id":          job_id,
+        "file_cache":      FileCache(),
+    }
+
+    user_message = (
+        f"Extract {request.http_method} {request.endpoint_path} "
+        f"from the repository at {repo_path}.\n\n"
+        f"Workspace: {request.workspace_id}.\n"
+        f"Follow the canonical pipeline in the system prompt unless you have a "
+        f"clear reason to deviate. Persist results via write_to_brain and call "
+        f"finalize_brain exactly once at the end."
+    )
+
+    harness_result = await HarnessLoop().run(user_message, context=context)
+
+    log.info(
+        "harness.done",
+        job_id=job_id,
+        iterations=harness_result.iterations,
+        tool_calls=harness_result.tool_call_count,
+        tool_calls_ok=harness_result.succeeded_tool_calls,
+        wall_time_seconds=harness_result.telemetry.get("wall_time_seconds"),
+    )
+
+    entity_count = 0
+    edge_count = 0
+    store = context.get("brain_store")
+    if store is not None:
+        try:
+            async for _ in store.list_ids():
+                entity_count += 1
+        except Exception:   # noqa: BLE001 — telemetry must not break the run
+            pass
+
+    return PipelineResult(
+        job_id=job_id,
+        workspace_id=request.workspace_id,
+        endpoint_path=request.endpoint_path,
+        entity_count=entity_count,
+        edge_count=edge_count,
+        gap_count=0,
+        status="completed",
+        files_traced=[],
+        stages_summary=[{"stage": "harness", "summary": harness_result.final_text[:400]}],
+        telemetry={
+            "harness": harness_result.telemetry,
+            "tool_calls": [
+                {"name": c["name"], "ok": c.get("ok", False)}
+                for c in harness_result.tool_calls
+            ],
+        },
+    )

@@ -862,6 +862,35 @@ async def run_pipeline(
             total=len(relationships), structural=len(structural_rels), llm=len(llm_relationships),
         )
 
+        # ── Stage 2.5: Reachability filter (drop entity drift) ────────────────
+        # Audit on the network-iq-backend-java extraction showed ~48% of
+        # entities were unrelated drift (Configuration*, Specialty*, sibling
+        # endpoints) pulled in by aggressive navigator / import-graph traversal.
+        # BFS from the entry endpoint via structural edges; drop everything
+        # not reached. Skippable via BRAIN_SKIP_REACHABILITY_FILTER=true if
+        # an operator wants the unfiltered superset.
+        from companybrain.pipeline.reachability_filter import filter_to_reachable
+
+        if os.environ.get("BRAIN_SKIP_REACHABILITY_FILTER", "").lower() != "true":
+            entities, relationships, _reach_stats = filter_to_reachable(
+                entities, relationships,
+                endpoint_path=request.endpoint_path,
+                http_method=request.http_method,
+            )
+            stages_summary.append({
+                "stage": "2.5",
+                "label": "Reachability Filter",
+                **_reach_stats,
+            })
+            if _reach_stats.get("dropped", 0) > 0:
+                await progress(
+                    "2.5", "✂️",
+                    f"Reachability filter: kept {_reach_stats['reachable']}/{_reach_stats['total']} entities, "
+                    f"dropped {_reach_stats['dropped']} drift",
+                    **{k: v for k, v in _reach_stats.items()
+                       if k in ("total", "reachable", "dropped")},
+                )
+
         # ── Stage 3: Business context synthesis ───────────────────────────────
         await progress("3", "📖", "Context synthesis — explaining WHY each entity exists (using git history)")
 

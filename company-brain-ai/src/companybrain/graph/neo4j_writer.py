@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-import re
 from typing import Any, Optional
 
 import structlog
@@ -185,15 +184,14 @@ _CONFIDENCE_SCORE: dict[str, float] = {
     "low":    0.4,
 }
 
-# Allowed chars in URN segments (mirrors urn.ts ALLOWED_CHARS)
-_URN_ALLOWED = re.compile(r"^[A-Za-z0-9/_.:@\-]+$")
+_URN_SAFE = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/_.:@-")
 
 
 # ── URN helpers ───────────────────────────────────────────────────────────────
 
 def _sanitize_urn_segment(segment: str) -> str:
     """Replace characters not allowed in URN segments with underscores."""
-    return re.sub(r"[^A-Za-z0-9/_.:@\-]", "_", segment)
+    return "".join(c if c in _URN_SAFE else "_" for c in segment)
 
 
 def build_llm_urn(workspace_id: str, file_path: str, entity_name: Optional[str] = None) -> str:

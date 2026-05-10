@@ -202,6 +202,119 @@ async def drain_queue(
     return results
 
 
+async def drain_queue_batched(
+    job_id: str,
+    workspace_id: str,
+    batch_size: int = 8,
+) -> list[ChunkResult]:
+    """ADR-0048: drain the queue using ContextAgent in class-grouped batches.
+
+    Instead of one worker-per-chunk, this path:
+    1. Fetches ALL pending chunks for the job in one query.
+    2. Groups them by file_path (same-class siblings first).
+    3. Sends each group to ContextAgent.extract_batch in slices of batch_size.
+    4. Returns ChunkResult-compatible objects for the existing merger.
+
+    Falls back to the standard per-chunk drain if ContextAgent import fails.
+    """
+    from companybrain.pipeline import queue as _q
+    from companybrain.agents.context_agent import ContextAgent, ContextAgentResult
+    from companybrain.pipeline.chunk_extractor import ChunkResult as CR, ExtractedChunkEntity, ExtractedEdge
+
+    # Pull all pending chunks for this job in one DB round-trip
+    conn = await _q._get_conn()
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT id, workspace_id, job_id, repo, file_path, qname,
+                   body_hash, chunk_kind, header_context, import_context,
+                   body, attempt_count, language
+            FROM extraction_queue
+            WHERE job_id = $1 AND workspace_id = $2 AND status = 'pending'
+            ORDER BY file_path, qname
+            """,
+            job_id, workspace_id,
+        )
+    finally:
+        await conn.close()
+
+    if not rows:
+        log.info("drain_queue_batched: no pending chunks", job_id=job_id)
+        return []
+
+    # Convert to QueueChunk objects
+    queue_chunks: list[QueueChunk] = [
+        QueueChunk(
+            id=str(r["id"]),
+            workspace_id=r["workspace_id"],
+            job_id=r["job_id"],
+            repo=r["repo"],
+            file_path=r["file_path"],
+            qname=r["qname"],
+            body_hash=r["body_hash"],
+            chunk_kind=r["chunk_kind"],
+            header_context=r["header_context"] or "",
+            import_context=r["import_context"] or "",
+            body=r["body"] or "",
+            attempt_count=r["attempt_count"],
+            language=r["language"] or "",
+        )
+        for r in rows
+    ]
+
+    # Group by file_path
+    from collections import defaultdict
+    by_file: dict[str, list[QueueChunk]] = defaultdict(list)
+    for qc in queue_chunks:
+        by_file[qc.file_path].append(qc)
+
+    agent = ContextAgent()
+    all_results: list[ChunkResult] = []
+
+    for file_path, file_chunks in by_file.items():
+        # Slice into batches of batch_size
+        for batch_start in range(0, len(file_chunks), batch_size):
+            batch_qchunks = file_chunks[batch_start:batch_start + batch_size]
+            method_chunks = [_queue_chunk_to_method_chunk(qc) for qc in batch_qchunks]
+
+            try:
+                agent_results: list[ContextAgentResult] = await agent.extract_batch(method_chunks)
+            except Exception as exc:
+                log.error("drain_queue_batched: ContextAgent failed", error=str(exc), file_path=file_path)
+                # Mark all chunks in this batch as failed
+                for qc in batch_qchunks:
+                    await mark_failed(qc.id, str(exc))
+                continue
+
+            # Persist results
+            for qc, mc, ar in zip(batch_qchunks, method_chunks, agent_results):
+                entity = ar.entity if ar else None
+                edges = ar.edges if ar else []
+                try:
+                    await mark_done(qc.id, cost_usd=ar.cost_usd if ar else 0.0,
+                                    input_tokens=ar.input_tokens if ar else 0,
+                                    output_tokens=ar.output_tokens if ar else 0)
+                except Exception as exc:
+                    log.warning("drain_queue_batched: mark_done failed", qname=qc.qname, error=str(exc))
+
+                all_results.append(ChunkResult(
+                    chunk=mc,
+                    entity=entity,
+                    edges=edges,
+                    cost_usd=ar.cost_usd if ar else 0.0,
+                    input_tokens=ar.input_tokens if ar else 0,
+                    output_tokens=ar.output_tokens if ar else 0,
+                ))
+
+    log.info(
+        "drain_queue_batched.complete",
+        job_id=job_id,
+        total_chunks=len(queue_chunks),
+        results=len(all_results),
+    )
+    return all_results
+
+
 def collect_entities_and_edges(
     results: list[ChunkResult],
 ) -> tuple[list, list]:

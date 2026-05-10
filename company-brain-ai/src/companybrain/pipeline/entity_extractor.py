@@ -1497,3 +1497,84 @@ def _entities_from_trivial_pojo(unit: "CodeUnit") -> "list[ExtractedEntity]":
         fields=len(entities) - 1,
     )
     return entities
+
+
+def _entities_from_dto_plan(
+    skip_dto_names: list[str],
+    repo_path: str,
+    repo_name: str,
+) -> "list[ExtractedEntity]":
+    """Emit Class entities for DTOs the SpecialistAgent flagged as structural-only.
+
+    No LLM call. For each DTO name in skip_dto_names, locates the .java file
+    and emits a Class entity via the trivial-POJO fast-path so the graph
+    still records the DTO's existence + field list.
+    """
+    from companybrain.models.entities import ExtractedEntity
+    from pathlib import Path as _Path
+
+    out: list[ExtractedEntity] = []
+    for dto_name in skip_dto_names:
+        # Find the Java file for this DTO class name
+        try:
+            root = _Path(repo_path)
+            matches = list(root.rglob(f"{dto_name}.java"))
+        except (OSError, RuntimeError):
+            matches = []
+
+        if not matches:
+            # Emit a minimal stub so the graph node exists
+            out.append(ExtractedEntity(
+                entity_type="Class",
+                name=dto_name,
+                file="",
+                repo=repo_name,
+                signature=f"class {dto_name}",
+                last_modified_commit="",
+                confidence=0.8,
+                structural_purpose="specialist_dto_skip",
+                code_snippet="",
+            ))
+            continue
+
+        # Use the first match; prefer src/main over test
+        target = next(
+            (m for m in matches if "test" not in str(m).lower()),
+            matches[0],
+        )
+
+        # Re-use existing trivial-POJO extraction logic
+        class DtoUnit:
+            file_path = str(target)
+            repo_name = repo_name
+            commit_sha = ""
+
+            @property
+            def content(self) -> str:
+                try:
+                    return target.read_text(errors="ignore")
+                except OSError:
+                    return ""
+
+            def brief(self) -> str:
+                return f"dto/{dto_name}"
+
+        dto_entities = _entities_from_trivial_pojo(DtoUnit())  # type: ignore[arg-type]
+        if dto_entities:
+            out.extend(dto_entities)
+        else:
+            # Fallback stub
+            out.append(ExtractedEntity(
+                entity_type="Class",
+                name=dto_name,
+                file=str(target),
+                repo=repo_name,
+                signature=f"class {dto_name}",
+                last_modified_commit="",
+                confidence=0.9,
+                structural_purpose="specialist_dto_skip",
+                code_snippet="",
+            ))
+
+    log.debug("_entities_from_dto_plan", dto_names=skip_dto_names, emitted=len(out))
+    return out

@@ -238,5 +238,13 @@ class Settings(BaseSettings):
     # Adds ~200ms per query but dramatically improves subgraph selection.
     enable_intent_router: bool = True
 
+    # ── ADR-0048: two-agent batched extraction ────────────────────────────────
+    # Number of methods sent in one ContextAgent batch call.
+    # Higher = fewer LLM calls, more context per call. Tune via Langfuse p95.
+    context_agent_batch_size: int = 8
+    # BRAIN_USE_LEGACY_NAVIGATOR=true → restore KnowledgeNavigatorAgent ReAct loop.
+    # Keep as fallback while two-agent path stabilises.
+    use_legacy_navigator: bool = False
+
 
 settings = Settings()

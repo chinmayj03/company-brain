@@ -1,17 +1,26 @@
 """Unit tests for pipeline/structural_prepass.py (ADR-0011)."""
+import os
+from pathlib import Path
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from companybrain.pipeline.structural_prepass import run_structural_prepass, _local_structural_hash
 from companybrain.collectors.code_tracer import FocalContext, CodeUnit
 
+# Tests use repo_path="/tmp/pilot"; files must exist there so the lazy
+# content property can read them. ADR-0045: CodeUnit.content reads from disk.
+_REPO_ROOT = "/tmp/pilot"
+
 
 def _make_unit(file_path: str, content: str, language: str = "java") -> CodeUnit:
+    """Write content to {_REPO_ROOT}/{file_path} and return a CodeUnit with absolute path."""
+    abs_path = os.path.join(_REPO_ROOT, file_path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    Path(abs_path).write_text(content, encoding="utf-8")
     return CodeUnit(
-        file_path=file_path,
+        file_path=abs_path,
         repo_name="pilot",
         role="service",
         class_name=file_path.split("/")[-1].replace(".java", "").replace(".py", ""),
-        content=content,
         language=language,
     )
 

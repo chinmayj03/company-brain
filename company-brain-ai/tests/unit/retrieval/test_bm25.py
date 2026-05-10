@@ -1,6 +1,8 @@
 import pytest
 from pathlib import Path
 
+pytest.importorskip("bm25s", reason="bm25s not installed — skip BM25 index tests")
+
 from companybrain.retrieval.bm25_index import Bm25Index
 
 

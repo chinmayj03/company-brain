@@ -6,22 +6,39 @@ deduplication, and severity/confidence values.
 """
 from __future__ import annotations
 
+import atexit
+import shutil
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from companybrain.collectors.code_tracer import CodeUnit
 from companybrain.pipeline.assumption_miner import mine_assumptions
 from companybrain.store.base import BrainEntity
 
+# Module-level temp dir — cleaned up when the process exits.
+_TMP = tempfile.mkdtemp(prefix="test_assumption_miner_")
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
+_COUNTER = iter(range(10_000))
+
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
 def _unit(content: str, file_path: str = "UserCard.tsx") -> CodeUnit:
+    """Write content to a real file and return a CodeUnit pointing at it.
+
+    ADR-0045: CodeUnit.content is a lazy file read; a real file must exist
+    for mine_assumptions (which reads unit.content) to see the source.
+    """
+    ext = Path(file_path).suffix or ".tsx"
+    fp = Path(_TMP) / f"{next(_COUNTER)}{ext}"
+    fp.write_text(content, encoding="utf-8")
     return CodeUnit(
-        file_path=file_path,
+        file_path=str(fp),
         repo_name="r",
         role="component",
         language="typescript",
-        content=content,
         class_name="UserCard",
     )
 

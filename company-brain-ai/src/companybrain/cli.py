@@ -136,9 +136,9 @@ async def _index_async(*, repo_path: Path, branch: str, workspace_id: str,
         endpoint="*",
         method="REPO",
         code_units=[
-            CodeUnit(file_path=str(p), repo_name=repo_name, role="unknown",
-                     class_name=p.stem, content=p.read_text(errors="replace"),
-                     language=_lang_for(p))
+            # ADR-0045: absolute path, no content — chunker reads from disk
+            CodeUnit(file_path=str(p.resolve()), repo_name=repo_name, role="unknown",
+                     class_name=p.stem, language=_lang_for(p))
             for p in walk_repo(repo_path)
         ],
     )
@@ -209,9 +209,9 @@ async def _map_async(file: Path, repo: Path, workspace_id: str, repo_name: str) 
         endpoint=str(file),
         method="MAP",
         code_units=[CodeUnit(
-            file_path=str(file), repo_name=repo_name, role="unknown",
-            class_name=file.stem, content=file.read_text(errors="replace"),
-            language=_lang_for(file),
+            # ADR-0045: absolute path, no content — chunker reads from disk
+            file_path=str(file.resolve()), repo_name=repo_name, role="unknown",
+            class_name=file.stem, language=_lang_for(file),
         )],
     )
     prepass = await run_structural_prepass(

@@ -6,18 +6,34 @@ that MethodChunk objects are produced with the correct bodies and header_context
 """
 from __future__ import annotations
 
+import atexit
+import shutil
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from companybrain.pipeline.code_chunker import CodeChunker, MethodChunk, _sha256
 
+# Module-level temp dir — cleaned up when the process exits.
+_TMP = tempfile.mkdtemp(prefix="test_code_chunker_")
+atexit.register(shutil.rmtree, _TMP, ignore_errors=True)
+
 
 def _unit(content: str, language: str, class_name: str = "TestClass") -> SimpleNamespace:
+    """Write content to a real file and return a SimpleNamespace pointing at it.
+
+    ADR-0045: chunk_unit reads from unit.file_path, so the path must resolve
+    to a real file on disk.
+    """
+    ext = {"java": ".java", "python": ".py", "typescript": ".ts",
+           "go": ".go", "sql": ".sql"}.get(language, f".{language[:4]}")
+    fp = Path(_TMP) / f"{class_name}{ext}"
+    fp.write_text(content, encoding="utf-8")
     return SimpleNamespace(
-        content=content,
         language=language,
-        file_path=f"{class_name}.{language[:4]}",
+        file_path=str(fp),
         class_name=class_name,
         repo_name="test-repo",
         role="service",
@@ -261,7 +277,7 @@ def test_chunk_kind_is_valid():
     chunker = CodeChunker()
     unit = _unit(_JAVA_FIXTURE, "java", "OrderService")
     for chunk in chunker.chunk_unit(unit):
-        assert chunk.kind in ("method", "top_decl", "schema_block")
+        assert chunk.kind in ("method", "top_decl", "schema_block", "unreadable_file")
 
 
 def test_import_context_capped_at_50_lines():

@@ -205,22 +205,19 @@ class ExtractionLoop:
                 rel_path = str(candidate_path.relative_to(self._root))
                 if rel_path in seen_files:
                     continue
-                try:
-                    content = candidate_path.read_text(encoding="utf-8", errors="ignore")
-                    # Determine role heuristically from file path
-                    role = _infer_role(rel_path)
-                    unit = CodeUnit(
-                        file_path=rel_path,
-                        repo_name=repo_name,
-                        role=role,
-                        language=language,
-                        content=content[:8_000],  # cap at MAX_UNIT_CHARS
-                    )
-                    new_units.append(unit)
-                    log.debug("[extraction-loop] Loaded candidate file", path=rel_path)
-                    break
-                except (OSError, IOError):
+                if not candidate_path.exists():
                     continue
+                # ADR-0045: absolute path, no content — chunker reads from disk
+                role = _infer_role(rel_path)
+                unit = CodeUnit(
+                    file_path=str(candidate_path.resolve()),
+                    repo_name=repo_name,
+                    role=role,
+                    language=language,
+                )
+                new_units.append(unit)
+                log.debug("[extraction-loop] Loaded candidate file", path=rel_path)
+                break
 
         return new_units
 

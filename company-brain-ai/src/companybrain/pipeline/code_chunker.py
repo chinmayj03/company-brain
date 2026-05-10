@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import structlog
@@ -31,13 +32,29 @@ log = structlog.get_logger(__name__)
 
 CHUNK_BODY_LIMIT = 50_000   # chars; bodies larger than this are recursively split
 
+# Truncation markers produced by the old _trim_content / _best_source paths.
+# If the chunker sees these in a file it just read from disk, an upstream caller
+# is still slicing content before writing it — that violates ADR-0045.
+_TRUNCATION_MARKERS = ("// ... (truncated)", "# ... (truncated)", "/* ... (truncated)")
+
+
+class TruncatedContentError(RuntimeError):
+    """Raised (D4) when the chunker detects pre-truncated content on disk."""
+    def __init__(self, path: str):
+        super().__init__(
+            f"Chunker received pre-truncated content from {path!r}. "
+            "An upstream caller is still slicing file content before writing it to disk. "
+            "Pass file_path through unmodified — do not cap or trim before the chunker reads."
+        )
+        self.path = path
+
 
 @dataclass
 class MethodChunk:
     """One LLM-sized chunk representing a single method or top-level declaration."""
     file_path: str
     qname: str                  # "ClassName.methodName" or top-level function name
-    kind: Literal["method", "top_decl", "schema_block"]
+    kind: Literal["method", "top_decl", "schema_block", "unreadable_file"]
     body: str                   # verbatim, no truncation
     header_context: str         # class header + fields + annotations
     import_context: str         # deduped, capped at 50 lines
@@ -75,15 +92,49 @@ class CodeChunker:
     def chunk_unit(self, unit) -> list[MethodChunk]:
         """
         Split a CodeUnit into MethodChunk objects.
-        Falls back to a single whole-file chunk if splitting is not possible.
+
+        ADR-0045 D2: reads file content directly from unit.file_path — never
+        trusts unit.content so that pre-truncation by upstream callers is
+        impossible.  Falls back to a single whole-file chunk when parsing fails.
         """
-        content = unit.content or ""
+        file_path = str(unit.file_path or "")
+        lang = (unit.language or "").lower()
+        class_name = unit.class_name or _stem(file_path)
+
+        # D2: read the real file from disk — bypass any cached/trimmed content
+        try:
+            raw = Path(file_path).read_text(errors="ignore")
+        except OSError as exc:
+            log.warning("[code-chunker] cannot read file — emitting unreadable_file chunk",
+                        path=file_path, error=str(exc))
+            return [MethodChunk(
+                file_path=file_path,
+                qname=class_name,
+                kind="unreadable_file",
+                body="",
+                header_context="",
+                import_context="",
+                body_hash="",
+                language=lang,
+            )]
+
+        # D4: loud failure if the file on disk is itself truncated
+        # (means an upstream caller wrote a truncated version)
+        if any(raw.endswith(marker) for marker in _TRUNCATION_MARKERS) and len(raw) < 8_000:
+            log.error(
+                "Chunker received truncated content on disk — refusing to chunk; "
+                "an upstream caller still slices file content. "
+                "Pass file_path through unmodified.",
+                path=file_path,
+                raw_len=len(raw),
+            )
+            raise TruncatedContentError(file_path)
+
+        log.debug("chunker.read_file_directly", path=file_path, len=len(raw))
+
+        content = raw
         if not content.strip():
             return []
-
-        lang = (unit.language or "").lower()
-        file_path = str(unit.file_path or "")
-        class_name = unit.class_name or _stem(file_path)
 
         chunks = self._split(content, lang, file_path, class_name)
         if not chunks:
@@ -167,10 +218,11 @@ class CodeChunker:
     ) -> list[MethodChunk]:
         try:
             from companybrain.pipeline.method_chunker import MethodChunker
-            from companybrain.collectors.code_tracer import CodeUnit as _CU
+            from types import SimpleNamespace
 
-            # Build a minimal CodeUnit for the existing MethodChunker
-            unit = _CU(
+            # Use SimpleNamespace (not CodeUnit) — content is already in memory here;
+            # constructing a real CodeUnit would trigger a disk read via the lazy property.
+            unit = SimpleNamespace(
                 file_path=file_path,
                 repo_name="",
                 role="service",

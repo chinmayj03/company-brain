@@ -130,14 +130,33 @@ _CODE_EXTS  = {".java", ".kt", ".ts", ".tsx", ".js", ".jsx", ".py"}
 
 @dataclass
 class CodeUnit:
-    """A single class / module that is relevant to the target endpoint."""
-    file_path: str          # relative to repo root
+    """A single class / module that is relevant to the target endpoint.
+
+    ADR-0045: file_path is the absolute path on disk. Content is never stored
+    on the unit — the chunker reads the file directly. The lazy `content`
+    property exists only for the legacy BRAIN_LEGACY_EXTRACT path; new code
+    should read unit.file_path directly.
+    """
+    file_path: str          # absolute path on disk (ADR-0045: was repo-relative)
     repo_name: str
     role: str               # controller | service | repository | model | client | component
     language: str           # java | typescript | python | javascript
-    content: str            # trimmed current source (capped at MAX_UNIT_CHARS)
     class_name: str = ""
     imports: list[str] = field(default_factory=list)
+    discovery_reason: str = ""
+    relevance_score: float = 0.0
+    _content_cache: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+
+    @property
+    def content(self) -> str:
+        """Lazy file read. Used only by the legacy extractor. Cached after first read."""
+        if self._content_cache is None:
+            try:
+                self._content_cache = Path(self.file_path).read_text(errors="ignore")
+            except OSError as exc:
+                log.warning("CodeUnit.content read failed", path=self.file_path, error=str(exc))
+                self._content_cache = ""
+        return self._content_cache
 
     def brief(self) -> str:
         """Short description for log lines."""
@@ -376,21 +395,20 @@ class CodeTracer:
             )
 
             if nodes:
-                units = []
-                for node in nodes:
-                    try:
-                        rel_path = str(Path(node.file_path).relative_to(repo_path))
-                    except ValueError:
-                        rel_path = node.file_path
-                    units.append(CodeUnit(
-                        file_path=rel_path,
+                # ADR-0045: node.file_path is already absolute (verified by NavigatorAgent).
+                # Store it directly; chunker reads the full file from disk.
+                units = [
+                    CodeUnit(
+                        file_path=str(Path(node.file_path).resolve()),
                         repo_name=repo_name,
                         role=node.role,
                         language=_detect_language_from_path(entry_file_str),
-                        content=node.to_code_unit_content(),
                         class_name=node.class_name,
                         imports=[],
-                    ))
+                        discovery_reason=node.discovery_reason,
+                    )
+                    for node in nodes
+                ]
                 return units, entry_method_name
 
             # Both agents failed — return just the handler file as a single unit
@@ -543,28 +561,24 @@ class CodeTracer:
                 repo_path, repo_name, handler_file, handler_content, [], []
             )
 
-        units: list[CodeUnit] = []
-        for node in nodes:
-            try:
-                rel_path = str(Path(node.file_path).relative_to(repo_path))
-            except ValueError:
-                rel_path = node.file_path
-            unit = CodeUnit(
-                file_path=rel_path,
+        # ADR-0045: node.file_path is absolute (verified by NavigatorAgent).
+        # Store absolute path; chunker reads full file from disk.
+        units: list[CodeUnit] = [
+            CodeUnit(
+                file_path=str(Path(node.file_path).resolve()),
                 repo_name=repo_name,
                 role=node.role,
                 language="java",
-                content=node.to_code_unit_content(),
                 class_name=node.class_name,
                 imports=[],
+                discovery_reason=node.discovery_reason,
             )
-            units.append(unit)
+            for node in nodes
+        ]
 
         log.info(
             "CodeTracer: NavigatorAgent extraction complete",
             units=len(units),
-            total_chars=sum(len(u.content) for u in units),
-            estimated_tokens=sum(len(u.content) for u in units) // 4,
             roles=[u.role for u in units],
         )
         return units
@@ -884,16 +898,17 @@ class CodeTracer:
         language: str,
         content: str,
     ) -> CodeUnit:
-        rel = str(file_path.relative_to(repo_path))
-        trimmed = _trim_content(content)
+        # ADR-0045: store absolute path so the chunker can read from disk directly.
+        # content is still read here to extract class_name/imports metadata only;
+        # it is never stored on the unit.
+        abs_path = str(file_path.resolve())
         class_name = _extract_class_name(content, language)
         imports = _extract_imports(content, language)
         return CodeUnit(
-            file_path=rel,
+            file_path=abs_path,
             repo_name=repo_name,
             role=role,
             language=language,
-            content=trimmed,
             class_name=class_name,
             imports=imports,
         )
@@ -935,27 +950,21 @@ def _knowledge_to_code_units(result, repo_path: Path, repo_name: str) -> list[Co
             candidate_paths.append(mf)
 
     def _emit(fp: str):
-        """Resolve path, read source, build CodeUnit. Returns unit or None."""
+        """Resolve path, build CodeUnit. Returns unit or None."""
         p = Path(fp)
         if not p.is_absolute():
             p = repo_path / fp
         if not p.exists():
             return None
-        try:
-            raw = p.read_text(errors="ignore")
-        except Exception:
-            return None
+        # ADR-0045: store absolute path; chunker reads the full file from disk.
         rel = str(p.relative_to(repo_path)) if p.is_absolute() else fp
         role = role_map.get(rel) or role_map.get(p.stem) or _infer_role(p.stem)
         language = _detect_language(fp)
-        agent_header = _build_agent_header(knowledge, rel, p.stem)
-        content = agent_header + "\n\n" + _trim_content(raw)
         return CodeUnit(
-            file_path=rel,
+            file_path=str(p.resolve()),
             repo_name=repo_name,
             role=role,
             language=language,
-            content=content,
             class_name=p.stem,
             imports=[],
         )

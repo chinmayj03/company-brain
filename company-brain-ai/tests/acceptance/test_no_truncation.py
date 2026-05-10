@@ -11,15 +11,20 @@ Asserts:
   4. Total body characters across all chunks cover ≥80% of the file size
      (import and class header are counted once in header_context, not bodies).
 
+ADR-0045 update: the chunker now reads from disk (not from unit.content), so
+each test writes a real .java file to tmp_path via _make_unit().
+
 This test does NOT make LLM calls — it validates the chunking layer only,
 which is the structural guarantee that makes per-chunk extraction complete.
 """
 from __future__ import annotations
 
 import textwrap
+from pathlib import Path
 
 import pytest
 
+from companybrain.collectors.code_tracer import CodeUnit
 from companybrain.pipeline.code_chunker import CodeChunker, _sha256
 
 
@@ -72,19 +77,28 @@ def _generate_large_java_class(num_methods: int = 30) -> tuple[str, list[str]]:
     return content, columns
 
 
-class _FakeUnit:
-    def __init__(self, content: str, language: str = "java", class_name: str = "ReportingRepository"):
-        self.content = content
-        self.language = language
-        self.class_name = class_name
-        self.file_path = f"{class_name}.java"
-        self.repo_name = "test-repo"
-        self.role = "repository"
+def _make_unit(content: str, tmp_path: Path, language: str = "java",
+               class_name: str = "ReportingRepository") -> CodeUnit:
+    """Write content to a real file and return a CodeUnit pointing at it.
+
+    ADR-0045: the chunker reads from disk, so the unit must carry an absolute
+    path to a real file — not an in-memory content string.
+    """
+    ext = {"java": ".java", "python": ".py", "typescript": ".ts"}.get(language, ".java")
+    fp = tmp_path / f"{class_name}{ext}"
+    fp.write_text(content, encoding="utf-8")
+    return CodeUnit(
+        file_path=str(fp),
+        repo_name="test-repo",
+        role="repository",
+        class_name=class_name,
+        language=language,
+    )
 
 
-def test_chunker_produces_30_chunks_from_30_method_class():
+def test_chunker_produces_30_chunks_from_30_method_class(tmp_path):
     content, columns = _generate_large_java_class(30)
-    unit = _FakeUnit(content)
+    unit = _make_unit(content, tmp_path)
     chunker = CodeChunker()
     chunks = chunker.chunk_unit(unit)
 
@@ -94,10 +108,10 @@ def test_chunker_produces_30_chunks_from_30_method_class():
     )
 
 
-def test_every_column_surfaces_in_chunk_bodies():
+def test_every_column_surfaces_in_chunk_bodies(tmp_path):
     """No column name is lost — every method body must appear in at least one chunk."""
     content, columns = _generate_large_java_class(30)
-    unit = _FakeUnit(content)
+    unit = _make_unit(content, tmp_path)
     chunker = CodeChunker()
     chunks = chunker.chunk_unit(unit)
 
@@ -109,12 +123,12 @@ def test_every_column_surfaces_in_chunk_bodies():
     )
 
 
-def test_chunk_bodies_cover_sufficient_content():
+def test_chunk_bodies_cover_sufficient_content(tmp_path):
     """Total body chars across all chunks must cover ≥80% of the file content."""
     content, _ = _generate_large_java_class(30)
     assert len(content) >= 30_000, f"Fixture too small: {len(content)} chars"
 
-    unit = _FakeUnit(content)
+    unit = _make_unit(content, tmp_path)
     chunker = CodeChunker()
     chunks = chunker.chunk_unit(unit)
 
@@ -126,9 +140,9 @@ def test_chunk_bodies_cover_sufficient_content():
     )
 
 
-def test_body_hashes_are_stable_and_unique():
+def test_body_hashes_are_stable_and_unique(tmp_path):
     content, _ = _generate_large_java_class(30)
-    unit = _FakeUnit(content)
+    unit = _make_unit(content, tmp_path)
     chunker = CodeChunker()
 
     chunks1 = chunker.chunk_unit(unit)
@@ -145,11 +159,11 @@ def test_body_hashes_are_stable_and_unique():
         )
 
 
-def test_no_chunk_body_exceeds_limit():
+def test_no_chunk_body_exceeds_limit(tmp_path):
     """No single chunk body should exceed the 50k char limit."""
     from companybrain.pipeline.code_chunker import CHUNK_BODY_LIMIT
     content, _ = _generate_large_java_class(30)
-    unit = _FakeUnit(content)
+    unit = _make_unit(content, tmp_path)
     chunker = CodeChunker()
     chunks = chunker.chunk_unit(unit)
 
@@ -157,20 +171,20 @@ def test_no_chunk_body_exceeds_limit():
     assert not oversized, f"Chunks exceeding {CHUNK_BODY_LIMIT} char limit: {oversized}"
 
 
-def test_all_chunks_have_valid_kind():
+def test_all_chunks_have_valid_kind(tmp_path):
     content, _ = _generate_large_java_class(30)
-    unit = _FakeUnit(content)
+    unit = _make_unit(content, tmp_path)
     chunker = CodeChunker()
     for chunk in chunker.chunk_unit(unit):
-        assert chunk.kind in ("method", "top_decl", "schema_block"), (
+        assert chunk.kind in ("method", "top_decl", "schema_block", "unreadable_file"), (
             f"Invalid kind {chunk.kind!r} on chunk {chunk.qname}"
         )
 
 
-def test_import_context_capped_per_chunk():
+def test_import_context_capped_per_chunk(tmp_path):
     """import_context in every chunk must not exceed 50 lines."""
     content, _ = _generate_large_java_class(30)
-    unit = _FakeUnit(content)
+    unit = _make_unit(content, tmp_path)
     chunker = CodeChunker()
     for chunk in chunker.chunk_unit(unit):
         lines = chunk.import_context.splitlines()
@@ -179,14 +193,14 @@ def test_import_context_capped_per_chunk():
         )
 
 
-def test_sql_method_bodies_contain_verbatim_queries():
+def test_sql_method_bodies_contain_verbatim_queries(tmp_path):
     """
     Each method's SQL string must appear verbatim in the chunk body.
     This is the definitive no-truncation check: the query_text is only
     recoverable if the full method body is present.
     """
     content, columns = _generate_large_java_class(30)
-    unit = _FakeUnit(content)
+    unit = _make_unit(content, tmp_path)
     chunker = CodeChunker()
     chunks = chunker.chunk_unit(unit)
 

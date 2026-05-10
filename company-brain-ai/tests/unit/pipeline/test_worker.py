@@ -29,6 +29,9 @@ def _make_method_chunk(qname: str = "Foo.bar") -> MethodChunk:
 
 
 def _make_queue_chunk(qname: str, attempt: int = 1) -> SimpleNamespace:
+    # Mirrors the QueueChunk dataclass shape (companybrain.pipeline.queue).
+    # `language` is required by _queue_chunk_to_method_chunk — leaving it off
+    # broke these tests when ADR-0047's per-chunk language column landed.
     return SimpleNamespace(
         id=f"id-{qname}",
         workspace_id="ws",
@@ -42,6 +45,7 @@ def _make_queue_chunk(qname: str, attempt: int = 1) -> SimpleNamespace:
         import_context="",
         body=f"void {qname}() {{}}",
         attempt_count=attempt,
+        language="java",
     )
 
 

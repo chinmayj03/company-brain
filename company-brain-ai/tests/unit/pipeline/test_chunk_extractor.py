@@ -255,28 +255,34 @@ async def test_qname_in_entity():
 
 
 def test_build_prompt_sections():
-    """_build_prompt must use labelled sections and include siblings."""
+    """_build_single_prompt must wrap each section in an XML tag and include siblings.
+
+    ADR-0049 O5a-1 replaced the original bracket-marker layout
+    ([IMPORTS]/[CLASS HEADER]/...) with XML tags (<imports>, <class_header>,
+    <sibling_methods>, <method>) — ~20% fewer tokens and better model
+    attention. The asserts here track that contract.
+    """
     from companybrain.pipeline.chunk_extractor import ChunkExtractor
     chunk = _make_chunk(
         qname="OrderService.placeOrder",
         sibling_signatures=["public void cancelOrder(Order o)", "public List<Order> findAll()"],
     )
-    prompt = ChunkExtractor()._build_prompt(chunk)
-    assert "[IMPORTS]" in prompt
-    assert "[CLASS HEADER]" in prompt
-    assert "[SIBLING METHODS]" in prompt
+    prompt = ChunkExtractor()._build_single_prompt(chunk)
+    assert "<imports>" in prompt
+    assert "<class_header" in prompt
+    assert "<sibling_methods" in prompt
     assert "cancelOrder" in prompt
     assert "findAll" in prompt
-    assert "[TARGET METHOD]" in prompt
-    assert "OrderService.placeOrder" in prompt
-    # Target body must appear after the sibling section
-    assert prompt.index("[TARGET METHOD]") > prompt.index("[SIBLING METHODS]")
+    assert "<method " in prompt
+    assert 'qname="OrderService.placeOrder"' in prompt
+    # Target method body must appear after the sibling section.
+    assert prompt.index("<method ") > prompt.index("<sibling_methods")
 
 
 def test_build_prompt_no_siblings_omits_section():
-    """[SIBLING METHODS] section must be absent when chunk has no siblings."""
+    """<sibling_methods> section must be absent when chunk has no siblings."""
     from companybrain.pipeline.chunk_extractor import ChunkExtractor
     chunk = _make_chunk(qname="Util.helper", sibling_signatures=[])
-    prompt = ChunkExtractor()._build_prompt(chunk)
-    assert "[SIBLING METHODS]" not in prompt
-    assert "[TARGET METHOD]" in prompt
+    prompt = ChunkExtractor()._build_single_prompt(chunk)
+    assert "<sibling_methods" not in prompt
+    assert "<method " in prompt

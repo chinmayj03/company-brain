@@ -105,6 +105,11 @@ class CodeChunker:
         file_cache: optional FileCache instance (ADR-0049 C2).  When supplied,
         reads are de-duped across callers in the same pipeline job.
         """
+        # ADR-0052 P6: notebooks aren't tree-sitter-parseable; one chunk per cell.
+        if Path(fp).suffix.lower() == ".ipynb":
+            from companybrain.harness.notebook_chunker import chunk_notebook
+            return chunk_notebook(Path(fp))
+
         raw = file_cache.read(fp) if file_cache is not None else Path(fp).read_text(errors="ignore")
 
         # Defensive assert — ADR-0047 D4

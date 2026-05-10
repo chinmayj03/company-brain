@@ -104,6 +104,15 @@ dependencies = [
     "structlog>=24.2.0",          # Structured logging
     "python-jose[cryptography]>=3.3.0",  # JWT validation
     "cryptography>=42.0.8",       # AES-256-GCM for metadata encryption
+
+    # ADR-0052 P6 — marketplace + ecosystem layer
+    # apscheduler: cron-triggered extractions persisted to scheduled_tasks (V13).
+    # nbformat:    Jupyter cell parsing for notebook_chunker.py.
+    # playwright:  optional browser-verifier sub-agent. Install browsers via
+    #              `playwright install chromium` post-install. Listed under
+    #              optional 'verifier' extras to keep the default image small.
+    "apscheduler>=3.10.4",
+    "nbformat>=5.10.0",
 ]
 
 [project.optional-dependencies]
@@ -120,6 +129,12 @@ dev = [
 # pip install -e ".[voyage]"
 voyage = [
     "voyageai>=0.3.2",
+]
+
+# ADR-0052 P6 — install the browser-verifier sub-agent's Playwright deps.
+# `pip install -e ".[verifier]" && playwright install chromium`
+verifier = [
+    "playwright>=1.45.0",
 ]
 
 [project.scripts]

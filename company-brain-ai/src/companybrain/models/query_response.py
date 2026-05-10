@@ -71,6 +71,10 @@ class QueryResponse(BaseModel):
     caveats: list[str] = []
     follow_up_questions: list[str] = []
     raw_markdown: str = ""
+    # ADR-0052 P6: per-entity sticky notes attached to any URN cited in
+    # affected_entities / call_chain. Each item: {urn, note, author?, created_at?}.
+    # Empty when no notes exist or the notes table is unavailable.
+    notes: list[dict] = []
 
     # Legacy aliases so callers that read .answer or .sources keep working.
     @property

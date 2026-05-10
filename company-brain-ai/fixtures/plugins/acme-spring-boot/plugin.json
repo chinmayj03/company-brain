@@ -1,0 +1,7 @@
+{
+  "name": "acme-spring-boot",
+  "version": "0.1.0",
+  "description": "Acme house-style Spring Boot conventions — overrides the bundled spring-boot SKILL.md.",
+  "required_capabilities": ["read_code", "write_brain"],
+  "homepage": "https://example.com/plugins/acme-spring-boot"
+}

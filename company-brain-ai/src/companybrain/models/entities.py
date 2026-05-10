@@ -125,6 +125,13 @@ class ExtractedEntity:
     structural_risk_flags:  list[str]           = field(default_factory=list)  # e.g. ['payment', 'pii']
     structural_change_risk: Optional[str]       = None   # 'high' | 'medium' | 'low'
 
+    # ADR-0052 P6: human-curation flags. ``pinned=True`` freezes the row
+    # against rebuild overwrites; ``proposed=True`` hides the entity from
+    # query responses unless the caller explicitly asks for proposed nodes.
+    # Both default False so nothing changes for entities written before V15.
+    pinned:   bool                              = False
+    proposed: bool                              = False
+
     @property
     def external_id(self) -> str:
         """Stable identifier used as the node external_id in the graph."""

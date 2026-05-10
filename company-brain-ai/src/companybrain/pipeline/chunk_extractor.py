@@ -1,0 +1,379 @@
+"""
+ADR-0044 PR-0044-3: Per-chunk extractor.
+
+Processes one MethodChunk at a time:
+  1. Build prompt with header_context + import_context + body.
+  2. LLM call, max_tokens=600.
+  3. Validate JSON via Pydantic; salvage partial via _salvage helpers.
+  4. If > 8 edges emitted, run follow-up calls (max 3) for remaining edges.
+
+Cost target: ~$0.0005 per chunk on claude-haiku-4-5.
+"""
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+import structlog
+
+from companybrain.edges.taxonomy import EDGE_TYPES, render_prompt_reference
+from companybrain.llm import get_provider, TaskRole, ChatMessage
+from companybrain.pipeline.code_chunker import MethodChunk
+from companybrain.pipeline.lookup_tool import LookupTool, get_symbol_index
+
+log = structlog.get_logger(__name__)
+
+MAX_EDGES_PER_CALL = 8
+MAX_FOLLOWUP_CALLS = 3
+MAX_TOKENS_PER_CALL = 600
+
+
+# ── Output models ──────────────────────────────────────────────────────────────
+
+@dataclass
+class ExtractedEdge:
+    edge_type: str
+    target: str
+    confidence: float = 0.8
+    evidence: str = ""
+
+
+@dataclass
+class ExtractedChunkEntity:
+    entity_type: str
+    name: str
+    qname: str
+    file_path: str
+    signature: str = ""
+    confidence: float = 0.9
+    query_text: str = ""
+    code_snippet: str = ""
+    language: str = ""
+
+
+@dataclass
+class ChunkResult:
+    chunk: MethodChunk
+    entity: Optional[ExtractedChunkEntity]
+    edges: list[ExtractedEdge]
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    lookup_calls: int = 0
+    latency_ms: float = 0.0
+    attempt: int = 1
+    error: Optional[str] = None
+
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+_SYSTEM_PROMPT = """\
+You will receive a single method (or top-level declaration) extracted from a larger codebase file.
+The input has three clearly labelled sections:
+
+  [IMPORTS]      — the file's import/use statements (context only, not the target)
+  [CLASS HEADER] — class signature + field declarations (context only, not the target)
+  [TARGET METHOD] — the specific method you must describe (THIS is the entity)
+
+Your job: return ONE entity describing the TARGET METHOD, plus at most {max_edges} edges \
+that originate from it.
+
+Important scoping rules:
+- The entity is the TARGET METHOD, not the class and not the file.
+- Calls to methods listed in [SIBLING METHODS] are calls within the same class. \
+  Emit them as CALLS edges with confidence ≤ 0.7 (internal helpers are low-value).
+- Calls to types/methods NOT in [SIBLING METHODS] and not in [IMPORTS] are likely \
+  external services or cross-class dependencies — emit those with higher confidence.
+- Do NOT emit an edge for the logger, trivial getters/setters, null checks, or test setup.
+
+The entity_type must be one of:
+  ApiEndpoint | Function | InterfaceMethod | Class | DatabaseQuery | DatabaseTable |
+  DatabaseColumn | SchemaField | ExternalService | ConfigKey | SharedType | FrontendComponent
+
+The edge_type values must come from the canonical taxonomy:
+{edge_types}
+
+Output strict JSON — no prose, no markdown, no comments:
+
+{{
+  "entity": {{
+    "entity_type": "<type>",
+    "name": "<fully qualified name>",
+    "signature": "<method signature line>",
+    "confidence": <0.5-1.0>,
+    "query_text": "<full verbatim SQL/JPQL if DatabaseQuery, else omit>",
+    "code_snippet": "<key 1-2 line excerpt from body>"
+  }},
+  "edges": [
+    {{"edge_type": "<type>", "target": "<name or URN>", "confidence": <0.5-1.0>, "evidence": "<1-line reason>"}}
+  ]
+}}
+
+Confidence guide: 1.0 = explicitly defined in TARGET METHOD, 0.8 = clearly referenced, 0.6 = inferred, ≤0.7 = same-class internal call.
+For DatabaseQuery: query_text must be the full verbatim SQL — never truncate it.
+""".strip()
+
+_FOLLOWUP_PROMPT = """\
+The method above has more edges than fit in the first response.
+The following edge types have already been emitted: {already_emitted}
+
+Return ONLY the remaining edges as JSON — same schema, no entity field:
+{{"edges": [...]}}
+
+Emit at most {max_edges} edges.
+""".strip()
+
+
+class ChunkExtractor:
+    """
+    Extracts one entity + edges from one MethodChunk using a focused LLM call.
+    """
+
+    async def extract(
+        self,
+        chunk: MethodChunk,
+        lookup_tool: Optional[LookupTool] = None,
+    ) -> ChunkResult:
+        start = time.monotonic()
+        if lookup_tool is None:
+            lookup_tool = LookupTool(get_symbol_index())
+
+        prompt_text = self._build_prompt(chunk)
+        system = _SYSTEM_PROMPT.format(
+            max_edges=MAX_EDGES_PER_CALL,
+            edge_types=render_prompt_reference(),
+        )
+
+        try:
+            provider = get_provider()
+            resp = await provider.chat(
+                messages=[ChatMessage(role="user", content=prompt_text)],
+                system=system,
+                role=TaskRole.FAST,
+                max_tokens=MAX_TOKENS_PER_CALL,
+            )
+            raw = resp.content.strip()
+            cost = resp.cost_usd if hasattr(resp, "cost_usd") else 0.0
+            in_tok = resp.input_tokens if hasattr(resp, "input_tokens") else 0
+            out_tok = resp.output_tokens if hasattr(resp, "output_tokens") else 0
+
+            entity, edges = self._parse_response(raw, chunk)
+
+            # If > 8 edges were hinted, run follow-up calls
+            if entity is not None and len(edges) >= MAX_EDGES_PER_CALL:
+                edges, extra_cost, extra_in, extra_out = await self._collect_remaining_edges(
+                    chunk, prompt_text, edges, provider, system,
+                )
+                cost += extra_cost
+                in_tok += extra_in
+                out_tok += extra_out
+
+            latency_ms = (time.monotonic() - start) * 1000
+
+            log.info(
+                "extraction_chunk",
+                file=chunk.file_path,
+                qname=chunk.qname,
+                body_chars=len(chunk.body),
+                entities_emitted=1 if entity else 0,
+                edges_emitted=len(edges),
+                cost_usd=round(cost, 6),
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                latency_ms=round(latency_ms, 1),
+                lookup_calls=lookup_tool.calls_used,
+                status="done" if entity else "empty",
+                attempt=1,
+            )
+
+            return ChunkResult(
+                chunk=chunk,
+                entity=entity,
+                edges=edges,
+                cost_usd=cost,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                lookup_calls=lookup_tool.calls_used,
+                latency_ms=latency_ms,
+            )
+
+        except Exception as exc:
+            latency_ms = (time.monotonic() - start) * 1000
+            log.error(
+                "extraction_chunk",
+                file=chunk.file_path,
+                qname=chunk.qname,
+                body_chars=len(chunk.body),
+                entities_emitted=0,
+                edges_emitted=0,
+                cost_usd=0,
+                input_tokens=0,
+                output_tokens=0,
+                latency_ms=round(latency_ms, 1),
+                lookup_calls=lookup_tool.calls_used,
+                status="failed",
+                attempt=1,
+                error=str(exc),
+            )
+            return ChunkResult(
+                chunk=chunk,
+                entity=None,
+                edges=[],
+                latency_ms=latency_ms,
+                error=str(exc),
+            )
+
+    # ── Prompt builder ─────────────────────────────────────────────────────────
+
+    def _build_prompt(self, chunk: MethodChunk) -> str:
+        parts: list[str] = []
+        if chunk.import_context.strip():
+            parts.append(f"[IMPORTS]\n{chunk.import_context.strip()}")
+        if chunk.header_context.strip():
+            parts.append(f"[CLASS HEADER]\n{chunk.header_context.strip()}")
+        siblings = getattr(chunk, "sibling_signatures", None) or []
+        if siblings:
+            sig_list = "\n".join(f"  - {s}" for s in siblings[:20])
+            parts.append(f"[SIBLING METHODS] (same class — calls to these are internal)\n{sig_list}")
+        parts.append(f"[TARGET METHOD] ({chunk.qname})\n{chunk.body.strip()}")
+        return "\n\n".join(parts)
+
+    # ── Response parser ────────────────────────────────────────────────────────
+
+    def _parse_response(
+        self, raw: str, chunk: MethodChunk,
+    ) -> tuple[Optional[ExtractedChunkEntity], list[ExtractedEdge]]:
+        try:
+            data = _parse_json(raw)
+        except Exception:
+            return None, []
+
+        entity = None
+        raw_entity = data.get("entity") or data.get("entities", [None])[0]
+        if raw_entity:
+            entity = ExtractedChunkEntity(
+                entity_type=raw_entity.get("entity_type", "Function"),
+                name=raw_entity.get("name", chunk.qname),
+                qname=chunk.qname,
+                file_path=chunk.file_path,
+                signature=raw_entity.get("signature", ""),
+                confidence=float(raw_entity.get("confidence", 0.8)),
+                query_text=raw_entity.get("query_text", ""),
+                code_snippet=raw_entity.get("code_snippet", ""),
+                language=chunk.language,
+            )
+
+        edges: list[ExtractedEdge] = []
+        for raw_edge in data.get("edges", []):
+            edge_type = raw_edge.get("edge_type", "")
+            if edge_type not in EDGE_TYPES:
+                continue
+            edges.append(ExtractedEdge(
+                edge_type=edge_type,
+                target=raw_edge.get("target", ""),
+                confidence=float(raw_edge.get("confidence", 0.8)),
+                evidence=raw_edge.get("evidence", ""),
+            ))
+
+        return entity, edges
+
+    # ── Follow-up edge collection ──────────────────────────────────────────────
+
+    async def _collect_remaining_edges(
+        self,
+        chunk: MethodChunk,
+        original_prompt: str,
+        initial_edges: list[ExtractedEdge],
+        provider,
+        system: str,
+    ) -> tuple[list[ExtractedEdge], float, int, int]:
+        all_edges = list(initial_edges)
+        total_cost = 0.0
+        total_in = 0
+        total_out = 0
+
+        for _ in range(MAX_FOLLOWUP_CALLS):
+            if len(all_edges) < MAX_EDGES_PER_CALL:
+                break
+
+            already = ", ".join({e.edge_type for e in all_edges})
+            followup = _FOLLOWUP_PROMPT.format(
+                already_emitted=already,
+                max_edges=MAX_EDGES_PER_CALL,
+            )
+            try:
+                resp = await provider.chat(
+                    messages=[
+                        ChatMessage(role="user", content=original_prompt),
+                        ChatMessage(role="assistant", content=json.dumps({"edges": [e.__dict__ for e in initial_edges]})),
+                        ChatMessage(role="user", content=followup),
+                    ],
+                    system=system,
+                    role=TaskRole.FAST,
+                    max_tokens=MAX_TOKENS_PER_CALL,
+                )
+                total_cost += getattr(resp, "cost_usd", 0.0)
+                total_in += getattr(resp, "input_tokens", 0)
+                total_out += getattr(resp, "output_tokens", 0)
+
+                data = _parse_json(resp.content.strip())
+                for raw_edge in data.get("edges", []):
+                    et = raw_edge.get("edge_type", "")
+                    if et in EDGE_TYPES:
+                        all_edges.append(ExtractedEdge(
+                            edge_type=et,
+                            target=raw_edge.get("target", ""),
+                            confidence=float(raw_edge.get("confidence", 0.8)),
+                            evidence=raw_edge.get("evidence", ""),
+                        ))
+            except Exception:
+                break
+
+        return all_edges, total_cost, total_in, total_out
+
+
+# ── JSON parsing helpers ──────────────────────────────────────────────────────
+
+def _parse_json(raw: str) -> dict:
+    """Parse JSON from raw LLM output, tolerating leading/trailing prose."""
+    # Strip markdown fences
+    raw = re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=re.MULTILINE)
+    raw = re.sub(r'\s*```$', '', raw.strip(), flags=re.MULTILINE)
+
+    # Try direct parse
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Salvage: find the first { ... } block
+    start = raw.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found")
+
+    # Walk from the start brace, collect the longest valid prefix
+    # by trying to close the object at each closing brace candidate.
+    depth = 0
+    for i, ch in enumerate(raw[start:], start=start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(raw[start : i + 1])
+                except json.JSONDecodeError:
+                    pass
+
+    # Last resort: try appending closing braces to salvage a truncated object
+    truncated = raw[start:]
+    for closes in ["}", "}}", "}}}"]:
+        try:
+            return json.loads(truncated + closes)
+        except json.JSONDecodeError:
+            continue
+
+    raise ValueError("Could not parse JSON")

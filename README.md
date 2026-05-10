@@ -260,3 +260,29 @@ make pull-small   # pulls llama3.1:8b — required before first pipeline run
 # mvnw is downloading Maven 3.9.6 (~50 MB) — wait 1–2 minutes
 # Subsequent runs skip the download
 ```
+
+---
+
+## Extraction model: chunked, resumable, language-agnostic
+
+As of ADR-0044, the extraction pipeline processes files of **any size** correctly.
+
+**How it works:**
+1. A tree-sitter–based code chunker splits every source file into individual
+   method/declaration chunks, each with class header + import context.
+2. Chunks are written to a Postgres queue (`extraction_queue`). Workers claim
+   one chunk at a time via `SELECT … FOR UPDATE SKIP LOCKED`, so multiple
+   coroutines run in parallel without duplicate work.
+3. Each LLM call is bounded to `max_tokens=600` — JSON output is never cut.
+4. A deterministic merger deduplicates entities that appear in multiple chunks
+   and resolves edge targets to canonical URNs.
+
+**Environment flags:**
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `BRAIN_USE_CHUNK_QUEUE` | `true` | Enable chunked extraction (ADR-0044) |
+| `BRAIN_LEGACY_EXTRACT` | `false` | Force the old per-file path (escape hatch) |
+| `BRAIN_JOB_BUDGET_USD` | `0.50` | Abort a pipeline run if cost exceeds this |
+
+**Languages supported:** Java, Python, TypeScript/TSX, JavaScript, Go, Kotlin, Rust, Ruby (via tree-sitter grammars).

@@ -535,13 +535,36 @@ class EntityExtractor:
                         method=chunk.method_name,
                         error=str(e),
                     )
-            # JPA deterministic pass still runs once on the full unit
+            # JPA / jOOQ / SQL deterministic pass still runs once on the full unit.
+            #
+            # Old behaviour: if the LLM had already emitted an entity with the
+            # same name (e.g. `fetchAllCompetitors` as a Function), the deterministic
+            # DatabaseQuery output was DROPPED. Result: the SQL we extracted
+            # (jOOQ DSL chain, JPQL, etc.) was lost forever for that method —
+            # exactly the bug the user keeps hitting on the lob-rename query.
+            #
+            # New behaviour: merge query_text + code_snippet from the
+            # deterministic pass into the LLM entity that won the name. The
+            # LLM keeps its richer entity_type / signature / confidence,
+            # but the SQL body is preserved. Net: no entities lost, no SQL lost.
             if unit.role in ("repository", "dao") and unit.file_path:
                 jpa_entities = self._extract_jpa_query_entities(unit)
-                existing = {e.name for e in all_entities}
+                by_name = {e.name: e for e in all_entities}
                 for qe in jpa_entities:
-                    if qe.name not in existing:
+                    if qe.name not in by_name:
                         all_entities.append(qe)
+                        continue
+                    # Same-name collision: merge the SQL bodies into the LLM entity
+                    target = by_name[qe.name]
+                    if not target.query_text and qe.query_text:
+                        target.query_text = qe.query_text
+                    if not target.code_snippet and qe.code_snippet:
+                        target.code_snippet = qe.code_snippet
+                    log.debug(
+                        "Merged deterministic SQL into LLM entity",
+                        name=qe.name,
+                        query_text_len=len(qe.query_text or ""),
+                    )
             return all_entities
 
         # ── Small unit: single LLM call (original path) ──────────────────────

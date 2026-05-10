@@ -58,6 +58,11 @@ class PostgresBrainStore(BrainStore):
     async def write(self, entity: BrainEntity, *, run_id: str, workspace_id: str) -> None:
         self._buffered_entities.append(_to_extracted_entity(entity))
         self._buffered_relationships.extend(_to_relationships(entity))
+        ctx = _to_context(entity)
+        if ctx is not None:
+            # Key matches what ContextSynthesizer and enrich use: repo/file::name
+            ctx_key = f"{entity.repo}/{entity.file}::{entity.qualified_name}"
+            self._buffered_contexts[ctx_key] = ctx
 
     async def read(self, entity_id: str) -> Optional[BrainEntity]:
         # Optional: implement via Java REST API. Tests should hit the JSON store.
@@ -124,3 +129,31 @@ def _to_relationships(entity: BrainEntity) -> "list[ExtractedRelationship]":
             evidence=rel.get("evidence", rel.get("source", "brain_store")),
         ))
     return out
+
+
+def _to_context(entity: BrainEntity) -> "Optional[BusinessContext]":
+    """
+    Extract a BusinessContext from entity.metadata["business_context"] if present.
+
+    enrich() stores the LLM-synthesised context blob as a dict under
+    entity.metadata["business_context"] before writing back to .brain/ JSON.
+    rebuild-from-json replays those JSON files through write(), so we must
+    lift the blob here to populate _buffered_contexts — otherwise node_context
+    stays 0 after every rebuild even though the data is sitting in the JSON.
+    """
+    raw = (entity.metadata or {}).get("business_context")
+    if not raw:
+        return None
+    try:
+        from companybrain.models.entities import BusinessContext
+        if isinstance(raw, BusinessContext):
+            return raw
+        # raw is a plain dict (JSON round-trip from .brain/ file)
+        return BusinessContext(**{
+            k: v for k, v in raw.items()
+            if k in BusinessContext.__dataclass_fields__
+        })
+    except Exception:
+        # Malformed / schema-drifted blob — skip silently rather than aborting
+        # the whole rebuild.
+        return None

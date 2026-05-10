@@ -50,6 +50,7 @@ def _queue_chunk_to_method_chunk(qc: QueueChunk) -> MethodChunk:
         import_context=qc.import_context,
         body_hash=qc.body_hash,
         language="java",  # stored in queue — default fallback; real lang in body_hash context
+        strategy=getattr(qc, "strategy", "per_method"),
     )
 
 
@@ -194,13 +195,15 @@ def collect_entities_and_edges(
 ) -> tuple[list, list]:
     """
     Flatten ChunkResults into entity list + edge list for the merger.
+
+    ADR-0046: batch and whole-file results carry multiple entities via
+    ChunkResult.all_entities(); fall back to .entity for legacy per-method results.
     """
     from companybrain.pipeline.chunk_extractor import ExtractedChunkEntity, ExtractedEdge
 
     entities: list[ExtractedChunkEntity] = []
     edges: list[ExtractedEdge] = []
     for r in results:
-        if r.entity:
-            entities.append(r.entity)
+        entities.extend(r.all_entities())
         edges.extend(r.edges)
     return entities, edges

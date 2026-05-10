@@ -37,6 +37,7 @@ class QueueChunk:
     import_context: str
     body: str
     attempt_count: int
+    strategy: str = "per_method"   # ADR-0046: whole_file | batched_methods | per_method
 
 
 @dataclass
@@ -52,6 +53,7 @@ class ChunkInput:
     header_context: str
     import_context: str
     body: str
+    strategy: str = "per_method"   # ADR-0046: whole_file | batched_methods | per_method
 
 
 async def _get_conn() -> asyncpg.Connection:
@@ -78,14 +80,15 @@ async def enqueue(chunks: list[ChunkInput]) -> int:
                 """
                 INSERT INTO extraction_queue
                     (workspace_id, job_id, repo, file_path, qname, body_hash,
-                     chunk_kind, header_context, import_context, body)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     chunk_kind, header_context, import_context, body, strategy)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (workspace_id, job_id, file_path, qname, body_hash)
                 DO NOTHING
                 """,
                 c.workspace_id, c.job_id, c.repo, c.file_path,
                 c.qname, c.body_hash, c.chunk_kind,
                 c.header_context, c.import_context, c.body,
+                getattr(c, "strategy", "per_method"),
             )
             # asyncpg returns "INSERT 0 N" — parse N
             n = int(result.split()[-1])
@@ -111,7 +114,8 @@ async def claim_next(worker_id: str, workspace_id: str, job_id: str) -> Optional
                 """
                 SELECT id, workspace_id, job_id, repo, file_path, qname,
                        body_hash, chunk_kind, header_context, import_context,
-                       body, attempt_count
+                       body, attempt_count,
+                       COALESCE(strategy, 'per_method') AS strategy
                 FROM extraction_queue
                 WHERE workspace_id = $1
                   AND job_id = $2
@@ -148,6 +152,7 @@ async def claim_next(worker_id: str, workspace_id: str, job_id: str) -> Optional
                 import_context=row["import_context"],
                 body=row["body"],
                 attempt_count=row["attempt_count"] + 1,
+                strategy=row["strategy"],
             )
     finally:
         await conn.close()

@@ -58,16 +58,35 @@ public class OrderService {
 """
 
 
-def test_java_produces_chunks():
+def test_java_small_file_produces_whole_file_chunk():
+    # _JAVA_FIXTURE is < 4 000 chars → WHOLE_FILE strategy: one chunk, all content.
     chunker = CodeChunker()
     unit = _unit(_JAVA_FIXTURE, "java", "OrderService")
     chunks = chunker.chunk_unit(unit)
 
-    assert len(chunks) >= 3, f"Expected ≥3 chunks for 3 methods, got {len(chunks)}"
-    qnames = {c.qname for c in chunks}
-    assert any("findById" in q for q in qnames)
-    assert any("placeOrder" in q for q in qnames)
-    assert any("findByCustomer" in q for q in qnames)
+    assert len(chunks) == 1, f"Small file should produce 1 WHOLE_FILE chunk, got {len(chunks)}"
+    assert chunks[0].strategy == "whole_file"
+    assert chunks[0].kind == "whole_file"
+    # All method names should be visible in the single chunk body.
+    body = chunks[0].body
+    assert "findById" in body
+    assert "placeOrder" in body
+    assert "findByCustomer" in body
+
+
+_JAVA_LARGE_FIXTURE = (_JAVA_FIXTURE * 20).replace(
+    "class OrderService {", "class OrderService {\n    // padded to exceed 4 000 chars\n"
+)
+
+
+def test_java_large_file_produces_per_method_or_batch_chunks():
+    # A file > 4 000 chars should produce BATCHED_METHODS or PER_METHOD chunks.
+    chunker = CodeChunker()
+    unit = _unit(_JAVA_LARGE_FIXTURE, "java", "OrderService")
+    chunks = chunker.chunk_unit(unit)
+
+    strategies = {c.strategy for c in chunks}
+    assert strategies - {"whole_file"}, "Large file should not use WHOLE_FILE for all chunks"
 
 
 def test_java_header_context_contains_class_signature():
@@ -127,16 +146,17 @@ class UserService:
 
 
 def test_python_produces_chunks():
+    # _PYTHON_FIXTURE is small → WHOLE_FILE; all method code still in the single chunk body.
     chunker = CodeChunker()
     unit = _unit(_PYTHON_FIXTURE, "python", "UserService")
     chunks = chunker.chunk_unit(unit)
 
-    assert len(chunks) >= 4
-    qnames = {c.qname for c in chunks}
-    assert any("get_user" in q for q in qnames)
-    assert any("create_user" in q for q in qnames)
-    assert any("list_active" in q for q in qnames)
-    assert any("deactivate" in q for q in qnames)
+    assert len(chunks) >= 1
+    bodies = " ".join(c.body for c in chunks)
+    assert "get_user" in bodies
+    assert "create_user" in bodies
+    assert "list_active" in bodies
+    assert "deactivate" in bodies
 
 
 def test_python_bodies_contain_actual_code():
@@ -260,8 +280,9 @@ def test_no_content_slice_in_output():
 def test_chunk_kind_is_valid():
     chunker = CodeChunker()
     unit = _unit(_JAVA_FIXTURE, "java", "OrderService")
+    valid_kinds = {"method", "top_decl", "schema_block", "whole_file", "batch"}
     for chunk in chunker.chunk_unit(unit):
-        assert chunk.kind in ("method", "top_decl", "schema_block")
+        assert chunk.kind in valid_kinds, f"Unexpected kind: {chunk.kind}"
 
 
 def test_import_context_capped_at_50_lines():

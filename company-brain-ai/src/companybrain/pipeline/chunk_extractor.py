@@ -57,7 +57,7 @@ class ExtractedChunkEntity:
 @dataclass
 class ChunkResult:
     chunk: MethodChunk
-    entity: Optional[ExtractedChunkEntity]
+    entity: Optional[ExtractedChunkEntity]  # set for per_method; None for batch/whole_file
     edges: list[ExtractedEdge]
     cost_usd: float = 0.0
     input_tokens: int = 0
@@ -66,6 +66,17 @@ class ChunkResult:
     latency_ms: float = 0.0
     attempt: int = 1
     error: Optional[str] = None
+    # ADR-0046: batch/whole-file strategies emit multiple entities per LLM call.
+    entities: list[ExtractedChunkEntity] = field(default_factory=list)
+    strategy_chosen: str = "per_method"
+
+    def all_entities(self) -> list[ExtractedChunkEntity]:
+        """Return all entities from this result regardless of strategy."""
+        if self.entities:
+            return self.entities
+        if self.entity:
+            return [self.entity]
+        return []
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -126,6 +137,97 @@ Return ONLY the remaining edges as JSON — same schema, no entity field:
 Emit at most {max_edges} edges.
 """.strip()
 
+# ── ADR-0046 D2: WHOLE_FILE system prompt ─────────────────────────────────────
+_WHOLE_FILE_SYSTEM_PROMPT = """\
+You will receive the complete source file for a single class or module.
+
+Your job: return ONE entity for EACH meaningful method in the file, plus the
+edges originating from each method.
+
+Rules:
+- Skip trivial methods: empty bodies, plain getters/setters, lombok-generated,
+  toString/equals/hashCode overrides, and unsupported-operation stubs.
+- For DatabaseQuery entities, query_text must be the FULL verbatim SQL/JPQL.
+- Do NOT emit an edge for loggers, null checks, or test setup.
+
+The entity_type must be one of:
+  ApiEndpoint | Function | InterfaceMethod | Class | DatabaseQuery | DatabaseTable |
+  DatabaseColumn | SchemaField | ExternalService | ConfigKey | SharedType | FrontendComponent
+
+The edge_type values must come from the canonical taxonomy:
+{edge_types}
+
+Output strict JSON — no prose, no markdown, no comments:
+
+{{
+  "methods": {{
+    "ClassName.methodName": {{
+      "entity": {{
+        "entity_type": "<type>",
+        "name": "<fully qualified name>",
+        "signature": "<method signature line>",
+        "confidence": <0.5-1.0>,
+        "query_text": "<full verbatim SQL/JPQL if DatabaseQuery, else omit>",
+        "code_snippet": "<key 1-2 line excerpt>"
+      }},
+      "edges": [
+        {{"edge_type": "<type>", "target": "<name or URN>", "confidence": <0.5-1.0>, "evidence": "<1-line reason>"}}
+      ]
+    }}
+  }}
+}}
+
+Use the actual qualified name (e.g. "PayerService.getPayerCompetitors") as the key.
+""".strip()
+
+# ── ADR-0046 D2: BATCHED_METHODS system prompt ────────────────────────────────
+_BATCHED_SYSTEM_PROMPT = """\
+You will receive a batch of methods from the SAME class, each delimited by
+[METHOD: ClassName.methodName].
+
+Your job: return ONE entity per method in this batch, in the SAME ORDER as
+the methods appear. Output a JSON object keyed by the method's qualified name.
+
+Rules:
+- Skip trivial methods (empty, getter/setter, lombok-generated, etc.) by
+  omitting them from the output entirely.
+- Calls between methods listed in [SIBLING METHODS] are internal — emit them
+  as CALLS edges with confidence ≤ 0.7.
+- For DatabaseQuery entities, query_text must be the full verbatim SQL.
+
+The entity_type must be one of:
+  ApiEndpoint | Function | InterfaceMethod | Class | DatabaseQuery | DatabaseTable |
+  DatabaseColumn | SchemaField | ExternalService | ConfigKey | SharedType | FrontendComponent
+
+The edge_type values must come from the canonical taxonomy:
+{edge_types}
+
+Output strict JSON — no prose, no markdown, no comments:
+
+{{
+  "methods": {{
+    "ClassName.methodA": {{
+      "entity": {{
+        "entity_type": "<type>",
+        "name": "<fully qualified name>",
+        "signature": "<signature line>",
+        "confidence": <0.5-1.0>,
+        "query_text": "<full SQL if DatabaseQuery, else omit>",
+        "code_snippet": "<1-2 key lines>"
+      }},
+      "edges": [
+        {{"edge_type": "<type>", "target": "<name or URN>", "confidence": <0.5-1.0>, "evidence": "<reason>"}}
+      ]
+    }},
+    "ClassName.methodB": {{ ... }}
+  }}
+}}
+""".strip()
+
+# Max tokens for batch/whole-file calls — more output needed since multiple entities.
+MAX_TOKENS_BATCH = 2000
+MAX_TOKENS_WHOLE_FILE = 3000
+
 
 class ChunkExtractor:
     """
@@ -141,6 +243,22 @@ class ChunkExtractor:
         if lookup_tool is None:
             lookup_tool = LookupTool(get_symbol_index())
 
+        strategy = getattr(chunk, "strategy", "per_method")
+
+        # Dispatch to the right extractor based on ADR-0046 strategy.
+        if strategy == "whole_file":
+            return await self._extract_whole_file(chunk, lookup_tool, start)
+        if strategy == "batched_methods":
+            return await self._extract_batch(chunk, lookup_tool, start)
+        # Default: per_method (original path)
+        return await self._extract_per_method(chunk, lookup_tool, start)
+
+    async def _extract_per_method(
+        self,
+        chunk: MethodChunk,
+        lookup_tool: LookupTool,
+        start: float,
+    ) -> ChunkResult:
         prompt_text = self._build_prompt(chunk)
         system = _SYSTEM_PROMPT.format(
             max_edges=MAX_EDGES_PER_CALL,
@@ -179,7 +297,6 @@ class ChunkExtractor:
                 out_tok += extra_out
 
             latency_ms = (time.monotonic() - start) * 1000
-
             log.info(
                 "extraction_chunk",
                 file=chunk.file_path,
@@ -193,9 +310,9 @@ class ChunkExtractor:
                 latency_ms=round(latency_ms, 1),
                 lookup_calls=lookup_tool.calls_used,
                 status="done" if entity else "empty",
+                strategy_chosen="per_method",
                 attempt=1,
             )
-
             return ChunkResult(
                 chunk=chunk,
                 entity=entity,
@@ -205,6 +322,7 @@ class ChunkExtractor:
                 output_tokens=out_tok,
                 lookup_calls=lookup_tool.calls_used,
                 latency_ms=latency_ms,
+                strategy_chosen="per_method",
             )
 
         except Exception as exc:
@@ -222,6 +340,7 @@ class ChunkExtractor:
                 latency_ms=round(latency_ms, 1),
                 lookup_calls=lookup_tool.calls_used,
                 status="failed",
+                strategy_chosen="per_method",
                 attempt=1,
                 error=str(exc),
             )
@@ -231,6 +350,169 @@ class ChunkExtractor:
                 edges=[],
                 latency_ms=latency_ms,
                 error=str(exc),
+                strategy_chosen="per_method",
+            )
+
+    async def _extract_whole_file(
+        self,
+        chunk: MethodChunk,
+        lookup_tool: LookupTool,
+        start: float,
+    ) -> ChunkResult:
+        """One LLM call for the entire file — returns multiple entities."""
+        system = _WHOLE_FILE_SYSTEM_PROMPT.format(edge_types=render_prompt_reference())
+        parts = []
+        if chunk.import_context.strip():
+            parts.append(f"[IMPORTS]\n{chunk.import_context.strip()}")
+        parts.append(f"[FILE: {chunk.qname}]\n{chunk.body.strip()}")
+        prompt_text = "\n\n".join(parts)
+
+        try:
+            provider = get_provider()
+            resp = await provider.chat(
+                messages=[
+                    ChatMessage(role="system", content=system),
+                    ChatMessage(role="user",   content=prompt_text),
+                ],
+                role=TaskRole.FAST,
+                max_tokens=MAX_TOKENS_WHOLE_FILE,
+            )
+            raw = resp.content.strip()
+            cost = getattr(resp, "cost_usd", 0.0)
+            in_tok = getattr(resp, "input_tokens", 0)
+            out_tok = getattr(resp, "output_tokens", 0)
+
+            entities, edges = self._parse_multi_response(raw, chunk)
+            latency_ms = (time.monotonic() - start) * 1000
+            log.info(
+                "extraction_chunk",
+                file=chunk.file_path,
+                qname=chunk.qname,
+                body_chars=len(chunk.body),
+                entities_emitted=len(entities),
+                edges_emitted=len(edges),
+                cost_usd=round(cost, 6),
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                latency_ms=round(latency_ms, 1),
+                lookup_calls=lookup_tool.calls_used,
+                status="done" if entities else "empty",
+                strategy_chosen="whole_file",
+                attempt=1,
+            )
+            return ChunkResult(
+                chunk=chunk,
+                entity=None,
+                entities=entities,
+                edges=edges,
+                cost_usd=cost,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                lookup_calls=lookup_tool.calls_used,
+                latency_ms=latency_ms,
+                strategy_chosen="whole_file",
+            )
+        except Exception as exc:
+            latency_ms = (time.monotonic() - start) * 1000
+            log.error(
+                "extraction_chunk",
+                file=chunk.file_path,
+                qname=chunk.qname,
+                status="failed",
+                strategy_chosen="whole_file",
+                error=str(exc),
+            )
+            return ChunkResult(
+                chunk=chunk,
+                entity=None,
+                edges=[],
+                latency_ms=latency_ms,
+                error=str(exc),
+                strategy_chosen="whole_file",
+            )
+
+    async def _extract_batch(
+        self,
+        chunk: MethodChunk,
+        lookup_tool: LookupTool,
+        start: float,
+    ) -> ChunkResult:
+        """One LLM call for a batch of small methods — returns multiple entities."""
+        system = _BATCHED_SYSTEM_PROMPT.format(edge_types=render_prompt_reference())
+        parts = []
+        if chunk.import_context.strip():
+            parts.append(f"[IMPORTS]\n{chunk.import_context.strip()}")
+        if chunk.header_context.strip():
+            parts.append(f"[CLASS HEADER]\n{chunk.header_context.strip()}")
+        siblings = getattr(chunk, "sibling_signatures", None) or []
+        if siblings:
+            sig_list = "\n".join(f"  - {s}" for s in siblings[:20])
+            parts.append(f"[SIBLING METHODS]\n{sig_list}")
+        parts.append(f"[BATCH OF METHODS]\n{chunk.body.strip()}")
+        prompt_text = "\n\n".join(parts)
+
+        try:
+            provider = get_provider()
+            resp = await provider.chat(
+                messages=[
+                    ChatMessage(role="system", content=system),
+                    ChatMessage(role="user",   content=prompt_text),
+                ],
+                role=TaskRole.FAST,
+                max_tokens=MAX_TOKENS_BATCH,
+            )
+            raw = resp.content.strip()
+            cost = getattr(resp, "cost_usd", 0.0)
+            in_tok = getattr(resp, "input_tokens", 0)
+            out_tok = getattr(resp, "output_tokens", 0)
+
+            entities, edges = self._parse_multi_response(raw, chunk)
+            latency_ms = (time.monotonic() - start) * 1000
+            log.info(
+                "extraction_chunk",
+                file=chunk.file_path,
+                qname=chunk.qname,
+                body_chars=len(chunk.body),
+                entities_emitted=len(entities),
+                edges_emitted=len(edges),
+                cost_usd=round(cost, 6),
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                latency_ms=round(latency_ms, 1),
+                lookup_calls=lookup_tool.calls_used,
+                status="done" if entities else "empty",
+                strategy_chosen="batched_methods",
+                attempt=1,
+            )
+            return ChunkResult(
+                chunk=chunk,
+                entity=None,
+                entities=entities,
+                edges=edges,
+                cost_usd=cost,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                lookup_calls=lookup_tool.calls_used,
+                latency_ms=latency_ms,
+                strategy_chosen="batched_methods",
+            )
+        except Exception as exc:
+            latency_ms = (time.monotonic() - start) * 1000
+            log.error(
+                "extraction_chunk",
+                file=chunk.file_path,
+                qname=chunk.qname,
+                status="failed",
+                strategy_chosen="batched_methods",
+                error=str(exc),
+            )
+            return ChunkResult(
+                chunk=chunk,
+                entity=None,
+                edges=[],
+                latency_ms=latency_ms,
+                error=str(exc),
+                strategy_chosen="batched_methods",
             )
 
     # ── Prompt builder ─────────────────────────────────────────────────────────
@@ -247,6 +529,51 @@ class ChunkExtractor:
             parts.append(f"[SIBLING METHODS] (same class — calls to these are internal)\n{sig_list}")
         parts.append(f"[TARGET METHOD] ({chunk.qname})\n{chunk.body.strip()}")
         return "\n\n".join(parts)
+
+    # ── Multi-entity parser (batch / whole-file) ───────────────────────────────
+
+    def _parse_multi_response(
+        self, raw: str, chunk: MethodChunk,
+    ) -> tuple[list[ExtractedChunkEntity], list[ExtractedEdge]]:
+        """Parse a `{"methods": {"qname": {"entity": ..., "edges": [...]}}}` response."""
+        try:
+            data = _parse_json(raw)
+        except Exception:
+            return [], []
+
+        methods_map: dict = data.get("methods", {})
+        all_entities: list[ExtractedChunkEntity] = []
+        all_edges: list[ExtractedEdge] = []
+
+        for qname, method_data in methods_map.items():
+            raw_entity = method_data.get("entity") or {}
+            if not raw_entity:
+                continue
+            entity = ExtractedChunkEntity(
+                entity_type=raw_entity.get("entity_type", "Function"),
+                name=raw_entity.get("name", qname),
+                qname=qname,
+                file_path=chunk.file_path,
+                signature=raw_entity.get("signature", ""),
+                confidence=float(raw_entity.get("confidence", 0.8)),
+                query_text=raw_entity.get("query_text", ""),
+                code_snippet=raw_entity.get("code_snippet", ""),
+                language=chunk.language,
+            )
+            all_entities.append(entity)
+
+            for raw_edge in method_data.get("edges", []):
+                edge_type = raw_edge.get("edge_type", "")
+                if edge_type not in EDGE_TYPES:
+                    continue
+                all_edges.append(ExtractedEdge(
+                    edge_type=edge_type,
+                    target=raw_edge.get("target", ""),
+                    confidence=float(raw_edge.get("confidence", 0.8)),
+                    evidence=raw_edge.get("evidence", ""),
+                ))
+
+        return all_entities, all_edges
 
     # ── Response parser ────────────────────────────────────────────────────────
 

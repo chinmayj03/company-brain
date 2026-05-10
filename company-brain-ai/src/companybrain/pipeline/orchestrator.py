@@ -396,6 +396,28 @@ async def run_pipeline(
                 f"{len(entities)} entities, {len(ckpt_units)} code units already extracted",
             )
 
+        # ── Stage 1 shared objects — created once, used by either path ───────────
+        # Must be instantiated BEFORE the chunk-queue block so that
+        # extractor._deduplicate() is callable inside the chunk-queue try: clause
+        # (ADR-0046 D1 fix: previously the EntityExtractor was created after the
+        # chunk-queue block, causing UnboundLocalError → fallback to legacy path →
+        # both paths ran, doubling LLM cost).
+        extractor   = EntityExtractor()
+        cm_agent    = ContextManagerAgent()
+        accumulator = SharedContextAccumulator()
+
+        from companybrain.pipeline.shared_context_accumulator import L2Persistence
+        repo_path_for_l2 = (request.repos[0].local_path or "") if request.repos else ""
+        branch_for_l2    = request.branch or "main"
+
+        l2 = L2Persistence.load(repo_path_for_l2, branch_for_l2) if repo_path_for_l2 else L2SharedContext()
+        if not l2.is_empty():
+            await progress(
+                "0.6", "🧠",
+                f"L2 warmed from cache: {l2.compact_summary()}",
+                summary=l2.compact_summary(),
+            )
+
         # ── ADR-0044: chunked extraction path ─────────────────────────────────
         # When BRAIN_USE_CHUNK_QUEUE=true (and not overridden by BRAIN_LEGACY_EXTRACT),
         # the pipeline routes through the per-method extraction queue instead of the
@@ -409,9 +431,10 @@ async def run_pipeline(
         )
 
         if _use_chunk_queue:
-            await progress("1", "📦", "ADR-0044 chunked extraction — splitting repo into per-method chunks")
+            await progress("1", "📦", "ADR-0046 adaptive chunked extraction — splitting repo into chunks")
             try:
                 from companybrain.pipeline.code_chunker import CodeChunker
+                from companybrain.pipeline.chunk_relevance_filter import filter_chunks
                 from companybrain.pipeline.queue import enqueue, ChunkInput, retry_failed
                 from companybrain.pipeline.worker import drain_queue, collect_entities_and_edges
                 from companybrain.pipeline.merger import merge_chunk_entities, resolve_edges
@@ -419,19 +442,44 @@ async def run_pipeline(
                 _chunker = CodeChunker()
                 _method_chunks = _chunker.chunk_repo(focal_context.code_units)
 
+                # Telemetry: count per strategy before filtering.
+                _strategy_counts: dict[str, int] = {}
+                for _mc in _method_chunks:
+                    _s = getattr(_mc, "strategy", "per_method")
+                    _strategy_counts[_s] = _strategy_counts.get(_s, 0) + 1
+
                 await progress(
                     "1", "✂️",
-                    f"Chunker produced {len(_method_chunks)} method chunks from "
-                    f"{len(focal_context.code_units)} code units",
+                    f"Chunker produced {len(_method_chunks)} chunks from "
+                    f"{len(focal_context.code_units)} code units "
+                    f"({_strategy_counts})",
                     chunks=len(_method_chunks),
+                    strategy_counts=_strategy_counts,
                 )
 
+                # D3 — relevance filter: drop Lombok/trivial/deprecated/test chunks before LLM.
+                _method_chunks, _filtered_chunks = filter_chunks(_method_chunks)
+                if _filtered_chunks:
+                    _filter_reasons: dict[str, int] = {}
+                    for _fc in _filtered_chunks:
+                        _r = getattr(_fc, "relevance_reason", "unknown")
+                        _filter_reasons[_r] = _filter_reasons.get(_r, 0) + 1
+                    await progress(
+                        "1", "🔎",
+                        f"Relevance filter: {len(_filtered_chunks)} chunks skipped "
+                        f"({_filter_reasons}), {len(_method_chunks)} remaining",
+                        filtered=len(_filtered_chunks),
+                        filter_reasons=_filter_reasons,
+                        remaining=len(_method_chunks),
+                    )
+
                 # Enqueue (idempotent — duplicate body_hashes are silently skipped)
+                _repo_name = getattr(focal_context.code_units[0], "repo_name", "") if focal_context.code_units else ""
                 _chunk_inputs = [
                     ChunkInput(
                         workspace_id=request.workspace_id,
                         job_id=job_id,
-                        repo=getattr(focal_context.code_units[0], "repo_name", ""),
+                        repo=_repo_name,
                         file_path=mc.file_path,
                         qname=mc.qname,
                         body_hash=mc.body_hash,
@@ -439,6 +487,7 @@ async def run_pipeline(
                         header_context=mc.header_context,
                         import_context=mc.import_context,
                         body=mc.body,
+                        strategy=getattr(mc, "strategy", "per_method"),
                     )
                     for mc in _method_chunks
                 ]
@@ -495,23 +544,6 @@ async def run_pipeline(
 
         if not _skip_extraction:
             await progress("1", "🧠", "Entity extraction — L1/L2 context hierarchy + CM Agent (one class at a time)")
-
-        extractor   = EntityExtractor()
-        cm_agent    = ContextManagerAgent()
-        accumulator = SharedContextAccumulator()
-
-        # ADR-0014: warm L2 from the previous run's persisted cache (if available)
-        from companybrain.pipeline.shared_context_accumulator import L2Persistence
-        repo_path_for_l2 = (request.repos[0].local_path or "") if request.repos else ""
-        branch_for_l2    = request.branch or "main"
-
-        l2 = L2Persistence.load(repo_path_for_l2, branch_for_l2) if repo_path_for_l2 else L2SharedContext()
-        if not l2.is_empty():
-            await progress(
-                "0.6", "🧠",
-                f"L2 warmed from cache: {l2.compact_summary()}",
-                summary=l2.compact_summary(),
-            )
 
         if not _skip_extraction and not focal_context.is_empty():
             concurrency = get_extraction_concurrency()

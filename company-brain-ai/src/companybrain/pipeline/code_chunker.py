@@ -37,13 +37,16 @@ class MethodChunk:
     """One LLM-sized chunk representing a single method or top-level declaration."""
     file_path: str
     qname: str                  # "ClassName.methodName" or top-level function name
-    kind: Literal["method", "top_decl", "schema_block"]
+    kind: Literal["method", "top_decl", "schema_block", "whole_file", "batch"]
     body: str                   # verbatim, no truncation
     header_context: str         # class header + fields + annotations
     import_context: str         # deduped, capped at 50 lines
     body_hash: str              # sha256(body)
     language: str
     sibling_signatures: list[str] = None  # other method signatures in same class (no bodies)
+    # ADR-0046: adaptive chunking metadata
+    strategy: str = "per_method"           # whole_file | batched_methods | per_method
+    relevance_reason: str = ""             # non-empty when filtered by ChunkRelevanceFilter
 
     def __post_init__(self):
         if self.sibling_signatures is None:
@@ -75,7 +78,11 @@ class CodeChunker:
     def chunk_unit(self, unit) -> list[MethodChunk]:
         """
         Split a CodeUnit into MethodChunk objects.
-        Falls back to a single whole-file chunk if splitting is not possible.
+
+        Applies ADR-0046 adaptive strategy:
+          WHOLE_FILE      — one chunk for the whole file  (< 4 000 chars)
+          BATCHED_METHODS — small methods grouped into batches (4 000-15 000)
+          PER_METHOD      — one chunk per method (> 15 000)
         """
         content = unit.content or ""
         if not content.strip():
@@ -85,28 +92,105 @@ class CodeChunker:
         file_path = str(unit.file_path or "")
         class_name = unit.class_name or _stem(file_path)
 
-        chunks = self._split(content, lang, file_path, class_name)
-        if not chunks:
-            # Whole-file fallback — still fully verbatim, just not split
-            chunks = [MethodChunk(
+        from companybrain.pipeline.chunk_strategy import (
+            ChunkStrategy, choose_strategy, group_into_batches,
+        )
+
+        # SQL/migration files always split by table — bypass file-size strategy.
+        if _is_schema_file(file_path, content):
+            schema_chunks = self._split_schema(content, file_path)
+            if schema_chunks:
+                for c in schema_chunks:
+                    c.strategy = "per_method"
+                return schema_chunks
+
+        strategy = choose_strategy(len(content))
+
+        if strategy == ChunkStrategy.WHOLE_FILE:
+            import_ctx = _cap_imports(_extract_imports(content, lang))
+            chunk = MethodChunk(
                 file_path=file_path,
                 qname=class_name,
-                kind="top_decl",
-                body=content,
-                header_context="",
-                import_context="",
+                kind="whole_file",
+                body=content if len(content) <= CHUNK_BODY_LIMIT else content[:CHUNK_BODY_LIMIT],
+                header_context=_extract_class_header(content, lang, class_name),
+                import_context=import_ctx,
                 body_hash=_sha256(content),
                 language=lang,
+                strategy="whole_file",
+            )
+            log.debug(
+                "[code-chunker] whole_file",
+                file=file_path,
+                chars=len(content),
+            )
+            return [chunk]
+
+        # PER_METHOD or BATCHED_METHODS: split first, then decide whether to batch.
+        per_method_chunks = self._split(content, lang, file_path, class_name)
+        if not per_method_chunks:
+            # Fallback to whole-file when AST/regex splitting yields nothing.
+            import_ctx = _cap_imports(_extract_imports(content, lang))
+            return [MethodChunk(
+                file_path=file_path,
+                qname=class_name,
+                kind="whole_file",
+                body=content if len(content) <= CHUNK_BODY_LIMIT else content[:CHUNK_BODY_LIMIT],
+                header_context=_extract_class_header(content, lang, class_name),
+                import_context=import_ctx,
+                body_hash=_sha256(content),
+                language=lang,
+                strategy="whole_file",
             )]
 
+        if strategy == ChunkStrategy.PER_METHOD:
+            for c in per_method_chunks:
+                c.strategy = "per_method"
+            log.debug(
+                "[code-chunker] per_method",
+                file=file_path,
+                language=lang,
+                chunks=len(per_method_chunks),
+            )
+            return per_method_chunks
+
+        # BATCHED_METHODS: group small methods together.
+        batches = group_into_batches(per_method_chunks)
+        result: list[MethodChunk] = []
+        first = per_method_chunks[0]  # use for shared context fields
+        for i, batch in enumerate(batches):
+            if len(batch) == 1:
+                # Solo chunk — still label per_method so the extractor uses the
+                # focused single-method prompt (batch of 1 is not worth batching).
+                solo = batch[0]
+                solo.strategy = "per_method"
+                result.append(solo)
+            else:
+                # Build a batch body with clear method delimiters.
+                batch_body = "\n\n".join(
+                    f"[METHOD: {c.qname}]\n{c.body}" for c in batch
+                )
+                batch_chunk = MethodChunk(
+                    file_path=file_path,
+                    qname=f"{class_name}.__batch_{i}__",
+                    kind="batch",
+                    body=batch_body if len(batch_body) <= CHUNK_BODY_LIMIT else batch_body[:CHUNK_BODY_LIMIT],
+                    header_context=first.header_context,
+                    import_context=first.import_context,
+                    body_hash=_sha256(batch_body),
+                    language=lang,
+                    strategy="batched_methods",
+                )
+                result.append(batch_chunk)
+
         log.debug(
-            "[code-chunker] split",
+            "[code-chunker] batched_methods",
             file=file_path,
             language=lang,
-            chunks=len(chunks),
-            total_chars=sum(len(c.body) for c in chunks),
+            methods=len(per_method_chunks),
+            batches=len(result),
         )
-        return chunks
+        return result
 
     def chunk_repo(self, code_units: list) -> list[MethodChunk]:
         """Split all units; deduplicate by (file_path, qname, body_hash)."""

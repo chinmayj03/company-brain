@@ -55,13 +55,21 @@ class QdrantBrainStore:
 
         from companybrain.retrieval.bm25_index import Bm25Index
         from companybrain.retrieval.qdrant_client import (
-            collection_name, ensure_collection, upsert_point,
+            collection_name, ensure_collection,
+            ensure_granularity_collection, granularity_collection_name,
+            upsert_point,
         )
         from companybrain.retrieval.tokenize import tokenize_code
 
         by_type: dict[str, list[tuple[Any, str]]] = {}
         for be, text in self._buffer:
             by_type.setdefault(be.entity_type, []).append((be, text))
+
+        # Ensure the three cross-type granularity collections exist once per run.
+        for gran in ("t2_card", "code", "business"):
+            ensure_granularity_collection(
+                self.qdrant, self.workspace_slug, gran, self.embedder.dim
+            )
 
         for entity_type, group in by_type.items():
             # BM25 upsert
@@ -73,7 +81,7 @@ class QdrantBrainStore:
                 idx.upsert(be.id, text)
             idx.flush()
 
-            # Qdrant: ensure collection then upsert points
+            # Qdrant: ensure per-type collection then upsert points
             ensure_collection(self.qdrant, self.workspace_slug,
                               entity_type, self.embedder.dim)
             coll = collection_name(self.workspace_slug, entity_type)
@@ -87,6 +95,7 @@ class QdrantBrainStore:
                     tf[h] = tf.get(h, 0.0) + 1.0
                 indices = list(tf.keys())
                 values  = list(tf.values())
+                meta = getattr(be, "metadata", {}) or {}
                 payload = {
                     "urn": be.id,
                     "repo": be.repo,
@@ -98,6 +107,42 @@ class QdrantBrainStore:
                 upsert_point(self.qdrant, collection=coll, point_id=be.id,
                              dense=emb, sparse_indices=indices, sparse_values=values,
                              payload=payload)
+
+                # ── Multi-granularity writes (ADR-0043 WS1.S2) ───────────────
+                # 'code': index structural / signature text for code-nav queries.
+                code_text = " \n".join(p for p in [
+                    getattr(be, "qualified_name", ""),
+                    meta.get("signature", ""),
+                    meta.get("code_snippet", "") or "",
+                    meta.get("query_text", "") or "",
+                ] if p)
+                if code_text:
+                    code_emb = self.embedder.embed(code_text)
+                    code_coll = granularity_collection_name(self.workspace_slug, "code")
+                    upsert_point(self.qdrant, collection=code_coll, point_id=be.id,
+                                 dense=code_emb,
+                                 sparse_indices=indices, sparse_values=values,
+                                 payload={**payload, "granularity": "code"})
+
+                # 'business': index t1_summary + business context for semantic queries.
+                biz_text = " \n".join(p for p in [
+                    getattr(be, "t1_summary", "") or "",
+                    getattr(be, "t0_token", "") or "",
+                    meta.get("purpose", "") or "",
+                ] if p)
+                if biz_text:
+                    biz_tokens = tokenize_code(biz_text)
+                    biz_tf: dict[int, float] = {}
+                    for tok in biz_tokens:
+                        h = hash(tok) % (2 ** 31)
+                        biz_tf[h] = biz_tf.get(h, 0.0) + 1.0
+                    biz_emb = self.embedder.embed(biz_text)
+                    biz_coll = granularity_collection_name(self.workspace_slug, "business")
+                    upsert_point(self.qdrant, collection=biz_coll, point_id=be.id,
+                                 dense=biz_emb,
+                                 sparse_indices=list(biz_tf.keys()),
+                                 sparse_values=list(biz_tf.values()),
+                                 payload={**payload, "granularity": "business"})
 
         log.info("Qdrant store commit complete",
                  entities=len(self._buffer),

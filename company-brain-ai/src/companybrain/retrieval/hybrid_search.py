@@ -19,6 +19,7 @@ from companybrain.retrieval.bm25_index import Bm25Index, BM25Index, BM25Result
 from companybrain.retrieval.embedder import Embedder, make_embedder, CodeEmbedder
 from companybrain.retrieval.qdrant_client import (
     collection_name, ensure_collection, make_client,
+    granularity_collection_name, GRANULARITY_COLLECTIONS,
 )
 
 log = structlog.get_logger(__name__)
@@ -60,7 +61,23 @@ class HybridSearcher:
 
     def search(self, query: str, *, top_k: int = 20,
                entity_types: list[str] | None = None,
-               filters: dict | None = None) -> list[SearchHit]:
+               filters: dict | None = None,
+               index: str = "default") -> list[SearchHit]:
+        """Search entities using BM25 + dense RRF fusion.
+
+        Parameters
+        ----------
+        index:
+            Which Qdrant collection granularity to use for dense search.
+            - 'default': per-entity-type collections (original behaviour)
+            - 'code':    cross-type code/signature collection (structural queries)
+            - 'business': cross-type business-context collection (semantic queries)
+            - 't2_card': pre-computed answer cards (hot-node lookups)
+        """
+        # Route to single cross-type granularity collection when requested.
+        if index in GRANULARITY_COLLECTIONS:
+            return self._search_granularity(query, top_k=top_k, granularity=index)
+
         types = entity_types or [
             "component", "screen", "api_contract",
             "data_model", "assumption", "business_context",
@@ -82,6 +99,32 @@ class HybridSearcher:
             all_hits.extend(self._search_one_type(query, et, top_k=top_k * 2))
         all_hits.sort(key=lambda h: h.score, reverse=True)
         return all_hits[:top_k]
+
+    def _search_granularity(self, query: str, *, top_k: int,
+                            granularity: str) -> list[SearchHit]:
+        """Search a single cross-type granularity collection (dense only)."""
+        coll = granularity_collection_name(self.workspace_slug, granularity)
+        existing = self._existing_collections()
+        if existing is not None and coll not in existing:
+            log.debug("Granularity collection missing, returning empty",
+                      collection=coll, granularity=granularity)
+            return []
+        dense_query = self.embedder.embed(query)
+        try:
+            hits = _qdrant_search(self.qdrant, coll, dense_query, top_k)
+        except Exception as exc:
+            log.debug("Qdrant granularity search failed",
+                      coll=coll, error=str(exc))
+            return []
+        return [
+            SearchHit(
+                urn=(h.payload or {}).get("urn", str(h.id)),
+                score=h.score,
+                payload=h.payload or {},
+                dense_rank=i + 1,
+            )
+            for i, h in enumerate(hits)
+        ]
 
     def _existing_collections(self) -> set[str] | None:
         """Return the set of Qdrant collection names that exist for this

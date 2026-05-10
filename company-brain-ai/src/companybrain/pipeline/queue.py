@@ -38,6 +38,10 @@ class QueueChunk:
     body: str
     attempt_count: int
     language: str = ""
+    # ADR-0049 C4: non-None when this row was deduped from a prior run.
+    # Workers should skip the LLM call and use this result directly.
+    result_json: Optional[str] = None
+    source_job_id: Optional[str] = None
 
 
 @dataclass
@@ -69,7 +73,12 @@ async def enqueue(chunks: list[ChunkInput]) -> int:
     """
     Insert chunks into the queue; skip duplicates (ON CONFLICT DO NOTHING).
     Chunks with a non-empty filter_reason are inserted with status='filtered'.
-    Returns the number of rows actually inserted (filtered + pending).
+
+    ADR-0049 C4: cross-job dedup — if a chunk with the same body_hash was
+    already processed successfully in ANY prior run for this workspace, copy
+    its result_json and mark the new row 'done' immediately (zero LLM cost).
+
+    Returns the number of rows actually inserted (filtered + pending + deduped).
     """
     if not chunks:
         return 0
@@ -78,30 +87,90 @@ async def enqueue(chunks: list[ChunkInput]) -> int:
     try:
         inserted = 0
         filtered_count = 0
+        deduped_count = 0
         for c in chunks:
-            status = "filtered" if c.filter_reason else "pending"
+            if c.filter_reason:
+                result = await conn.execute(
+                    """
+                    INSERT INTO extraction_queue
+                        (workspace_id, job_id, repo, file_path, qname, body_hash,
+                         chunk_kind, header_context, import_context, body,
+                         language, filter_reason, status)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'filtered')
+                    ON CONFLICT (workspace_id, job_id, file_path, qname, body_hash)
+                    DO NOTHING
+                    """,
+                    c.workspace_id, c.job_id, c.repo, c.file_path,
+                    c.qname, c.body_hash, c.chunk_kind,
+                    c.header_context, c.import_context, c.body,
+                    c.language or "", c.filter_reason or "",
+                )
+                n = int(result.split()[-1])
+                inserted += n
+                if n:
+                    filtered_count += 1
+                continue
+
+            # ADR-0049 C4: look for a previously-done row with same body_hash.
+            existing = await conn.fetchrow(
+                """
+                SELECT result_json FROM extraction_queue
+                WHERE workspace_id = $1 AND body_hash = $2
+                  AND status = 'done' AND result_json IS NOT NULL
+                ORDER BY processed_at DESC NULLS LAST, finished_at DESC NULLS LAST
+                LIMIT 1
+                """,
+                c.workspace_id, c.body_hash,
+            )
+            if existing and existing["result_json"]:
+                # Reuse: insert as already-done with source_job_id for lineage.
+                result = await conn.execute(
+                    """
+                    INSERT INTO extraction_queue
+                        (workspace_id, job_id, repo, file_path, qname, body_hash,
+                         chunk_kind, header_context, import_context, body,
+                         language, filter_reason, status, result_json, source_job_id,
+                         finished_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '', 'done',
+                            $12, $13, now())
+                    ON CONFLICT (workspace_id, job_id, file_path, qname, body_hash)
+                    DO NOTHING
+                    """,
+                    c.workspace_id, c.job_id, c.repo, c.file_path,
+                    c.qname, c.body_hash, c.chunk_kind,
+                    c.header_context, c.import_context, c.body,
+                    c.language or "",
+                    existing["result_json"], c.job_id,
+                )
+                n = int(result.split()[-1])
+                inserted += n
+                if n:
+                    deduped_count += 1
+                continue
+
+            # Normal insert as 'pending'.
             result = await conn.execute(
                 """
                 INSERT INTO extraction_queue
                     (workspace_id, job_id, repo, file_path, qname, body_hash,
                      chunk_kind, header_context, import_context, body,
                      language, filter_reason, status)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '', 'pending')
                 ON CONFLICT (workspace_id, job_id, file_path, qname, body_hash)
                 DO NOTHING
                 """,
                 c.workspace_id, c.job_id, c.repo, c.file_path,
                 c.qname, c.body_hash, c.chunk_kind,
                 c.header_context, c.import_context, c.body,
-                c.language or "", c.filter_reason or "", status,
+                c.language or "",
             )
             n = int(result.split()[-1])
             inserted += n
-            if c.filter_reason and n:
-                filtered_count += 1
+
         log.info("extraction_queue.enqueue",
                  total=len(chunks), inserted=inserted,
                  filtered=filtered_count,
+                 deduped=deduped_count,
                  skipped=len(chunks) - inserted)
         return inserted
     finally:
@@ -122,7 +191,7 @@ async def claim_next(worker_id: str, workspace_id: str, job_id: str) -> Optional
                 """
                 SELECT id, workspace_id, job_id, repo, file_path, qname,
                        body_hash, chunk_kind, header_context, import_context,
-                       body, attempt_count, language
+                       body, attempt_count, language, result_json, source_job_id
                 FROM extraction_queue
                 WHERE workspace_id = $1
                   AND job_id = $2
@@ -160,6 +229,8 @@ async def claim_next(worker_id: str, workspace_id: str, job_id: str) -> Optional
                 body=row["body"],
                 attempt_count=row["attempt_count"] + 1,
                 language=row["language"] or "",
+                result_json=row["result_json"],
+                source_job_id=str(row["source_job_id"]) if row["source_job_id"] else None,
             )
     finally:
         await conn.close()
@@ -188,8 +259,14 @@ async def mark_done(
     cost_usd: float = 0.0,
     input_tokens: int = 0,
     output_tokens: int = 0,
+    result_json: Optional[str] = None,
 ) -> None:
-    """Mark a chunk as successfully processed."""
+    """Mark a chunk as successfully processed.
+
+    ADR-0049 C4: result_json is stored so future runs can reuse it without
+    calling the LLM (cross-job dedup in enqueue()).
+    finished_at doubles as processed_at for the dedup ORDER BY.
+    """
     conn = await _get_conn()
     try:
         await conn.execute(
@@ -199,10 +276,11 @@ async def mark_done(
                 finished_at = now(),
                 cost_usd = $2,
                 input_tokens = $3,
-                output_tokens = $4
+                output_tokens = $4,
+                result_json = $5
             WHERE id = $1
             """,
-            chunk_id, cost_usd, input_tokens, output_tokens,
+            chunk_id, cost_usd, input_tokens, output_tokens, result_json,
         )
     finally:
         await conn.close()

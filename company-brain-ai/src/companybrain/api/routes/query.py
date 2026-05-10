@@ -27,7 +27,8 @@ from pathlib import Path
 from typing import Any
 
 import structlog
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
+from fastapi.responses import StreamingResponse
 
 import httpx
 
@@ -164,6 +165,9 @@ async def query_graph(request: QueryRequest):
 
     # ── Step 5: Render markdown blob ──────────────────────────────────────────
     render_to_markdown(query_response)
+    # ADR-0049 O5a-5: expose raw markdown without double-encoding.
+    if query_response.summary_md is None:
+        query_response.summary_md = query_response.raw_markdown or query_response.summary
 
     dur = int((time.monotonic() - t0) * 1000)
     log.info(
@@ -176,6 +180,73 @@ async def query_graph(request: QueryRequest):
         total_ms=dur,
     )
     return query_response
+
+
+# ── SSE streaming endpoint (ADR-0049 O5) ─────────────────────────────────────
+
+@router.post("/stream")
+async def query_graph_stream(request: QueryRequest):
+    """
+    POST /query/stream — identical to POST /query but streams the LLM response
+    as Server-Sent Events so the UI can show the first tokens in ~600ms rather
+    than waiting 4-8 seconds for the full response.
+
+    SSE format:
+        data: {"delta": "<text chunk>"}\n\n
+        ...
+        data: [DONE]\n\n
+
+    The client-side change to consume the stream is out of scope for ADR-0049.
+    """
+    from companybrain.config import settings as _s
+
+    provider = get_provider()
+
+    intent = "concept"
+    if not _s.skip_intent_router:
+        try:
+            from companybrain.api.intent_router import classify_intent
+            intent = await classify_intent(
+                request.question,
+                workspace_id=str(request.workspace_id),
+                ttl_sec=_s.brain_query_cache_ttl_sec,
+            )
+        except Exception:
+            pass
+
+    qdrant_index = _INTENT_TO_INDEX.get(intent, "default")
+    assembled_context, _ = await _smart_zone_assemble(
+        task=request.question,
+        workspace_id=str(request.workspace_id),
+        repo_path=getattr(request, "repo_path", None),
+        qdrant_index=qdrant_index,
+    )
+
+    try:
+        from companybrain.api.prompts.user_message import build_user_message
+        user_content = build_user_message(request.question, intent=intent, context=assembled_context)
+    except Exception:
+        user_content = _plain_user_message(request.question, assembled_context)
+
+    async def _event_stream():
+        try:
+            async with provider._client.messages.stream(
+                model=provider.model_for_role(TaskRole.QUERY),
+                system=[{
+                    "type": "text",
+                    "text": QUERY_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{"role": "user", "content": user_content}],
+                max_tokens=4096,
+            ) as stream:
+                async for text in stream.text_stream:
+                    yield f"data: {json.dumps({'delta': text})}\n\n"
+        except Exception as exc:
+            log.warning("[query/stream] Stream error", error=str(exc))
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
 # ── LLM response parsing ──────────────────────────────────────────────────────

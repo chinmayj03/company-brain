@@ -1,12 +1,15 @@
 """
 POST /query — answer a natural language question using tiered graph context + LLM.
 
-Architecture (ADR-0018: Smart-zone context assembler, ADR-0043: response layer):
+Architecture (ADR-0018: Smart-zone context assembler + ADR-0043: intent router,
+              response layer):
 
+  0. IntentRouter.classify_intent() → one of {call_chain, data_flow,
+     change_risk, concept, other} (fast model, cached).
   1. SmartZoneAssembler.assemble() classifies the task, runs hybrid retrieval
-     (ADR-0015), expands via Neo4j blast-radius, MMR-reranks, tiers into
-     T0/T1/T2, compresses task-aware, and renders the final context block.
-  2. Build the LLM messages using the new structured system prompt (ADR-0043).
+     (ADR-0015) on the intent-appropriate index, expands via Neo4j blast-radius,
+     MMR-reranks, tiers into T0/T1/T2, compresses task-aware, renders context.
+  2. Build the per-intent user message from prompts/user_message.py.
   3. Call the LLM, parse the JSON response into a typed QueryResponse.
   4. Populate raw_markdown via the markdown renderer and return.
 
@@ -44,6 +47,16 @@ log = structlog.get_logger(__name__)
 BACKEND_URL  = os.environ.get("BACKEND_URL", "http://localhost:8080")
 INTERNAL_KEY = os.environ.get("AI_INTERNAL_KEY", "dev-internal-key")
 
+# Intent → Qdrant index mapping for intent-aware retrieval (ADR-0043 WS2)
+_INTENT_TO_INDEX: dict[str, str] = {
+    "call_chain":  "default",   # per-entity BM25+dense RRF; needs full graph
+    "data_flow":   "code",      # code/signature collection for SQL queries
+    "change_risk": "default",   # full graph to trace blast radius
+    "concept":     "business",  # business context collection for semantic search
+    "other":       "default",
+}
+
+
 # ── Main handler ──────────────────────────────────────────────────────────────
 
 @router.post("", response_model=QueryResponse)
@@ -51,19 +64,40 @@ async def query_graph(request: QueryRequest):
     """
     POST /query
 
+    0. IntentRouter classifies the question (ADR-0043 WS2)
     1. SmartZoneAssembler.assemble() builds T0/T1/T2 tiered context (ADR-0018)
-    2. Call LLM with structured system prompt (ADR-0043)
-    3. Parse typed QueryResponse
-    4. Return structured response
+    2. Per-intent user message is rendered (ADR-0043 WS2)
+    3. Call LLM with structured system prompt (ADR-0043)
+    4. Parse typed QueryResponse
+    5. Return structured response
     """
+    from companybrain.config import settings
+
     t0 = time.monotonic()
     provider = get_provider()
+
+    # ── Step 0: Intent classification (ADR-0043 WS2) ──────────────────────────
+    intent = "concept"
+    if not settings.skip_intent_router:
+        try:
+            from companybrain.api.intent_router import classify_intent
+            intent = await classify_intent(
+                request.question,
+                workspace_id=str(request.workspace_id),
+                ttl_sec=settings.brain_query_cache_ttl_sec,
+            )
+        except Exception as exc:
+            log.warning("[query] Intent router failed (using 'concept')", error=str(exc))
+
+    log.info("[query] Intent classified", intent=intent)
+    qdrant_index = _INTENT_TO_INDEX.get(intent, "default")
 
     # ── Step 1: Smart-zone assembly (ADR-0018) ────────────────────────────────
     assembled_context, smart_zone_meta = await _smart_zone_assemble(
         task=request.question,
         workspace_id=str(request.workspace_id),
         repo_path=getattr(request, "repo_path", None),
+        qdrant_index=qdrant_index,
     )
 
     # ── Step 1b: Legacy Java assembler fallback ───────────────────────────────
@@ -88,27 +122,29 @@ async def query_graph(request: QueryRequest):
             request.question,
             request.workspace_id,
             getattr(request, "repo_path", None),
+            index=qdrant_index,
         )
         if assembled_context:
-            log.info("[query] Using hybrid retrieval context (SmartZone + Java unavailable)")
+            log.info("[query] Using hybrid retrieval context (SmartZone + Java unavailable)",
+                     intent=intent, index=qdrant_index)
 
-    # ── Step 2: Build LLM prompt ──────────────────────────────────────────────
-    if assembled_context:
-        user_content = (
-            f"KNOWLEDGE BASE:\n\n{assembled_context}\n\n"
-            f"---\n\n"
-            f"QUESTION: {request.question}"
+    # ── Step 2: Build per-intent user message (ADR-0043 WS2) ─────────────────
+    try:
+        from companybrain.api.prompts.user_message import build_user_message
+        user_content = build_user_message(
+            request.question,
+            intent=intent,
+            context=assembled_context,
         )
-    else:
-        user_content = (
-            f"QUESTION: {request.question}\n\n"
-            f"Note: No brain context available. "
-            f"Run the extraction pipeline on the repo first."
-        )
+    except Exception as exc:
+        log.warning("[query] Per-intent template failed (using plain fallback)",
+                    error=str(exc))
+        user_content = _plain_user_message(request.question, assembled_context)
 
     # ── Step 3: Call LLM ──────────────────────────────────────────────────────
     t1 = time.monotonic()
     log.info("[query] Calling LLM",
+             intent=intent,
              task_type=smart_zone_meta.get("task_type"),
              tokens_used=smart_zone_meta.get("tokens_used", 0),
              context_available=bool(assembled_context))
@@ -132,7 +168,7 @@ async def query_graph(request: QueryRequest):
     dur = int((time.monotonic() - t0) * 1000)
     log.info(
         "[query] OK",
-        intent="unknown",
+        intent=intent,
         confidence=query_response.confidence.level,
         affected_count=len(query_response.affected_entities),
         call_chain_len=len(query_response.call_chain),
@@ -161,7 +197,6 @@ def _parse_llm_response(raw: str, context: str | None) -> QueryResponse:
     except Exception as exc:
         log.warning("[query] LLM output was not valid QueryResponse JSON — wrapping",
                     error=str(exc), preview=raw[:200])
-        # Wrap free-form text so callers always get the typed schema.
         confidence_level = (
             "medium" if context else "low"
         )
@@ -188,10 +223,25 @@ def _strip_uncited(text: str) -> str:
     return " ".join(result) if result else text
 
 
+def _plain_user_message(question: str, context: str | None) -> str:
+    if context:
+        return (
+            f"KNOWLEDGE BASE:\n\n{context}\n\n"
+            f"---\n\n"
+            f"QUESTION: {question}"
+        )
+    return (
+        f"QUESTION: {question}\n\n"
+        f"Note: No brain context available. "
+        f"Run the extraction pipeline on the repo first."
+    )
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _smart_zone_assemble(
-    task: str, workspace_id: str, repo_path: str | None
+    task: str, workspace_id: str, repo_path: str | None,
+    qdrant_index: str = "default",
 ) -> tuple[str | None, dict]:
     """Run SmartZoneAssembler; return (rendered_str, meta_dict) or (None, {})."""
     try:
@@ -224,7 +274,10 @@ async def _smart_zone_assemble(
             neo4j_driver=driver,
         )
         budget  = TokenBudget()
-        payload = await assembler.assemble(task=task, budget=budget)
+        # Pass intent-derived index hint to the assembler's searcher.
+        payload = await assembler.assemble(
+            task=task, budget=budget, qdrant_index=qdrant_index
+        )
         await driver.close()
 
         meta = {
@@ -290,8 +343,17 @@ async def _assemble_context(
 
 
 async def _hybrid_retrieve(
-    question: str, workspace_id: str, repo_path: str | None = None
+    question: str, workspace_id: str, repo_path: str | None = None,
+    index: str = "default",
 ) -> str | None:
+    """Retrieve relevant entities via HybridSearcher as a fallback context source.
+
+    Resolves brain_root from (in order):
+      1. Caller-supplied repo_path (typically request.repo_path)
+      2. BRAIN_ROOT env var
+
+    Returns None if neither is set OR neither contains a usable .brain/ directory.
+    """
     try:
         from companybrain.retrieval.hybrid_search import HybridSearcher
         from companybrain.store.identity import workspace_slug_for
@@ -302,7 +364,7 @@ async def _hybrid_retrieve(
         brain_root = Path(effective_root)
         workspace_slug = workspace_slug_for(workspace_id)
         searcher = HybridSearcher(brain_root=brain_root, workspace_slug=workspace_slug)
-        hits = searcher.search(question, top_k=10)
+        hits = searcher.search(question, top_k=10, index=index)
         if not hits:
             return None
         lines = ["## Hybrid Retrieval Results\n"]

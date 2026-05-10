@@ -190,6 +190,18 @@ class Settings(BaseSettings):
     # When True, Stage 4 (gap detection) is skipped. One LLM call but useful
     # for fast iteration / demo runs where gaps aren't being acted on.
     skip_gap_detection:    bool = False
+    # When True, the query-time intent router (ADR-0043 WS2) is skipped.
+    # The query route falls back to the 'concept' template + default index.
+    # Override via env var: BRAIN_SKIP_INTENT_ROUTER=true
+    skip_intent_router:    bool = False
+
+    # ── Query-time budget & cache (ADR-0043) ─────────────────────────────────
+    # brain_query_budget_usd: hard ceiling on LLM spend per /query call.
+    # Enforced by the provider's cost tracker. Set to 0 to disable.
+    brain_query_budget_usd:   float = 0.05
+    # brain_query_cache_ttl_sec: how long intent-router classifications are
+    # cached in-process before re-classifying. 0 = always re-classify.
+    brain_query_cache_ttl_sec: int  = 3600
 
     # ── ADR-0042: per-pass token budgets ─────────────────────────────────────
     # Each budget sits ~2× the empirical p95 for that pass to prevent truncation.

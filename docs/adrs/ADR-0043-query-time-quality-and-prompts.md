@@ -1,6 +1,6 @@
 # ADR-0043: Query-Time Quality, Prompt Architecture & Human-Friendly Responses
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-05-10
 **Deciders:** Chinmay (product), engineering review
 **Companion:** `SONNET-IMPLEMENTATION-PROMPT-ADR-0043.md` for Claude Code brief

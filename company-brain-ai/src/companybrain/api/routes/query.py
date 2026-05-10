@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -188,8 +187,12 @@ def _parse_llm_response(raw: str, context: str | None) -> QueryResponse:
     so existing consumers always receive the same schema.
     """
     # Strip markdown fences the LLM sometimes wraps around JSON.
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+    lines = raw.strip().splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    cleaned = "\n".join(lines).strip()
 
     try:
         data: dict[str, Any] = json.loads(cleaned)
@@ -197,30 +200,13 @@ def _parse_llm_response(raw: str, context: str | None) -> QueryResponse:
     except Exception as exc:
         log.warning("[query] LLM output was not valid QueryResponse JSON — wrapping",
                     error=str(exc), preview=raw[:200])
-        confidence_level = (
-            "medium" if context else "low"
-        )
         return QueryResponse(
-            summary=_strip_uncited(raw),
+            summary=raw,
             confidence=Confidence(
-                level=confidence_level,
+                level="medium" if context else "low",
                 rationale="LLM returned free-form text rather than structured JSON",
             ),
         )
-
-
-_CITATION_RE = re.compile(r"\[urn:cb:[^\]]+\]")
-_CODE_TOKEN_RE = re.compile(r"[A-Z][a-z]+[A-Z]|[a-z]+\.[a-zA-Z]+|[A-Z_]{3,}|\w+\.\w+")
-
-
-def _strip_uncited(text: str) -> str:
-    """Remove sentences that contain code-shaped tokens but no URN citation."""
-    result = []
-    for sentence in re.split(r"(?<=[.!?])\s+", text):
-        if _CODE_TOKEN_RE.search(sentence) and not _CITATION_RE.search(sentence):
-            continue
-        result.append(sentence)
-    return " ".join(result) if result else text
 
 
 def _plain_user_message(question: str, context: str | None) -> str:

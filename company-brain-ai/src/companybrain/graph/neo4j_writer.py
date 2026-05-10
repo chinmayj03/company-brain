@@ -159,6 +159,8 @@ _CANONICAL_EDGE_TYPES: dict[str, str] = {
     "configured_by":    "configured_by",
     "initialized_by":   "initialized_by",
     "rate_limited_by":  "rate_limited_by",
+    # assumption / dependency (assumption_miner static extractor)
+    "relies_on":        "relies_on",
 }
 
 
@@ -1084,6 +1086,7 @@ _EDGE_VERB: dict[str, str] = {
     "CONFIGURED_BY":   "is configured by",
     "INITIALIZED_BY":  "is initialized by",
     "RATE_LIMITED_BY": "is rate-limited by",
+    "RELIES_ON":       "relies on",
 }
 
 

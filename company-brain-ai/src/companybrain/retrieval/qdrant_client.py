@@ -3,6 +3,11 @@
 Collection naming: brain__{workspace_slug}__{entity_type}
 e.g.               brain__dev__component, brain__dev__api_contract
 
+Multi-granularity index (ADR-0043 WS1.S2):
+  brain__{slug}__t2_card   — pre-computed answer cards for hot nodes
+  brain__{slug}__code      — raw code / signature text for structural queries
+  brain__{slug}__business  — business context / t1_summary for semantic queries
+
 Point IDs must be unsigned integers or UUIDs. Entity URNs are arbitrary
 strings, so we derive a deterministic UUID5 from each URN and store the
 original URN in the payload under the "urn" key.
@@ -28,9 +33,26 @@ _ALLOWED_TYPES = (
     "assumption", "business_context", "function_node",
 )
 
+# ── Multi-granularity index suffixes (ADR-0043 WS1.S2) ────────────────────────
+# Each workspace gets three additional cross-type collections alongside the
+# per-entity-type collections.  The suffix maps to what each collection indexes.
+GRANULARITY_COLLECTIONS = ("t2_card", "code", "business")
+
 
 def collection_name(workspace_slug: str, entity_type: str) -> str:
     return f"brain__{workspace_slug}__{entity_type}"
+
+
+def granularity_collection_name(workspace_slug: str, granularity: str) -> str:
+    """Return name for one of the three cross-type granularity collections.
+
+    granularity must be one of: 't2_card', 'code', 'business'.
+    """
+    if granularity not in GRANULARITY_COLLECTIONS:
+        raise ValueError(
+            f"Unknown granularity {granularity!r}. Must be one of {GRANULARITY_COLLECTIONS}"
+        )
+    return f"brain__{workspace_slug}__{granularity}"
 
 
 def make_client() -> QdrantClient:
@@ -40,6 +62,18 @@ def make_client() -> QdrantClient:
 def ensure_collection(client: QdrantClient, workspace_slug: str,
                       entity_type: str, dense_dim: int) -> None:
     name = collection_name(workspace_slug, entity_type)
+    _create_if_missing(client, name, dense_dim)
+
+
+def ensure_granularity_collection(
+    client: QdrantClient, workspace_slug: str, granularity: str, dense_dim: int
+) -> None:
+    """Ensure one of the three cross-type granularity collections exists."""
+    name = granularity_collection_name(workspace_slug, granularity)
+    _create_if_missing(client, name, dense_dim)
+
+
+def _create_if_missing(client: QdrantClient, name: str, dense_dim: int) -> None:
     if client.collection_exists(name):
         return
     client.create_collection(

@@ -329,7 +329,9 @@ class RelationshipExtractor:
             relationships,
         )
 
-        # Merge: LLM results override pattern-distilled results
+        # Merge: add pattern-distilled edges not already in LLM results.
+        # Pre-computed edges have lower precedence; confidence-weighted dedup
+        # (below) will keep the best version of any duplicate triple.
         llm_edge_keys = {(r.from_entity, r.edge_type, r.to_entity) for r in relationships}
         for pre in pre_computed_rels:
             key = (pre["from_entity"], pre["edge_type"], pre["to_entity"])
@@ -344,7 +346,14 @@ class RelationshipExtractor:
                     evidence=pre["evidence"],
                 ))
 
-        log.info("Relationship extraction complete", relationships=len(relationships))
+        # Confidence-weighted dedup (ADR-0043 WS1.S4): replace first-wins with
+        # keep-highest-confidence to avoid silently dropping richer edges.
+        from companybrain.pipeline._dedup import dedup_relationships_by_confidence
+        before_dedup = len(relationships)
+        relationships = dedup_relationships_by_confidence(relationships)
+        dropped = before_dedup - len(relationships)
+        log.info("Relationship extraction complete",
+                 relationships=len(relationships), dedup_dropped=dropped)
         return relationships
 
     # Approximate chars-per-token ratio for Llama models (conservative)

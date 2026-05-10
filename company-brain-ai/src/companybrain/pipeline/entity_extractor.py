@@ -1086,6 +1086,46 @@ class EntityExtractor:
         return list(seen.values())
 
 
+    def _parse_entities_xml(self, raw: str) -> list[ExtractedEntity]:
+        """ADR-0050 M2: iterparse-based partial parser for XML-format responses.
+
+        For LLM responses in XML format (introduced in ADR-0049), this replaces
+        the char-by-char JSON scanner with a more robust stdlib iterparse.
+
+        Each <entity> element is expected to carry child text elements:
+          <type>, <name>, <file>, <repo>, <signature>, <confidence>, <query_text>
+
+        A truncated stream (stop_reason=max_tokens) yields all complete
+        <entity> elements before the truncation point.
+        """
+        from companybrain.util.xml_partial_parser import parse_complete_elements
+        elements = parse_complete_elements(raw, "entity")
+        if not elements:
+            # Fall through to JSON path — output may not be XML.
+            return self._parse_entities(raw)
+
+        entities = []
+        for elem in elements:
+            try:
+                def _text(tag: str, default: str = "") -> str:
+                    child = elem.find(tag)
+                    return (child.text or default) if child is not None else default
+
+                entities.append(ExtractedEntity(
+                    entity_type=_text("type", "Function"),
+                    name=_text("name"),
+                    file=_text("file"),
+                    repo=_text("repo"),
+                    signature=_text("signature"),
+                    last_modified_commit="",
+                    confidence=float(_text("confidence", "0.7") or "0.7"),
+                    query_text=_text("query_text") or None,
+                ))
+            except Exception as exc:
+                log.debug("Skipping malformed XML entity", error=str(exc))
+        return entities
+
+
 # ── Module helpers ────────────────────────────────────────────────────────────
 
 import re as _re

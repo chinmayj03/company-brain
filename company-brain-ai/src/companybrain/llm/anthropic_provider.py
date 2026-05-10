@@ -160,3 +160,60 @@ class AnthropicProvider(LLMProvider):
         ))
 
         return chat_response
+
+    async def chat_streaming(
+        self,
+        messages: list[ChatMessage],
+        *,
+        role: TaskRole = TaskRole.BALANCED,
+        max_tokens: int = 4_000,
+        temperature: float = 0.1,
+        on_truncation_detected=None,
+        **kwargs,
+    ):
+        """ADR-0050 M6: streaming variant with mid-stream stop_reason detection.
+
+        If on_truncation_detected is set, it is scheduled as soon as a
+        'message_delta' event arrives with stop_reason='max_tokens'.
+        Returns the full accumulated response string after the stream closes.
+        """
+        import asyncio as _asyncio
+
+        model = self.model_for_role(role)
+        system_msgs = [m for m in messages if m.role == "system"]
+        user_msgs   = [m for m in messages if m.role != "system"]
+        system_text = "\n\n".join(m.content for m in system_msgs) if system_msgs else None
+        system_param = (
+            [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}]
+            if system_text is not None
+            else []
+        )
+
+        accumulated: list[str] = []
+        usage = None
+
+        async with self._client.messages.stream(
+            model=model,
+            system=system_param,
+            messages=[{"role": m.role, "content": m.content} for m in user_msgs],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        ) as stream:
+            async for event in stream:
+                etype = getattr(event, "type", None)
+                if etype == "content_block_delta":
+                    delta_text = getattr(getattr(event, "delta", None), "text", None)
+                    if delta_text:
+                        accumulated.append(delta_text)
+                elif etype == "message_delta":
+                    stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
+                    if stop_reason == "max_tokens" and on_truncation_detected is not None:
+                        # Don't await — schedule and continue draining the stream.
+                        _asyncio.create_task(on_truncation_detected())
+            try:
+                usage = await stream.get_final_message()
+            except Exception:
+                pass
+
+        content = "".join(accumulated)
+        return content, usage

@@ -499,9 +499,25 @@ async def run_pipeline(
                     for r in _drop_chunks
                 ]
 
-                # ADR-0047 U2: group small siblings before enqueueing live chunks
-                _batcher = ChunkBatcher()
-                _batches = _batcher.batch(_keep_chunks)
+                # ADR-0050 M1: token-budget-aware batching (replaces fixed ChunkBatcher).
+                # batch_planner.pack_into_batches sizes each batch so estimated output
+                # tokens stay under the configured ceiling — prevents truncation before
+                # the call goes out.  Falls back to the legacy ChunkBatcher on import error.
+                try:
+                    from companybrain.pipeline.batch_planner import pack_into_batches as _pack
+                    _batches_raw = _pack(
+                        _keep_chunks,
+                        max_output_tokens=_adr44_settings.adr0050_max_batch_output_tokens,
+                        hard_max_per_batch=_adr44_settings.adr0050_hard_max_per_batch,
+                    )
+                    # Wrap in ChunkBatch for downstream compat
+                    from companybrain.pipeline.chunk_batcher import ChunkBatch as _CB
+                    _batches = [_CB(chunks=b, rationale=f"batch_planner_{len(b)}") for b in _batches_raw]
+                except Exception as _bp_err:
+                    log.warning("batch_planner unavailable, falling back to ChunkBatcher",
+                                error=str(_bp_err))
+                    _batcher = ChunkBatcher()
+                    _batches = _batcher.batch(_keep_chunks)
 
                 # Flatten batches back to chunks for the queue (queue is per-chunk)
                 _live_inputs = [
@@ -614,6 +630,20 @@ async def run_pipeline(
                 ]
                 entities = extractor._deduplicate(fresh_entities + entities)
 
+                # ADR-0050 telemetry: surface recovery stats in pipeline result
+                _recovery_stats: dict = {}
+                try:
+                    from companybrain.pipeline.extraction_recovery import RecoveryStats as _RS
+                    _rs = _RS()   # stats are per-job; future integration threads this through workers
+                    _recovery_stats = {
+                        "recovery_invocations": _rs.recovery_invocations,
+                        "bisection_depth_max":  _rs.bisection_depth_max,
+                        "region_splits":        _rs.region_splits,
+                        "oversized_methods":    _rs.oversized_methods,
+                    }
+                except Exception:
+                    pass
+
                 # ADR-0048: emit structural Class entities for DTO fast-path
                 if not _adr44_settings.use_legacy_navigator:
                     _tracer = getattr(focal_context, "_tracer", None)
@@ -644,6 +674,7 @@ async def run_pipeline(
                     entities=len(_merged),
                     chunks_processed=len(_chunk_results),
                     batches=len(_batches),
+                    recovery=_recovery_stats,
                 )
 
                 _skip_extraction = True

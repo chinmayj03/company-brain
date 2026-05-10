@@ -396,6 +396,103 @@ async def run_pipeline(
                 f"{len(entities)} entities, {len(ckpt_units)} code units already extracted",
             )
 
+        # ── ADR-0044: chunked extraction path ─────────────────────────────────
+        # When BRAIN_USE_CHUNK_QUEUE=true (and not overridden by BRAIN_LEGACY_EXTRACT),
+        # the pipeline routes through the per-method extraction queue instead of the
+        # legacy per-file LLM call.  Both paths converge at Stage 2.
+        from companybrain.config import settings as _adr44_settings
+        _use_chunk_queue = (
+            _adr44_settings.use_chunk_queue
+            and not _adr44_settings.use_legacy_extract
+            and not _skip_extraction
+            and focal_context.code_units
+        )
+
+        if _use_chunk_queue:
+            await progress("1", "📦", "ADR-0044 chunked extraction — splitting repo into per-method chunks")
+            try:
+                from companybrain.pipeline.code_chunker import CodeChunker
+                from companybrain.pipeline.queue import enqueue, ChunkInput, retry_failed
+                from companybrain.pipeline.worker import drain_queue, collect_entities_and_edges
+                from companybrain.pipeline.merger import merge_chunk_entities, resolve_edges
+
+                _chunker = CodeChunker()
+                _method_chunks = _chunker.chunk_repo(focal_context.code_units)
+
+                await progress(
+                    "1", "✂️",
+                    f"Chunker produced {len(_method_chunks)} method chunks from "
+                    f"{len(focal_context.code_units)} code units",
+                    chunks=len(_method_chunks),
+                )
+
+                # Enqueue (idempotent — duplicate body_hashes are silently skipped)
+                _chunk_inputs = [
+                    ChunkInput(
+                        workspace_id=request.workspace_id,
+                        job_id=job_id,
+                        repo=getattr(focal_context.code_units[0], "repo_name", ""),
+                        file_path=mc.file_path,
+                        qname=mc.qname,
+                        body_hash=mc.body_hash,
+                        chunk_kind=mc.kind,
+                        header_context=mc.header_context,
+                        import_context=mc.import_context,
+                        body=mc.body,
+                    )
+                    for mc in _method_chunks
+                ]
+                _inserted = await enqueue(_chunk_inputs)
+                await progress("1", "📥", f"Enqueued {_inserted} chunks ({len(_method_chunks)-_inserted} duplicates skipped)")
+
+                # Drain the queue with parallel workers
+                _chunk_results = await drain_queue(
+                    job_id=job_id,
+                    workspace_id=request.workspace_id,
+                    max_workers=_adr44_settings.chunk_queue_max_workers,
+                )
+
+                # Collect raw entities + edges from all chunk results
+                _raw_chunk_entities, _raw_chunk_edges = collect_entities_and_edges(_chunk_results)
+
+                # Merge duplicate entities (same qname, different body versions)
+                from companybrain.pipeline.merger import merge_chunk_entities
+                _merged = merge_chunk_entities(_raw_chunk_entities)
+
+                # Convert chunk entities → ExtractedEntity for the existing downstream pipeline
+                from companybrain.models.entities import ExtractedEntity
+                entities = [
+                    ExtractedEntity(
+                        entity_type=ce.entity_type,
+                        name=ce.name,
+                        file=ce.file_path,
+                        repo=getattr(focal_context.code_units[0], "repo_name", ""),
+                        signature=ce.signature,
+                        last_modified_commit="",
+                        confidence=ce.confidence,
+                        code_snippet=ce.code_snippet,
+                        query_text=ce.query_text,
+                    )
+                    for ce in _merged
+                ]
+                entities = extractor._deduplicate(fresh_entities + entities)
+
+                await progress(
+                    "1", "✅",
+                    f"Chunked extraction complete — {len(_merged)} entities from "
+                    f"{len(_chunk_results)} chunks",
+                    entities=len(_merged),
+                    chunks_processed=len(_chunk_results),
+                )
+
+                # Signal to downstream stages that extraction is done (skip legacy path)
+                _skip_extraction = True
+
+            except Exception as _chunk_err:
+                log.error("ADR-0044 chunked extraction failed — falling back to legacy", error=str(_chunk_err))
+                await progress("1", "⚠️", f"Chunked extraction failed: {_chunk_err} — using legacy path")
+                # _skip_extraction stays False → falls through to legacy path below
+
         if not _skip_extraction:
             await progress("1", "🧠", "Entity extraction — L1/L2 context hierarchy + CM Agent (one class at a time)")
 

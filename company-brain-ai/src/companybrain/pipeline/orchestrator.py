@@ -514,6 +514,33 @@ async def run_pipeline(
                 # Merge duplicate entities (same qname, different body versions)
                 _merged = merge_chunk_entities(_raw_chunk_entities)
 
+                # Convert ExtractedEdge (chunk format: implicit-from, target-only)
+                # → ExtractedRelationship (downstream format: explicit from+to).
+                # Every chunk edge's from is the chunk's owning entity.
+                # Without this, every edge the LLM extracted PER CHUNK was
+                # silently dropped — only Stage 2's separate relationship pass
+                # produced edges, which was the whole point of chunking.
+                from companybrain.models.entities import ExtractedRelationship
+                _chunk_relationships: list = []
+                for cr in _chunk_results:
+                    if cr.entity is None or not cr.edges:
+                        continue
+                    from_name = cr.entity.name
+                    from_type = cr.entity.entity_type
+                    for e in cr.edges:
+                        _chunk_relationships.append(ExtractedRelationship(
+                            from_entity=from_name,
+                            from_type=from_type,
+                            edge_type=getattr(e, "edge_type", "") or "",
+                            to_entity=getattr(e, "target", "") or "",
+                            to_type="",
+                            confidence=float(getattr(e, "confidence", 0.8) or 0.8),
+                            evidence=getattr(e, "evidence", "") or "",
+                        ))
+                log.info("ADR-0044 chunked extraction: collected chunk edges",
+                         chunks=len(_chunk_results),
+                         relationships_from_chunks=len(_chunk_relationships))
+
                 # Convert chunk entities → ExtractedEntity for the downstream pipeline
                 from companybrain.models.entities import ExtractedEntity
                 entities = [
@@ -990,11 +1017,18 @@ async def run_pipeline(
             {"path": request.endpoint_path, "method": request.http_method},
         )
 
-        # Merge: AST structural + import-graph structural + LLM behavioral.
-        # AST edges come FIRST so their high-confidence (1.0) entries win the
-        # dedup tiebreak when the LLM also surfaces the same edge.
+        # Merge: AST structural + import-graph structural + chunk-queue +
+        # LLM behavioral. Order matters because dedup is first-wins:
+        #   AST/structural (confidence 1.0) wins ties
+        #   chunk-queue edges come second — they have method-body grounding
+        #   LLM-pass edges come last as a fallback for whatever the chunk
+        #     queue and structural sources didn't find
+        _chunk_rels_safe = locals().get("_chunk_relationships") or []
         relationships = _dedup_relationships(
-            ast_structural_rels + structural_rels + llm_relationships
+            ast_structural_rels
+            + structural_rels
+            + _chunk_rels_safe
+            + llm_relationships
         )
 
         stage_2 = {
@@ -1342,14 +1376,47 @@ def _dedup_relationships(rels: list) -> list:
     """
     Deduplicate relationships by (from_entity, edge_type, to_entity).
     First occurrence wins (structural edges come first → they win ties).
+
+    Defensive: tolerates raw dicts (some upstream paths — pattern_distiller,
+    chunk-queue worker output, .brain/ replays — have historically leaked
+    dicts into the relationship list). Coerce to ExtractedRelationship
+    on the fly and log the source so the leak can be tracked down.
     """
+    from companybrain.models.entities import ExtractedRelationship as _ER
+
     seen: set[tuple] = set()
     out: list = []
+    dict_count = 0
     for r in rels:
-        key = (r.from_entity, r.edge_type, r.to_entity)
+        if isinstance(r, dict):
+            dict_count += 1
+            try:
+                r = _ER(
+                    from_entity=r.get("from_entity") or r.get("from") or "",
+                    from_type=r.get("from_type", ""),
+                    edge_type=r.get("edge_type", ""),
+                    to_entity=r.get("to_entity") or r.get("to") or "",
+                    to_type=r.get("to_type", ""),
+                    confidence=float(r.get("confidence", 0.7) or 0.7),
+                    evidence=r.get("evidence", "") or "",
+                )
+            except Exception as exc:
+                log.warning("[_dedup_relationships] dropping malformed dict",
+                            error=str(exc), keys=list(r.keys())[:8])
+                continue
+        try:
+            key = (r.from_entity, r.edge_type, r.to_entity)
+        except AttributeError as exc:
+            log.warning("[_dedup_relationships] skipping non-relationship object",
+                        type=type(r).__name__, error=str(exc))
+            continue
         if key not in seen:
             seen.add(key)
             out.append(r)
+    if dict_count:
+        log.warning("[_dedup_relationships] coerced N dicts to ExtractedRelationship — "
+                    "track upstream and pass the right type",
+                    count=dict_count, total=len(rels))
     return out
 
 

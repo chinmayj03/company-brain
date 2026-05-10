@@ -559,3 +559,43 @@ These are floor estimates assuming one full-time engineer. Real team will be fas
 ---
 
 *Read alongside `current-state-and-breakages.md` for the present-day code-level reality.*
+
+---
+
+## 9. ADR-0042 — Language-Agnostic Extraction Enhancements (Accepted, 2026-05-10)
+
+Stage 1 is now extended by ADR-0042, which removes all per-language branching from
+orchestrator paths and introduces LLM-as-pattern-recognizer passes that work for
+Java, Python, and TypeScript from a single implementation.
+
+### 9.1 What was added
+
+| Enhancement | Description |
+|---|---|
+| **E1** | Cross-file call graph: 3-hop default, ripgrep+LLM two-tier symbol resolver |
+| **E2** | AnnotationPass — ANNOTATES edges for framework annotations/decorators |
+| **E3** | StorageTargetPass — PERSISTS\_TO edges to DatabaseTable entities |
+| **E4** | Method-level freshness hashes (sha256 per body, skip unchanged methods) |
+| **E5** | SchemaMigrationPass — CONTAINS edges from migration files (any framework) |
+| **E6** | ClientCallPass — CALLS\_ENDPOINT edges for outbound HTTP/gRPC/queue calls |
+| **E7** | TestCoveragePass — TESTED\_BY edges from test to production entities |
+| **E8** | Multi-pass chunked relationship extraction (co-locality grouping, 25-entity batches) |
+| **E9** | `edges_reverse` materialized view for blast-radius/upstream queries |
+| **E10** | Intent router — classifies question into 7 intents before SmartZoneAssembler |
+
+### 9.2 Supported languages matrix (as of ADR-0042)
+
+| Pass | Java / Spring | Python / FastAPI | TypeScript / Next.js |
+|---|---|---|---|
+| AnnotationPass | @Transactional, @Cacheable, @Controller | @app.get, @login\_required | @Controller, @UseGuards, export function |
+| StorageTargetPass | jOOQ Tables.*, Hibernate @Table | SQLAlchemy \_\_tablename\_\_ | Drizzle pgTable(), Prisma model |
+| SchemaMigrationPass | Flyway SQL, Liquibase | Alembic op.create\_table | Prisma migrate, Drizzle schema |
+| ClientCallPass | RestTemplate, WebClient, @FeignClient | requests, httpx | fetch, axios, useSWR |
+| TestCoveragePass | JUnit 4/5, TestNG | pytest, unittest | Jest, Vitest, Mocha |
+
+### 9.3 Ops notes
+
+- All passes individually disableable via `BRAIN_SKIP_<PASS_NAME>=true` env var.
+- Cost guard: job halts if cumulative cost exceeds `BRAIN_JOB_BUDGET_USD` (default $0.50).
+- `edges_reverse` materialized view refreshed with `REFRESH MATERIALIZED VIEW CONCURRENTLY`.
+- Intent router adds ~$0.001/query; disable with `ENABLE_INTENT_ROUTER=false`.

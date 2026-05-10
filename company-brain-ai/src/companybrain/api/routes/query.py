@@ -15,11 +15,14 @@ Fallback: if SmartZoneAssembler is unavailable (missing .brain/, Neo4j down),
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+from typing import Literal
 
 import structlog
 from fastapi import APIRouter
+from pydantic import BaseModel
 
 import httpx
 
@@ -31,6 +34,95 @@ log = structlog.get_logger(__name__)
 
 BACKEND_URL  = os.environ.get("BACKEND_URL", "http://localhost:8080")
 INTERNAL_KEY = os.environ.get("AI_INTERNAL_KEY", "dev-internal-key")
+
+# ── ADR-0042 E10: Intent router ───────────────────────────────────────────────
+
+class IntentRouterResponse(BaseModel):
+    """Structured output from the intent router LLM call."""
+    intent: Literal[
+        "impact-analysis", "trace-flow", "explain-purpose",
+        "find-callers", "find-tests", "schema-question", "general"
+    ]
+    anchor_entities: list[str]
+    edge_types_needed: list[str]
+    max_hops: int = 2
+    include_test_coverage: bool = False
+
+
+# Intent → SmartZone policy: which hops / edge types / test coverage to pull
+_INTENT_POLICY: dict[str, dict] = {
+    "impact-analysis": {
+        "hops": 4,
+        "edge_filter": [],   # no filter — all edges
+        "include_tests": True,
+    },
+    "trace-flow": {
+        "hops": 5,
+        "edge_filter": ["CALLS", "CALLS_ENDPOINT", "READS_COLUMN", "WRITES_COLUMN"],
+        "include_tests": False,
+    },
+    "explain-purpose": {
+        "hops": 1,
+        "edge_filter": ["CONTAINS", "USES", "EXTENDS"],
+        "include_tests": False,
+    },
+    "find-callers": {
+        "hops": 2,
+        "edge_filter": ["CALLS"],   # reverse direction handled by query
+        "include_tests": False,
+    },
+    "find-tests": {
+        "hops": 1,
+        "edge_filter": ["TESTED_BY"],
+        "include_tests": True,
+    },
+    "schema-question": {
+        "hops": 2,
+        "edge_filter": ["READS_COLUMN", "WRITES_COLUMN", "CONTAINS"],
+        "include_tests": False,
+    },
+    "general": {
+        "hops": 2,
+        "edge_filter": [],
+        "include_tests": False,
+    },
+}
+
+_INTENT_ROUTER_SYSTEM = """\
+You are a query intent classifier for a code knowledge graph.
+
+Given a natural-language question about code, classify the INTENT and identify
+the anchor entities (named code artifacts: function names, class names, table
+names, column names, endpoint paths) the question is about.
+
+Output ONLY valid JSON matching exactly:
+{
+  "intent": "<one of the values below>",
+  "anchor_entities": ["<entity name>", ...],
+  "edge_types_needed": ["<EDGE_TYPE>", ...],
+  "max_hops": <integer 1-5>,
+  "include_test_coverage": <boolean>
+}
+
+Intent values:
+  impact-analysis  — "what breaks if I change X?", "blast radius of X", "rename X"
+  trace-flow       — "how does X reach Y?", "call chain from X to DB", "data flow"
+  explain-purpose  — "what does X do?", "explain X", "what is X for?"
+  find-callers     — "who calls X?", "what uses X?", "callers of X"
+  find-tests       — "what tests cover X?", "is X tested?", "test coverage for X"
+  schema-question  — "what tables does X read?", "which columns?", "DB schema for X"
+  general          — anything else
+
+EXAMPLES:
+  Q: "What breaks if I rename lob column in plan_info?"
+  → {"intent": "impact-analysis", "anchor_entities": ["plan_info", "lob"], "edge_types_needed": ["READS_COLUMN", "WRITES_COLUMN", "CALLS"], "max_hops": 4, "include_test_coverage": true}
+
+  Q: "How does getCompetitors reach the database?"
+  → {"intent": "trace-flow", "anchor_entities": ["getCompetitors"], "edge_types_needed": ["CALLS", "READS_COLUMN"], "max_hops": 5, "include_test_coverage": false}
+
+  Q: "What tests cover CompetitorService?"
+  → {"intent": "find-tests", "anchor_entities": ["CompetitorService"], "edge_types_needed": ["TESTED_BY"], "max_hops": 1, "include_test_coverage": true}
+"""
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -81,6 +173,17 @@ async def query_graph(request: QueryRequest):
     """
     provider = get_provider()
 
+    # ── Step 0 (ADR-0042 E10): Intent router — classify question before assembly ──
+    intent_result: IntentRouterResponse | None = None
+    from companybrain.config import settings as _qs
+    if _qs.enable_intent_router:
+        intent_result = await _classify_intent(request.question, provider)
+        if intent_result:
+            log.info("[query] Intent classified",
+                     intent=intent_result.intent,
+                     anchors=intent_result.anchor_entities,
+                     hops=intent_result.max_hops)
+
     # ── Step 1: Smart-zone assembly (ADR-0018) ────────────────────────────────
     assembled_context: str | None = None
     smart_zone_meta: dict = {}
@@ -89,6 +192,7 @@ async def query_graph(request: QueryRequest):
         task=request.question,
         workspace_id=str(request.workspace_id),
         repo_path=getattr(request, "repo_path", None),
+        intent=intent_result,
     )
 
     # ── Step 1b: Legacy Java assembler fallback ───────────────────────────────
@@ -178,11 +282,45 @@ async def query_graph(request: QueryRequest):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+async def _classify_intent(
+    question: str,
+    provider,
+) -> "IntentRouterResponse | None":
+    """
+    ADR-0042 E10: One cheap LLM call (~$0.001) that classifies the question intent
+    and identifies anchor entities. Drives SmartZonePolicy for subgraph selection.
+
+    Returns None on failure (non-fatal — caller falls back to generic assembly).
+    """
+    try:
+        from companybrain.config import settings as _cs
+        raw = await provider.chat_json(
+            messages=[
+                ChatMessage(role="system", content=_INTENT_ROUTER_SYSTEM),
+                ChatMessage(role="user",   content=f"Question: {question}"),
+            ],
+            role=TaskRole.FAST,
+            max_tokens=_cs.max_tokens_intent_router,
+        )
+        data = json.loads(raw)
+        return IntentRouterResponse(**data)
+    except Exception as exc:
+        log.debug("[query] Intent router failed (non-fatal)", error=str(exc))
+        return None
+
+
 async def _smart_zone_assemble(
-    task: str, workspace_id: str, repo_path: str | None
+    task: str,
+    workspace_id: str,
+    repo_path: str | None,
+    intent: "IntentRouterResponse | None" = None,
 ) -> tuple[str | None, dict]:
     """
     Run SmartZoneAssembler (ADR-0018) to build T0/T1/T2 tiered context.
+
+    ADR-0042 E10: When intent is provided, applies the corresponding
+    SmartZonePolicy (hops, edge_filter, include_tests) from _INTENT_POLICY.
+
     Returns (rendered_str, meta_dict) or (None, {}) if unavailable.
     """
     try:
@@ -215,7 +353,23 @@ async def _smart_zone_assemble(
             neo4j_driver=driver,
         )
         budget  = TokenBudget()
-        payload = await assembler.assemble(task=task, budget=budget)
+
+        # Apply intent-derived policy when available
+        assemble_kwargs: dict = {"task": task, "budget": budget}
+        if intent:
+            policy = _INTENT_POLICY.get(intent.intent, _INTENT_POLICY["general"])
+            # Pass policy overrides as kwargs — SmartZoneAssembler reads them
+            # if it supports them (graceful no-op if not yet upgraded).
+            assemble_kwargs["intent_policy"] = {
+                "hops":           policy["hops"],
+                "edge_filter":    policy["edge_filter"],
+                "include_tests":  policy["include_tests"],
+                "anchor_entities": intent.anchor_entities,
+            }
+            if intent.anchor_entities:
+                assemble_kwargs["entities"] = intent.anchor_entities
+
+        payload = await assembler.assemble(**assemble_kwargs)
         await driver.close()
 
         meta = {
@@ -224,6 +378,7 @@ async def _smart_zone_assemble(
             "t0": payload.t0,
             "t1": payload.t1,
             "t2": payload.t2,
+            **({"intent": intent.intent} if intent else {}),
         }
         return payload.rendered if payload.rendered else None, meta
 

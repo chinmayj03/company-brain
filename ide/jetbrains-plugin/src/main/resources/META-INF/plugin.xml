@@ -1,0 +1,21 @@
+<idea-plugin>
+  <id>com.companybrain.brain</id>
+  <name>Company Brain</name>
+  <vendor email="dev@example.com" url="https://github.com/chinmayj03/company-brain">company-brain</vendor>
+  <description><![CDATA[
+    Codebase context + extraction insights, inline. Talks to the company-brain
+    MCP server (ADR-0052 P5). Scaffold only — full implementation lands after
+    the VS Code extension is battle-tested.
+  ]]></description>
+
+  <depends>com.intellij.modules.platform</depends>
+
+  <actions>
+    <action id="CompanyBrain.AskBrain"
+            class="com.companybrain.brain.AskBrainAction"
+            text="Ask Brain"
+            description="Ask the company-brain MCP server about this code">
+      <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+    </action>
+  </actions>
+</idea-plugin>

@@ -62,13 +62,57 @@ class JsonFileBrainStore(BrainStore):
 
     async def read(self, entity_id: str) -> Optional[BrainEntity]:
         idx = self._load_index()
+
+        # Tier 1 — direct index lookup (covers entities written under whatever
+        # id form the writer used).
         rel = idx.get(entity_id)
-        if not rel:
-            return None
-        path = self.root / rel
-        if not path.exists():
-            return None
-        return BrainEntity.from_dict(json.loads(path.read_text()))
+        if rel:
+            path = self.root / rel
+            if path.exists():
+                return BrainEntity.from_dict(json.loads(path.read_text()))
+
+        # Tier 2 — canonical URN was looked up but the index keys are legacy
+        # `repo::type::qname` form (or vice versa). Derive the file path
+        # directly from the URN parts. Without this fallback, every
+        # SmartZoneAssembler retrieval reports 'knowledge base is empty
+        # (0 tokens)' because Qdrant returns canonical URNs while the
+        # writer indexed under the legacy form (or any older format).
+        if entity_id.startswith("urn:cb:"):
+            try:
+                derived_path = self._entity_path_from_id(entity_id)
+                if derived_path.exists():
+                    log.debug("brain.json.read URN→path fallback hit",
+                              urn=entity_id, path=str(derived_path))
+                    return BrainEntity.from_dict(json.loads(derived_path.read_text()))
+            except Exception as exc:
+                log.debug("brain.json.read URN derivation failed",
+                          urn=entity_id, error=str(exc))
+
+            # Tier 3 — last-ditch: scan the index for entries that end with
+            # the same qualified_name. Lets us match across older legacy
+            # variants. O(N) but only fires on a true miss.
+            try:
+                from companybrain.store.identity import parse_urn
+                parts = parse_urn(entity_id)
+                qname = parts.qualified_name
+                etype = parts.entity_type
+                # Look for any index key whose tail matches "type::qname"
+                # OR whose mapped path ends with "<type>/<qname>.json".
+                for key, rel_path in idx.items():
+                    rel_path_str = str(rel_path)
+                    if (rel_path_str.endswith(f"{etype}/{_qname_to_filename(qname)}.json")
+                            or key.endswith(f"::{etype}::{qname}")
+                            or key.endswith(f"::{qname}")):
+                        path = self.root / rel_path
+                        if path.exists():
+                            log.debug("brain.json.read URN→legacy fallback hit",
+                                      urn=entity_id, matched_key=key)
+                            return BrainEntity.from_dict(json.loads(path.read_text()))
+            except Exception as exc:
+                log.debug("brain.json.read legacy scan failed",
+                          urn=entity_id, error=str(exc))
+
+        return None
 
     async def is_fresh(self, entity_id: str, version_hash: str) -> bool:
         existing = await self.read(entity_id)

@@ -140,11 +140,18 @@ async def test_claim_next_marks_in_progress():
     from companybrain.pipeline.queue import claim_next
 
     row_id = str(uuid.uuid4())
+    # Mirror the columns claim_next() reads from the extraction_queue row.
+    # `language`, `result_json`, and `source_job_id` were added after this
+    # test was written; the mock_row dict has to include every column the
+    # production query selects or the row→QueueChunk hydration KeyErrors.
     mock_row = {
         "id": row_id, "workspace_id": "ws", "job_id": "job", "repo": "r",
         "file_path": "F.java", "qname": "F.m", "body_hash": "bh",
         "chunk_kind": "method", "header_context": "", "import_context": "", "body": "x",
         "attempt_count": 0,
+        "language": "java",
+        "result_json": None,
+        "source_job_id": None,
     }
 
     mock_conn = AsyncMock()

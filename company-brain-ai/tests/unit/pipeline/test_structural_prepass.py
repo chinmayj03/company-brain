@@ -1,8 +1,21 @@
 """Unit tests for pipeline/structural_prepass.py (ADR-0011)."""
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
+from companybrain.pipeline import structural_prepass
 from companybrain.pipeline.structural_prepass import run_structural_prepass, _local_structural_hash
 from companybrain.collectors.code_tracer import FocalContext, CodeUnit
+
+
+@pytest.fixture(autouse=True)
+def _clear_prepass_cache():
+    # ADR-0049 C6 caches PrePassResult by (repo_path, commit_sha) at module
+    # level. Multiple tests in this file share the same (repo_path, commit_sha)
+    # pair, so without an explicit reset the second test gets a stale cache hit
+    # and never exercises its own mock fingerprints. Reset before AND after to
+    # protect both this file and any cross-module test runs that follow.
+    structural_prepass._PREPASS_CACHE.clear()
+    yield
+    structural_prepass._PREPASS_CACHE.clear()
 
 
 def _make_unit(file_path: str, content: str, language: str = "java") -> CodeUnit:

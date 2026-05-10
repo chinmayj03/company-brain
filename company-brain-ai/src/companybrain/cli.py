@@ -105,6 +105,10 @@ def index(
     ),
     repo_name: str = typer.Option("monorepo", help="Repo identifier for URNs"),
     dry_run: bool = typer.Option(False, help="Discover endpoints but don't run LLM"),
+    headless: bool = typer.Option(False, "--headless",
+                                   help="ADR-0052 P5: non-interactive mode for CI."),
+    json_output: bool = typer.Option(False, "--json",
+                                      help="ADR-0052 P5: emit a structured JSON payload to stdout."),
 ):
     """Whole-repo extraction.
 
@@ -118,6 +122,25 @@ def index(
     if not repo_path.is_dir():
         typer.secho(f"Not a directory: {repo_path}", fg=typer.colors.RED)
         raise typer.Exit(1)
+
+    if headless or json_output:
+        # ADR-0052 P5: structured JSON for CI consumption.
+        from companybrain.cli_helpers.headless import run_index_headless
+
+        payload, exit_code = asyncio.run(run_index_headless(
+            repo_path=repo_path,
+            branch=branch,
+            workspace_id=workspace_id,
+            endpoints=endpoints,
+            repo_name=repo_name,
+            dry_run=dry_run,
+        ))
+        if json_output:
+            import json as _json
+            typer.echo(_json.dumps(payload, default=str))
+        else:
+            typer.echo(payload.get("summary", ""))
+        raise typer.Exit(exit_code)
 
     asyncio.run(_index_async(
         repo_path=repo_path, branch=branch, workspace_id=workspace_id,
@@ -457,6 +480,75 @@ def tools_cmd(
         caps = ",".join(c.value for c in t.requires) or "(none)"
         typer.echo(f"  {name:32s}  [{caps}]")
         typer.echo(f"      {t.description}")
+
+
+# ── ADR-0052 P5: brain mcp serve / brain plugin install (stub) ──────────────
+
+
+@app.command(name="mcp")
+def mcp_cmd(
+    action: str = typer.Argument(..., help="serve"),
+    repo: str = typer.Option(".", help="Repo root (workspace root)"),
+    workspace_id: str = typer.Option(
+        os.getenv("BRAIN_WORKSPACE_ID", "00000000-0000-0000-0000-000000000001"),
+    ),
+    host: str = typer.Option("127.0.0.1"),
+    port: int = typer.Option(8765),
+    http: bool = typer.Option(False, "--http", help="Serve over HTTP instead of stdio."),
+    allow_writes: bool = typer.Option(False, "--allow-writes",
+                                       help="Expose mutating tools (mcp_writes)."),
+):
+    """Serve the brain-as-MCP server (ADR-0052 P5).
+
+        brain mcp serve --repo ./my-repo --workspace ${BRAIN_WORKSPACE_ID}
+        brain mcp serve --http --port 8765
+    """
+    if action != "serve":
+        typer.secho(f"Unknown action: {action!r}. Only 'serve' is supported.",
+                    fg=typer.colors.RED)
+        raise typer.Exit(2)
+
+    from companybrain.harness.mcp_server import build_server
+
+    server = build_server(
+        workspace_id=workspace_id,
+        brain_root=Path(repo).resolve(),
+        allow_writes=allow_writes,
+    )
+    if http:
+        typer.echo(f"brain-as-MCP listening on http://{host}:{port} "
+                   f"(workspace={workspace_id})")
+        asyncio.run(server.run_sse(host=host, port=port))
+    else:
+        typer.echo(f"brain-as-MCP serving over stdio (workspace={workspace_id})",
+                   err=True)
+        asyncio.run(server.run_stdio())
+
+
+@app.command(name="plugin")
+def plugin_cmd(
+    action: str = typer.Argument(..., help="install (stub for P5; full impl in P6)"),
+    target: Optional[str] = typer.Argument(None, help="Plugin name or URL"),
+):
+    """Plugin marketplace stub (ADR-0052 P5; full impl ships in P6).
+
+    Currently records the request and exits non-zero so CI scripts can detect
+    the gap. The P6 PR replaces this body with the real installer.
+    """
+    if action != "install":
+        typer.secho(f"Unknown action: {action!r}. Only 'install' is supported.",
+                    fg=typer.colors.RED)
+        raise typer.Exit(2)
+    if not target:
+        typer.secho("plugin install requires a name or URL argument.",
+                    fg=typer.colors.RED)
+        raise typer.Exit(2)
+    typer.echo(
+        "brain plugin install is a P5 stub — the marketplace lands in ADR-0052 P6.\n"
+        f"  requested: {target}\n"
+        "  Track progress: docs/adrs/ADR-0052-comprehensive-feature-adoption.md §Phase 6"
+    )
+    raise typer.Exit(3)
 
 
 if __name__ == "__main__":

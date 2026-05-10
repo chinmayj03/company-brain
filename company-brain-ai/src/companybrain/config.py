@@ -299,5 +299,20 @@ class Settings(BaseSettings):
     # the env var BRAIN_AUTOAPPROVE=true is also honoured.
     grants_auto_approve: bool = False
 
+    # ── ADR-0052 P5: slash + MCP + workspace + rooms + headless + SDK ──────
+    # Mounts the brain-as-MCP route at /mcp/harness on the FastAPI app. Off
+    # by default; turn on for environments that want IDEs to connect over
+    # HTTP without spinning up `brain mcp serve --http` separately.
+    harness_mcp_enabled: bool = False
+    # Host + port for `brain mcp serve --http`. Defaults match the docs.
+    harness_mcp_host: str = "127.0.0.1"
+    harness_mcp_port: int = 8765
+    # Cap on `run_repo_command` wall-clock per call (seconds). Tools may
+    # request shorter timeouts but never longer.
+    run_repo_command_max_timeout_s: int = 300
+    # Per-job worktree prefix; visible in `git worktree list`. Tweak only if
+    # you have a tmp-dir convention.
+    worktree_prefix: str = "brain-wt-"
+
 
 settings = Settings()

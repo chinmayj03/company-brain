@@ -105,19 +105,24 @@ def register_tool(
 # Import every tool module so its @register_tool calls fire at package load.
 # Order is irrelevant; each module is independent. P1 tools register the
 # concrete pipeline calls (read_file, extract_methods_from_class, ...); the
-# P2 spawn_* tools build sub-agent allowlists from those P1 names.
+# P2 spawn_* tools build sub-agent allowlists from those P1 names; the
+# P5 (ADR-0052) modules add shell + web + branch-diff tools.
 from companybrain.harness.tools import (  # noqa: E402,F401
     discover_routes,
     extract_methods_from_class,
     finalize_brain,
     find_entry_handler,
+    git_branch_diff,
     glob_files,
     grep_code,
     list_candidate_files,
     read_file,
+    run_repo_command,
     spawn_extractor,
     spawn_research,
     spawn_verifier,
+    web_fetch,
+    web_search,
     write_to_brain,
 )
 

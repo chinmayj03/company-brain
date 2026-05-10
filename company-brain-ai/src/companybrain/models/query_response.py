@@ -1,0 +1,81 @@
+"""
+Structured response schema for POST /query — ADR-0043 WS3.
+
+Every factual claim in summary/call_chain must end with a URN citation so
+the frontend can wire click-to-jump. The LLM is instructed to drop claims
+it cannot cite rather than fabricate node names.
+"""
+from __future__ import annotations
+
+from typing import Literal, Optional
+
+from pydantic import BaseModel
+
+
+class CallChainStep(BaseModel):
+    ord: int
+    urn: str
+    name: str
+    role: Literal[
+        "entry", "controller", "service", "repository",
+        "query", "external", "frontend", "test", "other"
+    ]
+    edge_in: Optional[str] = None
+    annotations: list[str] = []
+    one_liner: str
+
+
+class SqlBlock(BaseModel):
+    source_urn: str
+    language: Literal["sql", "jpql", "jooq", "cypher", "mongo", "other"]
+    body: str
+
+
+class Citation(BaseModel):
+    urn: str
+    name: str
+    why_relevant: str
+    confidence: float
+
+
+class RiskAssessment(BaseModel):
+    level: Literal["low", "medium", "high"]
+    reason: str
+    blast_radius_count: int
+    sample_affected: list[Citation] = []
+
+
+class Confidence(BaseModel):
+    level: Literal["high", "medium", "low"]
+    rationale: str
+
+
+class QueryResponse(BaseModel):
+    """
+    Typed response returned by POST /query (ADR-0043 WS3).
+
+    ``summary`` is backward-compatible with the old ``answer: str`` field —
+    UI consumers that only read summary continue to work on day 1.
+    """
+    summary: str
+    call_chain: list[CallChainStep] = []
+    sql_quotes: list[SqlBlock] = []
+    affected_entities: list[Citation] = []
+    change_risk: Optional[RiskAssessment] = None
+    confidence: Confidence
+    caveats: list[str] = []
+    follow_up_questions: list[str] = []
+    raw_markdown: str = ""
+
+    # Legacy aliases so callers that read .answer or .sources keep working.
+    @property
+    def answer(self) -> str:
+        return self.summary
+
+    @property
+    def sources(self) -> list[dict]:
+        return [{"urn": c.urn, "name": c.name} for c in self.affected_entities]
+
+    @property
+    def affected_nodes(self) -> list[dict]:
+        return [{"urn": c.urn, "name": c.name} for c in self.affected_entities]

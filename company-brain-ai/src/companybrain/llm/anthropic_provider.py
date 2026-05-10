@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
+import httpx
 import structlog
 from anthropic import AsyncAnthropic
 
@@ -50,11 +52,31 @@ _ENV_OVERRIDES: dict[TaskRole, str] = {
     if f"ANTHROPIC_MODEL_{role.value.upper()}" in os.environ
 }
 
+# ADR-0049 O4: module-level httpx singleton — avoids a TCP + TLS handshake
+# (~75ms) on every LLM call.  Saves ~1.5s for a typical 20-call pipeline run.
+_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+        _HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=5.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=10,
+                max_connections=20,
+            ),
+        )
+    return _HTTP_CLIENT
+
 
 class AnthropicProvider(LLMProvider):
 
     def __init__(self, api_key: str):
-        self._client = AsyncAnthropic(api_key=api_key)
+        self._client = AsyncAnthropic(
+            api_key=api_key,
+            http_client=_get_http_client(),
+        )
         log.info("AnthropicProvider initialised", model_overrides=_ENV_OVERRIDES)
 
     @property
@@ -98,13 +120,13 @@ class AnthropicProvider(LLMProvider):
 
         cache_creation = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
         cache_read     = getattr(response.usage, "cache_read_input_tokens",     0) or 0
-        log.debug(
-            "anthropic chat complete",
+        log.info(
+            "llm_call",
             model=model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
-            cache_read=cache_read,
-            cache_creation=cache_creation,
+            cache_read_tokens=cache_read,
+            cache_creation_tokens=cache_creation,
         )
 
         chat_response = ChatResponse(

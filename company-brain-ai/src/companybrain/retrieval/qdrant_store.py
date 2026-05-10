@@ -103,6 +103,9 @@ class QdrantBrainStore:
                     "qualified_name": be.qualified_name,
                     "t1_summary": be.t1_summary,
                     "file": be.file,
+                    # ADR-0049 C5: stored so future runs can skip re-embedding
+                    # unchanged entities via QdrantEntityWriter.upsert_entity.
+                    "version_hash": meta.get("body_hash", "") or meta.get("version_hash", ""),
                 }
                 upsert_point(self.qdrant, collection=coll, point_id=be.id,
                              dense=emb, sparse_indices=indices, sparse_values=values,

@@ -58,6 +58,11 @@ class QueryResponse(BaseModel):
     UI consumers that only read summary continue to work on day 1.
     """
     summary: str
+    # ADR-0049 O5a-5: raw markdown field — avoids double-encoding markdown
+    # inside a JSON string (every backtick and newline was escaped, costing 2×
+    # tokens and forcing the client to decode twice).  summary stays for one
+    # release as a deprecated alias.
+    summary_md: Optional[str] = None
     call_chain: list[CallChainStep] = []
     sql_quotes: list[SqlBlock] = []
     affected_entities: list[Citation] = []

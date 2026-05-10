@@ -23,6 +23,11 @@ CB_API_URL = os.getenv("CB_API_URL", "http://cb-api:8090")
 CB_API_TIMEOUT = 300.0  # seconds — large repos take time
 log = structlog.get_logger(__name__)
 
+# ADR-0049 C6: module-level cache keyed by (repo_path, commit_sha).
+# Skips the cb-api round-trip and fingerprint fetch entirely when the repo
+# SHA hasn't moved since the last call in this process lifetime.
+_PREPASS_CACHE: dict[tuple[str, str], "PrePassResult"] = {}
+
 
 async def run_structural_prepass(
     *,
@@ -36,7 +41,16 @@ async def run_structural_prepass(
     2. GET  cb-api /fingerprints  (returns Neo4j-side structural hashes)
     3. For each CodeUnit: compare local structural hash to Neo4j's;
        fresh if equal, dirty otherwise.
+
+    ADR-0049 C6: results are cached by (repo_path, commit_sha) so repeated
+    calls within the same process (e.g., re-running the same endpoint) skip
+    the cb-api round-trip entirely.
     """
+    cache_key = (repo_path, commit_sha)
+    if cache_key in _PREPASS_CACHE:
+        log.info("structural_prepass.cache_hit", repo=repo_path, sha=commit_sha[:8])
+        return _PREPASS_CACHE[cache_key]
+
     result = PrePassResult()
 
     # Step 1: trigger structural extraction
@@ -94,6 +108,9 @@ async def run_structural_prepass(
         dirty=len(result.dirty_units),
         cb_api=result.cb_api_status,
     )
+    # ADR-0049 C6: store for future calls with the same repo+SHA.
+    if commit_sha:
+        _PREPASS_CACHE[cache_key] = result
     return result
 
 

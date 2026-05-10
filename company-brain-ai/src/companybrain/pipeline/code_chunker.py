@@ -97,12 +97,15 @@ class CodeChunker:
     when the file does not exist on disk.
     """
 
-    def chunk_file(self, fp: str) -> list[MethodChunk]:
+    def chunk_file(self, fp: str, file_cache=None) -> list[MethodChunk]:
         """
         ADR-0047 primary path: read file from disk, assert it's not pre-truncated,
         split into method chunks.
+
+        file_cache: optional FileCache instance (ADR-0049 C2).  When supplied,
+        reads are de-duped across callers in the same pipeline job.
         """
-        raw = Path(fp).read_text(errors="ignore")
+        raw = file_cache.read(fp) if file_cache is not None else Path(fp).read_text(errors="ignore")
 
         # Defensive assert — ADR-0047 D4
         if len(raw) == _TRUNCATION_SENTINEL_LEN or (
@@ -207,6 +210,7 @@ class CodeChunker:
 
     def _split_via_ast(
         self, content: str, lang: str, file_path: str, class_name: str,
+        ast_cache=None,
     ) -> list[MethodChunk]:
         try:
             from companybrain.pipeline.ast_analyzer import ASTAnalyzer
@@ -214,6 +218,7 @@ class CodeChunker:
             unit = SimpleNamespace(
                 language=lang, file_path=file_path,
                 content=content, class_name=class_name,
+                _ast_cache=ast_cache,   # passed through to ASTAnalyzer if it supports it
             )
             analyzer = ASTAnalyzer()
             symbol_table = analyzer.analyze(unit)

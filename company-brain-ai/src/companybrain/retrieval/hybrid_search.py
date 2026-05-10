@@ -219,6 +219,9 @@ class FileHybridSearcher:
         self._bm25_indexes: dict[str, BM25Index] = {}
         self._file_contents: dict[str, dict[str, str]] = {}
         self._embedder = CodeEmbedder()
+        # ADR-0049 C7: track the commit SHA when the BM25 index was last built
+        # for each repo.  When the SHA changes, rebuild; otherwise reuse.
+        self._index_built_at_sha: dict[str, Optional[str]] = {}
         try:
             from companybrain.retrieval.reranker import Reranker  # type: ignore
             self._reranker = Reranker()
@@ -226,7 +229,9 @@ class FileHybridSearcher:
             self._reranker = None
 
     async def index_repo(self, repo_path: Path, repo_name: str) -> None:
-        if repo_name in self._bm25_indexes:
+        # ADR-0049 C7: skip rebuild if index exists AND the repo SHA hasn't moved.
+        current_sha = _resolve_commit_sha(str(repo_path))
+        if repo_name in self._bm25_indexes and self._index_built_at_sha.get(repo_name) == current_sha:
             return
         from companybrain.pipeline.file_walker import FileWalker
         walker = FileWalker(repo_path)
@@ -244,6 +249,8 @@ class FileHybridSearcher:
         bm25.build()
         self._bm25_indexes[repo_name] = bm25
         self._file_contents[repo_name] = contents
+        # ADR-0049 C7: record SHA so we can skip this rebuild on subsequent calls.
+        self._index_built_at_sha[repo_name] = current_sha
         if self._embedder.enabled and embeddings_batch:
             from companybrain.retrieval.qdrant_store import QdrantStore, path_to_point_id
             qs = QdrantStore()
@@ -355,3 +362,21 @@ def _classify_source(in_bm25: bool, in_dense: bool) -> str:
     if in_dense:
         return "dense"
     return "graph"
+
+
+def _resolve_commit_sha(repo_path: str) -> Optional[str]:
+    """Return the HEAD commit SHA for repo_path, or None if not a git repo."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None

@@ -81,6 +81,8 @@ class PipelineResult:
     git_commits_found: int = 0
     files_traced: list[str] = field(default_factory=list)
     stages_summary: list[dict] = field(default_factory=list)
+    # ADR-0049: per-run cost/cache telemetry surfaced by /pipeline/jobs/{id}
+    telemetry: dict = field(default_factory=dict)
 
 
 async def run_pipeline(
@@ -107,6 +109,8 @@ async def run_pipeline(
 
     # Reset the per-run usage tracker so each run starts clean
     from companybrain.llm.base import get_usage_tracker
+    import time as _pipeline_time
+    _pipeline_start = _pipeline_time.perf_counter()
     _run_tracker = get_usage_tracker()
     _run_tracker.reset()
 
@@ -415,6 +419,11 @@ async def run_pipeline(
                 f"{len(entities)} entities, {len(ckpt_units)} code units already extracted",
             )
 
+        # L2 repo/branch needed both for ADR-0049 O2 (pre-enqueue skip) and
+        # ADR-0014 L2 warm-up below.  Define once here so both paths share it.
+        repo_path_for_l2 = (request.repos[0].local_path or "") if request.repos else ""
+        branch_for_l2    = request.branch or "main"
+
         # ── ADR-0044: chunked extraction path ─────────────────────────────────
         # When BRAIN_USE_CHUNK_QUEUE=true (and not overridden by BRAIN_LEGACY_EXTRACT),
         # the pipeline routes through the per-method extraction queue instead of the
@@ -432,6 +441,8 @@ async def run_pipeline(
         extractor   = EntityExtractor()
         cm_agent    = ContextManagerAgent()
         accumulator = SharedContextAccumulator()
+        # ADR-0049 O3: set True by the chunked path when it produced chunk_results.
+        _skip_gap_detection_auto = False
 
         if _use_chunk_queue:
             await progress("1", "📦", "ADR-0047 chunked extraction — splitting repo into per-method chunks")
@@ -509,6 +520,23 @@ async def run_pipeline(
                     )
                     for mc in _keep_chunks
                 ]
+
+                # ADR-0049 O2: skip enqueueing chunks whose file hash already
+                # has a 'done' entry in the L2 cache from a prior run.
+                _l2_hit_files: set[str] = _load_l2_cache_hits(
+                    repo_path_for_l2, branch_for_l2
+                )
+                if _l2_hit_files:
+                    _live_before = len(_live_inputs)
+                    _live_inputs = [
+                        ci for ci in _live_inputs
+                        if ci.file_path not in _l2_hit_files
+                    ]
+                    log.info(
+                        "ADR-0049 O2: L2-cache short-circuit",
+                        skipped=_live_before - len(_live_inputs),
+                        remaining=len(_live_inputs),
+                    )
 
                 _all_inputs = _filtered_inputs + _live_inputs
                 _inserted = await enqueue(_all_inputs)
@@ -589,6 +617,19 @@ async def run_pipeline(
 
                 _skip_extraction = True
 
+                # ADR-0049 O3: the chunked path emits business_context per
+                # method — Stage 1.5 (intent synthesis) and Stage 4 (gap
+                # detection) would re-derive the same signals. Skip them when
+                # we have a successful chunked run to save ~2 LLM calls.
+                if _chunk_results:
+                    _skip_intent_synthesis = True
+                    _skip_gap_detection_auto = True
+                    log.info(
+                        "ADR-0049 O3: skip intent-synthesis + gap-detection "
+                        "(chunked path provides equivalent data)",
+                        chunks=len(_chunk_results),
+                    )
+
             except Exception as _chunk_err:
                 # Include the full traceback so the legacy-path fallback isn't
                 # silent. Without this, you only see "Failed to parse entity
@@ -611,9 +652,7 @@ async def run_pipeline(
 
         # ADR-0014: warm L2 from the previous run's persisted cache (if available)
         from companybrain.pipeline.shared_context_accumulator import L2Persistence
-        repo_path_for_l2 = (request.repos[0].local_path or "") if request.repos else ""
-        branch_for_l2    = request.branch or "main"
-
+        # repo_path_for_l2 / branch_for_l2 defined above (before chunk-queue block).
         l2 = L2Persistence.load(repo_path_for_l2, branch_for_l2) if repo_path_for_l2 else L2SharedContext()
         if not l2.is_empty():
             await progress(
@@ -1138,16 +1177,21 @@ async def run_pipeline(
         # One call saved per run — useful for fast iteration / demo runs
         # where gaps aren't being acted on downstream.
         gaps: list = []
-        if not _stage_settings.skip_gap_detection:
+        if not _stage_settings.skip_gap_detection and not _skip_gap_detection_auto:
             await progress("4", "🔎", "Gap detection — finding unexplained behaviour and missing owners")
             gaps = await GapDetector().detect(entities, git_clusters, annotations, contexts)
             stage_4 = {"stage": "4", "label": "Gap Detection", "gaps": len(gaps)}
             stages_summary.append(stage_4)
             await progress("4", "✅", f"Detected {len(gaps)} gaps")
         else:
-            await progress("4", "⏭️ ",
-                           "Gap detection SKIPPED (settings.skip_gap_detection=true)")
-            stages_summary.append({"stage": "4", "label": "Gap Detection (skipped)", "gaps": 0})
+            reason = (
+                "ADR-0049 O3: chunked path provides equivalent data"
+                if _skip_gap_detection_auto
+                else "settings.skip_gap_detection=true"
+            )
+            await progress("4", "⏭️ ", f"Gap detection SKIPPED ({reason})")
+            stages_summary.append({"stage": "4", "label": "Gap Detection (skipped)",
+                                    "gaps": 0, "reason": reason})
 
         # ── Stage 5: Graph population — via BrainStore fan-out (ADR-0012) ──────
         # Write to JSON SOT first, then mirror to Postgres + Neo4j.
@@ -1273,6 +1317,7 @@ async def run_pipeline(
         # Pipeline completed successfully — clear checkpoint so next run is fresh
         _checkpoint_clear(request)
 
+        _usage = _run_tracker.summary()
         return PipelineResult(
             job_id=job_id,
             workspace_id=request.workspace_id,
@@ -1284,6 +1329,13 @@ async def run_pipeline(
             git_commits_found=git_commits,
             files_traced=files_traced,
             stages_summary=stages_summary,
+            telemetry={
+                "wall_seconds": round(_pipeline_time.perf_counter() - _pipeline_start, 2),
+                "total_input_tokens": _usage["total_input_tokens"],
+                "total_output_tokens": _usage["total_output_tokens"],
+                "total_cache_read_tokens": _usage["total_cache_read_tokens"],
+                "total_cost_usd": _usage["total_cost_usd"],
+            },
         )
 
     except Exception as e:
@@ -1300,6 +1352,30 @@ async def run_pipeline(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _load_l2_cache_hits(repo_path: str, branch: str) -> set[str]:
+    """ADR-0049 O2: return the set of file_paths whose hash appears as 'done'
+    in the L2 cache from a prior run.  Files in this set can skip chunk-queue
+    enqueue because their entities are already in the brain store.
+
+    Returns an empty set on any error (non-fatal; falls through to full extraction).
+    """
+    if not repo_path:
+        return set()
+    try:
+        import json as _json
+        cache_file = _Path(repo_path) / ".brain" / ".l2-cache" / f"{branch}.json"
+        if not cache_file.exists():
+            return set()
+        data = _json.loads(cache_file.read_text())
+        # L2 cache schema: {"files": {"<file_path>": {"hash": "...", "status": "done"}}}
+        files = data.get("files", {})
+        return {fp for fp, meta in files.items()
+                if isinstance(meta, dict) and meta.get("status") == "done"}
+    except Exception:
+        return set()
+
 
 async def _trigger_structural_extraction(
     repo_path: str,

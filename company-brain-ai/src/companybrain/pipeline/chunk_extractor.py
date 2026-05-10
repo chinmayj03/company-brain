@@ -38,6 +38,10 @@ MAX_TOKENS_SINGLE   = 1_200   # raised 600 → 1200 — single method with verbo
 MAX_TOKENS_BATCH    = 2_400   # raised 1200 → 2400 — batched call returns an
                               # array of N entities × per-entity payload
 
+# ADR-0049 O5a-4: stub constant for future XML output switching.
+# ADR-0050 will flip this to "xml" once the partial-parse iterparse is ready.
+OUTPUT_FORMAT = "json"
+
 
 # ── Output models ──────────────────────────────────────────────────────────────
 
@@ -112,6 +116,7 @@ Entity types: ApiEndpoint | Function | InterfaceMethod | Class | DatabaseQuery |
 Edge types must come from the canonical taxonomy:
 {edge_types}
 
+Return a single line of compact JSON (no whitespace between tokens, no indentation).
 Output strict JSON — no prose, no markdown:
 
 {{
@@ -139,6 +144,7 @@ The [IMPORTS] and [CLASS HEADER] sections apply to all of them.
 
 For each method return exactly one entity + edges.
 
+Return a single line of compact JSON (no whitespace between tokens, no indentation).
 Return a JSON array with exactly {n} items (one per method, same order):
 
 [
@@ -386,28 +392,55 @@ class ChunkExtractor:
     # ── Prompt builders ────────────────────────────────────────────────────────
 
     def _build_single_prompt(self, chunk: MethodChunk) -> str:
+        # ADR-0049 O5a-1: XML tags for inputs — reduces token count ~20% vs
+        # bracket markers and improves model attention on structured sections.
         parts: list[str] = []
+        file_path = chunk.file_path or ""
+        # Derive class name from qname ("ClassName.methodName") or file stem.
+        class_name = chunk.qname.rsplit(".", 1)[0] if "." in chunk.qname else ""
+        method_name = chunk.qname.rsplit(".", 1)[-1]
+
         if chunk.import_context.strip():
-            parts.append(f"[IMPORTS]\n{chunk.import_context.strip()}")
+            parts.append(f"<imports>\n{chunk.import_context.strip()}\n</imports>")
         if chunk.header_context.strip():
-            parts.append(f"[CLASS HEADER]\n{chunk.header_context.strip()}")
+            parts.append(
+                f'<class_header file="{file_path}" class="{class_name}">\n'
+                f"{chunk.header_context.strip()}\n"
+                f"</class_header>"
+            )
         siblings = getattr(chunk, "sibling_signatures", None) or []
         if siblings:
-            sig_list = "\n".join(f"  - {s}" for s in siblings[:20])
-            parts.append(f"[SIBLING METHODS] (same class — calls to these are internal)\n{sig_list}")
-        parts.append(f"[TARGET METHOD] ({chunk.qname})\n{chunk.body.strip()}")
+            sig_list = "\n".join(f"  {s}" for s in siblings[:20])
+            parts.append(f"<sibling_methods note=\"calls to these are same-class internal\">\n{sig_list}\n</sibling_methods>")
+        parts.append(
+            f'<method name="{method_name}" qname="{chunk.qname}" lang="{chunk.language}">\n'
+            f"{chunk.body.strip()}\n"
+            f"</method>"
+        )
         return "\n\n".join(parts)
 
     def _build_batch_prompt(self, chunks: list[MethodChunk]) -> str:
+        # ADR-0049 O5a-1: XML tags for batch inputs.
         parts: list[str] = []
-        # Shared context from first chunk (all are same class)
         first = chunks[0]
+        file_path = first.file_path or ""
+        class_name = first.qname.rsplit(".", 1)[0] if "." in first.qname else ""
+
         if first.import_context.strip():
-            parts.append(f"[IMPORTS]\n{first.import_context.strip()}")
+            parts.append(f"<imports>\n{first.import_context.strip()}\n</imports>")
         if first.header_context.strip():
-            parts.append(f"[CLASS HEADER]\n{first.header_context.strip()}")
+            parts.append(
+                f'<class_header file="{file_path}" class="{class_name}">\n'
+                f"{first.header_context.strip()}\n"
+                f"</class_header>"
+            )
         for i, chunk in enumerate(chunks, start=1):
-            parts.append(f"[METHOD {i}] ({chunk.qname})\n{chunk.body.strip()}")
+            method_name = chunk.qname.rsplit(".", 1)[-1]
+            parts.append(
+                f'<method index="{i}" name="{method_name}" qname="{chunk.qname}" lang="{chunk.language}">\n'
+                f"{chunk.body.strip()}\n"
+                f"</method>"
+            )
         return "\n\n".join(parts)
 
     # ── Response parsers ───────────────────────────────────────────────────────

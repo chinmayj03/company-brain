@@ -57,6 +57,15 @@ app.include_router(feedback.router, prefix="/feedback", tags=["feedback"])
 # Path is fully embedded in the route so no prefix is set here.
 app.include_router(stream.router, tags=["stream"])
 
+# ── ADR-0052 P5: brain-as-MCP route ──────────────────────────────────────
+# Exposes the harness MCP surface (query_brain, read_entity, find_callers, ...)
+# under /mcp/harness so external IDE/agent clients can connect to the same
+# FastAPI service that backs the pipeline. Routes are mounted lazily — the
+# handlers spin up a per-request server bound to the requested workspace.
+if settings.harness_mcp_enabled:
+    from companybrain.api.routes import harness_mcp  # noqa: E402
+    app.include_router(harness_mcp.router, prefix="/mcp/harness", tags=["mcp"])
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):

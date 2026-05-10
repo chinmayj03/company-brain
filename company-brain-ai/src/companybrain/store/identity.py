@@ -12,12 +12,26 @@ Legacy shims:
   - from_legacy_neo4j(): translate old 'urn:cb:llm:...' to canonical URN
   - make_entity_id() / parse_entity_id() / to_external_id(): kept for callers
     that have not yet migrated; they delegate to the URN layer internally.
+
+ADR-0043 (WS1.S3): the `monorepo` default was removed from every URN
+constructor. Callers that cannot supply a real repo name will now receive
+RepoUnknownForUrn instead of silently producing urn:…:monorepo:… URNs that
+could never match a real node.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from urllib.parse import quote, unquote
+
+
+class RepoUnknownForUrn(ValueError):
+    """Raised when a URN constructor is called without a concrete repo name.
+
+    Callers must supply the real repo (e.g. 'network-iq-backend-java').
+    Passing an empty string or omitting the argument is no longer allowed —
+    it would silently produce urn:…:monorepo:… URNs that orphan every edge.
+    """
 
 URN_SCHEME = "urn:cb"
 URN_SEPARATOR = ":"
@@ -110,12 +124,21 @@ def from_legacy_postgres(
     workspace_slug: str,
     node_type: str,
     legacy_external_id: str,
-    repo: str = "monorepo",
+    repo: str,
 ) -> str:
     """
     Translate a Postgres external_id like 'backend/src/payment.ts::chargePayment'
     into a canonical URN.  node_type is mapped via NODE_TYPE_TAXONOMY.
+
+    ``repo`` is now required (no default). Pass the real repository name so
+    that the resulting URN matches the nodes stored for that repo.
+    Raises RepoUnknownForUrn when repo is empty.
     """
+    if not repo:
+        raise RepoUnknownForUrn(
+            f"from_legacy_postgres called without a repo for external_id {legacy_external_id!r}. "
+            "Pass the real repo name — 'monorepo' is no longer accepted."
+        )
     entity_type = NODE_TYPE_TAXONOMY.get(node_type, "component")
     # Take the last segment after '::' as the qualified name; fall back to the whole string.
     qname = legacy_external_id.split("::")[-1] if "::" in legacy_external_id else legacy_external_id
@@ -128,13 +151,19 @@ def from_legacy_postgres(
     )
 
 
-def from_legacy_neo4j(legacy_urn: str, *, repo: str = "monorepo") -> str:
+def from_legacy_neo4j(legacy_urn: str, *, repo: str) -> str:
     """
     Translate 'urn:cb:llm:{workspace}:{file_path}:{entity_name}'
     into the canonical URN format.
 
+    ``repo`` is now required (no default). Raises RepoUnknownForUrn when empty.
     entity_type defaults to 'component'; refined later by the migration script.
     """
+    if not repo:
+        raise RepoUnknownForUrn(
+            f"from_legacy_neo4j called without a repo for urn {legacy_urn!r}. "
+            "Pass the real repo name — 'monorepo' is no longer accepted."
+        )
     parts = legacy_urn.split(URN_SEPARATOR)
     if len(parts) < 6 or parts[:3] != ["urn", "cb", "llm"]:
         raise ValueError(f"Not a legacy Neo4j URN: {legacy_urn!r}")

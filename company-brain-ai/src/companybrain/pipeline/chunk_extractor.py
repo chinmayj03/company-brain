@@ -149,9 +149,16 @@ class ChunkExtractor:
 
         try:
             provider = get_provider()
+            # AnthropicProvider.chat() reads the system prompt from a
+            # ChatMessage(role='system') in the messages list — it does NOT
+            # accept a top-level `system=` kwarg. Passing one raised
+            # 'unexpected keyword argument system' on every chunk and
+            # the entire queue failed at attempt=1.
             resp = await provider.chat(
-                messages=[ChatMessage(role="user", content=prompt_text)],
-                system=system,
+                messages=[
+                    ChatMessage(role="system", content=system),
+                    ChatMessage(role="user",   content=prompt_text),
+                ],
                 role=TaskRole.FAST,
                 max_tokens=MAX_TOKENS_PER_CALL,
             )
@@ -305,13 +312,15 @@ class ChunkExtractor:
                 max_edges=MAX_EDGES_PER_CALL,
             )
             try:
+                # Same fix as the primary call: system goes inside messages,
+                # not as a kwarg.
                 resp = await provider.chat(
                     messages=[
-                        ChatMessage(role="user", content=original_prompt),
+                        ChatMessage(role="system",    content=system),
+                        ChatMessage(role="user",      content=original_prompt),
                         ChatMessage(role="assistant", content=json.dumps({"edges": [e.__dict__ for e in initial_edges]})),
-                        ChatMessage(role="user", content=followup),
+                        ChatMessage(role="user",      content=followup),
                     ],
-                    system=system,
                     role=TaskRole.FAST,
                     max_tokens=MAX_TOKENS_PER_CALL,
                 )

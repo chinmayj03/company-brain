@@ -37,6 +37,7 @@ class QueueChunk:
     import_context: str
     body: str
     attempt_count: int
+    language: str = ""
 
 
 @dataclass
@@ -52,6 +53,8 @@ class ChunkInput:
     header_context: str
     import_context: str
     body: str
+    language: str = ""
+    filter_reason: str = ""  # non-empty → row is pre-filtered, status='filtered'
 
 
 async def _get_conn() -> asyncpg.Connection:
@@ -65,7 +68,8 @@ async def _get_conn() -> asyncpg.Connection:
 async def enqueue(chunks: list[ChunkInput]) -> int:
     """
     Insert chunks into the queue; skip duplicates (ON CONFLICT DO NOTHING).
-    Returns the number of rows actually inserted.
+    Chunks with a non-empty filter_reason are inserted with status='filtered'.
+    Returns the number of rows actually inserted (filtered + pending).
     """
     if not chunks:
         return 0
@@ -73,25 +77,31 @@ async def enqueue(chunks: list[ChunkInput]) -> int:
     conn = await _get_conn()
     try:
         inserted = 0
+        filtered_count = 0
         for c in chunks:
+            status = "filtered" if c.filter_reason else "pending"
             result = await conn.execute(
                 """
                 INSERT INTO extraction_queue
                     (workspace_id, job_id, repo, file_path, qname, body_hash,
-                     chunk_kind, header_context, import_context, body)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                     chunk_kind, header_context, import_context, body,
+                     language, filter_reason, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 ON CONFLICT (workspace_id, job_id, file_path, qname, body_hash)
                 DO NOTHING
                 """,
                 c.workspace_id, c.job_id, c.repo, c.file_path,
                 c.qname, c.body_hash, c.chunk_kind,
                 c.header_context, c.import_context, c.body,
+                c.language or "", c.filter_reason or "", status,
             )
-            # asyncpg returns "INSERT 0 N" — parse N
             n = int(result.split()[-1])
             inserted += n
+            if c.filter_reason and n:
+                filtered_count += 1
         log.info("extraction_queue.enqueue",
                  total=len(chunks), inserted=inserted,
+                 filtered=filtered_count,
                  skipped=len(chunks) - inserted)
         return inserted
     finally:
@@ -103,6 +113,7 @@ async def claim_next(worker_id: str, workspace_id: str, job_id: str) -> Optional
     Claim one pending row for this worker.
     Uses SELECT ... FOR UPDATE SKIP LOCKED so parallel workers never double-claim.
     Returns None when the queue is empty for this job.
+    Filtered rows (status='filtered') are never claimed.
     """
     conn = await _get_conn()
     try:
@@ -111,7 +122,7 @@ async def claim_next(worker_id: str, workspace_id: str, job_id: str) -> Optional
                 """
                 SELECT id, workspace_id, job_id, repo, file_path, qname,
                        body_hash, chunk_kind, header_context, import_context,
-                       body, attempt_count
+                       body, attempt_count, language
                 FROM extraction_queue
                 WHERE workspace_id = $1
                   AND job_id = $2
@@ -148,7 +159,26 @@ async def claim_next(worker_id: str, workspace_id: str, job_id: str) -> Optional
                 import_context=row["import_context"],
                 body=row["body"],
                 attempt_count=row["attempt_count"] + 1,
+                language=row["language"] or "",
             )
+    finally:
+        await conn.close()
+
+
+async def mark_filtered(chunk_id: str, reason: str) -> None:
+    """Mark a pre-filtered chunk — it was never sent to the LLM."""
+    conn = await _get_conn()
+    try:
+        await conn.execute(
+            """
+            UPDATE extraction_queue
+            SET status = 'filtered',
+                finished_at = now(),
+                filter_reason = $2
+            WHERE id = $1
+            """,
+            chunk_id, reason[:500],
+        )
     finally:
         await conn.close()
 

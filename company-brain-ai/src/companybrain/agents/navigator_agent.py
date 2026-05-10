@@ -104,25 +104,27 @@ _SKIP_DIRS = frozenset({
 })
 
 _UTILITY_OBJECTS = frozenset({
-    "log", "logger", "LOG", "LOGGER", "System", "Objects",
+    # Logging — all languages
+    "log", "logger", "LOG", "LOGGER", "Logger", "LoggerFactory",
+    # Universal primitives / stdlib types (language-agnostic naming)
     "Optional", "String", "List", "Map", "Set", "Arrays",
-    "Collections", "Stream", "ResponseEntity", "CompletableFuture",
+    "Collections", "Stream", "CompletableFuture",
     "Math", "Integer", "Long", "Boolean", "Double",
     "UUID", "LocalDate", "LocalDateTime", "OffsetDateTime", "Instant",
-    "BigDecimal", "Pageable", "Page", "Sort",
-    "HttpStatus", "HttpHeaders", "MediaType",
-    "Logger", "LoggerFactory",
+    "BigDecimal",
+    # Python builtins
+    "None", "True", "False", "dict", "list", "set", "tuple", "str", "int",
+    "float", "bool", "bytes", "object",
+    # Generic utility
+    "System", "Objects",
 })
 
-# Type-name suffixes we never follow as dependencies
+# Type-name suffixes we never follow as dependencies (language-agnostic)
 _SKIP_SUFFIXES = (
     "DTO", "Dto", "Request", "Response",
-    "Config", "Configuration", "Properties",
+    "Config", "Configuration", "Properties", "Settings",
     "Exception", "Error", "Constant", "Constants",
-    "Util", "Utils", "Helper",
-    "Entity",           # JPA entities — structural, not business logic
-    "Mapping",          # constant/mapping classes
-    "JsonKeyMapping",
+    "Util", "Utils", "Helper", "Helpers",
 )
 
 _CLASS_RE     = re.compile(r'(?:class|interface)\s+(\w+)')

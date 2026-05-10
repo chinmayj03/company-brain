@@ -1,11 +1,13 @@
 # ADR-0045 — Chunker Must Read Files Directly From Disk
 
-**Status:** Proposed
+**Status:** Superseded by ADR-0047
 **Date:** 2026-05-10
 **Deciders:** Chinmay (product), pipeline-team
 **Companion:** `SONNET-IMPLEMENTATION-PROMPT-ADR-0045.md`
 **Builds on:** ADR-0044 (chunked extraction)
 **Fixes:** the residual truncation observed AFTER ADR-0044 shipped
+**Superseded by:** ADR-0047 (Unified Chunked Extraction) — design decisions D1–D4
+from this ADR are all implemented in ADR-0047; this file is kept as a historical record.
 
 ---
 

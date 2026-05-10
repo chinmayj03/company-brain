@@ -1,6 +1,6 @@
 # HARNESS — the agentic extraction loop
 
-**Status:** Phase 1 (tool-use harness around the existing stages).
+**Status:** Phase 2 (tool-use harness with parallel sub-agent fan-out).
 **Source:** `company-brain-ai/src/companybrain/harness/`.
 **Driving ADR:** [`ADR-0051`](adrs/ADR-0051-agentic-harness-migration.md).
 
@@ -172,9 +172,87 @@ This bubbles up into `PipelineResult.telemetry["harness"]` so the existing
 
 ---
 
+## Sub-agents (Phase 2)
+
+P2 adds the Task-tool primitive from Claude Code: **isolated sub-agents
+with fresh context windows**. The parent agent invokes a `spawn_*` tool
+with a list of work items; the tool spawns one sub-agent per item, runs
+them in parallel (bounded by `settings.max_subagents`, default 8), and
+returns a flat result list. The parent never sees the sub-agents'
+tool-call trajectories — only the final summaries.
+
+```
+Parent agent (HarnessLoop)
+  ├─ spawn_extractor({files: [F1, F2, F3, ...]})
+  │     ├─ Subagent("extractor:F1") ─ fresh ctx, tools=extractor subset
+  │     ├─ Subagent("extractor:F2") ─ fresh ctx, tools=extractor subset
+  │     └─ Subagent("extractor:F3") ─ fresh ctx, tools=extractor subset
+  │     → {results: [{file, summary, cost_usd, ...}, ...]}
+  │
+  └─ Continues with the merged result; per-sub-agent reads/greps stay
+     out of the parent's context.
+```
+
+### Why isolation matters
+
+Sub-agent input tokens stay flat at "system prompt + one focused user
+prompt" (typically 1-3 KB) regardless of how much the parent has already
+extracted. Without isolation, every fan-out would carry the parent's full
+accumulated state — the per-file context grows linearly with the run.
+For a 60-method endpoint, this is the difference between ~50 KB × 60 =
+3 MB of duplicated input vs. ~3 KB × 60 = 180 KB. The acceptance test
+asserts sub-agent input < 50% of parent input; in practice it's < 10%.
+
+### The three spawn_* tools
+
+| Tool             | Tools the sub-agent may call                                              | Output shape                              | Use it for                                                      |
+|------------------|---------------------------------------------------------------------------|-------------------------------------------|------------------------------------------------------------------|
+| `spawn_extractor`| `read_file`, `glob_files`, `grep_code`, `extract_methods_from_class`      | `{file, summary, iterations, cost_usd}`   | Per-file extraction fan-out (replaces `worker.drain_queue`).    |
+| `spawn_verifier` | `read_file`, `glob_files`, `grep_code` (read-only)                        | `{claim, verdict, evidence}` per item     | Cross-checking extracted edges against primary sources.          |
+| `spawn_research` | `read_file`, `glob_files`, `grep_code` (read-only; +`WebFetch` in P5)     | `{question, answer}` per item             | Focused questions whose reads should not pollute parent context. |
+
+Each spawn_* tool returns aggregated cost and timeout flags so the
+parent can decide whether to retry, downgrade, or proceed.
+
+### Config knobs
+
+```python
+# companybrain.config.settings
+max_subagents:      int = 8     # fan-out width per spawn_* call
+subagent_timeout_s: int = 120   # per-sub-agent wall-clock cap
+```
+
+Both are pydantic-settings fields; override via the corresponding
+uppercase environment variable (`MAX_SUBAGENTS`, `SUBAGENT_TIMEOUT_S`).
+
+### Tool-allowlist enforcement
+
+Each `Subagent` is constructed with `allowed_tools=[...]`. The runner:
+
+1. Sends only the allowlisted tool schemas to the model — others are
+   invisible to it.
+2. Refuses any tool call whose name isn't in the allowlist, returning a
+   `{"error": "Tool not in allowlist"}` payload so the model can re-plan.
+
+This is what makes "research sub-agent (read-only)" vs. "extractor
+sub-agent (read + extract)" a hard guarantee, not a guideline.
+
+### Failure handling
+
+* Sub-agent provider error → captured on `SubagentResult.error`, the
+  spawn_* tool keeps going for the rest of the batch.
+* Sub-agent exceeds `subagent_timeout_s` → result has `timed_out=True`
+  and an empty `final_text`; the parent sees which items timed out.
+* Sub-agent hits its iteration cap → last assistant text is salvaged as
+  `final_text`, mirroring HarnessLoop's max-iterations behaviour.
+
+The parent's HarnessLoop never sees a sub-agent crash propagate — fan-out
+failures are always observable in the spawn_* tool's return value.
+
+---
+
 ## What's next
 
-* **P2** — sub-agents and parallel fan-out via a `spawn_extractor` tool.
 * **P3** — per-framework `SKILL.md` + per-repo `BRAIN.md` memory.
 * **P4** — hooks, capability declarations, streaming TodoWrite progress.
 

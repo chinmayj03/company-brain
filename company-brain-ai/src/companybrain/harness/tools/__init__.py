@@ -86,7 +86,9 @@ def register_tool(
 
 
 # Import every tool module so its @register_tool calls fire at package load.
-# Order is irrelevant; each module is independent.
+# Order is irrelevant; each module is independent. P1 tools register the
+# concrete pipeline calls (read_file, extract_methods_from_class, ...); the
+# P2 spawn_* tools build sub-agent allowlists from those P1 names.
 from companybrain.harness.tools import (  # noqa: E402,F401
     discover_routes,
     extract_methods_from_class,
@@ -96,6 +98,9 @@ from companybrain.harness.tools import (  # noqa: E402,F401
     grep_code,
     list_candidate_files,
     read_file,
+    spawn_extractor,
+    spawn_research,
+    spawn_verifier,
     write_to_brain,
 )
 

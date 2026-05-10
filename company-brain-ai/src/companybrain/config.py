@@ -266,5 +266,19 @@ class Settings(BaseSettings):
     # acceptance suite is green for two weeks (per ADR-0051).
     use_harness: bool = False
 
+    # ── ADR-0051 P2: sub-agents and parallel fan-out ─────────────────────────
+    # Maximum concurrent sub-agents per spawn_* tool call. Each sub-agent gets
+    # its own LLM context window, so this caps both wall-time fan-out width
+    # and provider concurrency. 8 matches the typical batch granularity from
+    # ADR-0048's two-agent extraction; raise on hosts with high TPM headroom.
+    # Override via env var: MAX_SUBAGENTS=16.
+    max_subagents: int = 8
+    # Per-sub-agent wall-clock cap. Exceeding it returns a timed_out=True
+    # result rather than aborting the whole fan-out — one slow file should
+    # not stall the parent's batch. Tuned for the 60-method endpoint
+    # acceptance target; raise for repos with very large files.
+    # Override via env var: SUBAGENT_TIMEOUT_S=180.
+    subagent_timeout_s: int = 120
+
 
 settings = Settings()

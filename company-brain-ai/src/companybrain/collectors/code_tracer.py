@@ -128,16 +128,60 @@ _CODE_EXTS  = {".java", ".kt", ".ts", ".tsx", ".js", ".jsx", ".py"}
 
 # ── Data models ───────────────────────────────────────────────────────────────
 
-@dataclass
+@dataclass(init=False)
 class CodeUnit:
-    """A single class / module that is relevant to the target endpoint."""
-    file_path: str          # relative to repo root
+    """A single class / module that is relevant to the target endpoint.
+
+    ADR-0047 (supersedes ADR-0045): content is no longer an eagerly-loaded
+    field. The chunker reads file_path directly from disk to avoid upstream
+    truncation. content is a lazy property for legacy callers (entity extractor,
+    to_llm_block); it caches after first read.
+    """
+    file_path: str          # absolute or repo-relative path
     repo_name: str
     role: str               # controller | service | repository | model | client | component
-    language: str           # java | typescript | python | javascript
-    content: str            # trimmed current source (capped at MAX_UNIT_CHARS)
-    class_name: str = ""
-    imports: list[str] = field(default_factory=list)
+    language: str           # java | typescript | python | javascript | go | …
+    class_name: str
+    imports: list[str]
+    discovery_reason: str   # why NavigatorAgent included this file
+    relevance_score: float  # 0.0–1.0 from the navigator
+    _content_cache: Optional[str] = field(default=None, repr=False, compare=False)
+
+    def __init__(
+        self,
+        file_path: str,
+        repo_name: str,
+        role: str,
+        language: str,
+        content: Optional[str] = None,   # legacy kwarg — pre-seeded into cache
+        class_name: str = "",
+        imports: Optional[list] = None,
+        discovery_reason: str = "",
+        relevance_score: float = 0.0,
+    ) -> None:
+        self.file_path = file_path
+        self.repo_name = repo_name
+        self.role = role
+        self.language = language
+        self.class_name = class_name
+        self.imports = imports if imports is not None else []
+        self.discovery_reason = discovery_reason
+        self.relevance_score = relevance_score
+        self._content_cache = content
+
+    @property
+    def content(self) -> str:
+        """Lazy disk read; cached after first access. Legacy callers use this."""
+        if self._content_cache is None:
+            try:
+                self._content_cache = Path(self.file_path).read_text(errors="ignore")
+            except OSError as exc:
+                log.warning(
+                    "CodeUnit.content lazy read failed",
+                    path=self.file_path, error=str(exc),
+                )
+                self._content_cache = ""
+        return self._content_cache
 
     def brief(self) -> str:
         """Short description for log lines."""
@@ -882,18 +926,17 @@ class CodeTracer:
         repo_name: str,
         role: str,
         language: str,
-        content: str,
+        content: str = "",
     ) -> CodeUnit:
         rel = str(file_path.relative_to(repo_path))
-        trimmed = _trim_content(content)
         class_name = _extract_class_name(content, language)
         imports = _extract_imports(content, language)
         return CodeUnit(
-            file_path=rel,
+            file_path=str(file_path.resolve()),  # absolute → chunker reads directly
             repo_name=repo_name,
             role=role,
             language=language,
-            content=trimmed,
+            content=content or None,  # seed cache with already-read content
             class_name=class_name,
             imports=imports,
         )
@@ -949,13 +992,15 @@ def _knowledge_to_code_units(result, repo_path: Path, repo_name: str) -> list[Co
         role = role_map.get(rel) or role_map.get(p.stem) or _infer_role(p.stem)
         language = _detect_language(fp)
         agent_header = _build_agent_header(knowledge, rel, p.stem)
-        content = agent_header + "\n\n" + _trim_content(raw)
+        # Store absolute path so chunker can read the full file from disk.
+        # Prepend agent header to the cache so legacy entity extractor gets context.
+        seeded_content = agent_header + "\n\n" + raw
         return CodeUnit(
-            file_path=rel,
+            file_path=str(p.resolve()),
             repo_name=repo_name,
             role=role,
             language=language,
-            content=content,
+            content=seeded_content,
             class_name=p.stem,
             imports=[],
         )

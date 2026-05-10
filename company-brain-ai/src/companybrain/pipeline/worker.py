@@ -1,8 +1,12 @@
 """
-ADR-0044 PR-0044-4: Extraction worker and drain loop.
+ADR-0047: Extraction worker and drain loop.
 
 Workers pull one chunk at a time from the extraction_queue, run ChunkExtractor,
 and write results back (mark_done / mark_failed).
+
+The worker operates at single-chunk granularity because the queue stores one row
+per chunk. Batching happens upstream (in the orchestrator) before enqueueing.
+The ChunkExtractor.extract() single-chunk path is used here.
 
 Exponential backoff on failure: 1s → 5s → 25s, max 3 attempts.
 Budget guard: if cumulative job cost_usd >= settings.brain_job_budget_usd,
@@ -15,13 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Optional
 
 import structlog
 
 from companybrain.config import settings
 from companybrain.pipeline.chunk_extractor import ChunkExtractor, ChunkResult
-from companybrain.pipeline.code_chunker import MethodChunk
+from companybrain.pipeline.code_chunker import MethodChunk, _LANGUAGE_MAP
 from companybrain.pipeline.lookup_tool import LookupTool, get_symbol_index
 from companybrain.pipeline.queue import (
     QueueChunk,
@@ -41,6 +46,14 @@ _MAX_ATTEMPTS = 3
 
 def _queue_chunk_to_method_chunk(qc: QueueChunk) -> MethodChunk:
     from companybrain.pipeline.code_chunker import MethodChunk as MC
+
+    # Prefer the language stored on the queue row; fall back to detecting from
+    # file extension so we never silently default to "java" for non-Java files.
+    language = qc.language or ""
+    if not language:
+        suffix = Path(qc.file_path).suffix.lower()
+        language = _LANGUAGE_MAP.get(suffix, "unknown")
+
     return MC(
         file_path=qc.file_path,
         qname=qc.qname,
@@ -49,7 +62,7 @@ def _queue_chunk_to_method_chunk(qc: QueueChunk) -> MethodChunk:
         header_context=qc.header_context,
         import_context=qc.import_context,
         body_hash=qc.body_hash,
-        language="java",  # stored in queue — default fallback; real lang in body_hash context
+        language=language,
     )
 
 
@@ -69,7 +82,6 @@ async def _run_one_worker(
     symbol_index = get_symbol_index()
 
     while True:
-        # Budget guard: check cumulative cost before claiming another chunk
         current_cost = await job_cost_usd(job_id, workspace_id)
         if current_cost >= settings.brain_job_budget_usd:
             log.warning(
@@ -82,7 +94,7 @@ async def _run_one_worker(
 
         chunk = await claim_next(worker_id, workspace_id, job_id)
         if chunk is None:
-            return  # queue empty for this worker
+            return
 
         method_chunk = _queue_chunk_to_method_chunk(chunk)
         lookup = LookupTool(symbol_index)
@@ -94,6 +106,7 @@ async def _run_one_worker(
             "chunk_worker.processing",
             worker=worker_id,
             qname=chunk.qname,
+            language=method_chunk.language,
             attempt=attempt,
         )
 
@@ -113,6 +126,7 @@ async def _run_one_worker(
                 "chunk_worker.done",
                 worker=worker_id,
                 qname=chunk.qname,
+                language=method_chunk.language,
                 edges=len(result.edges),
             )
 
@@ -127,9 +141,7 @@ async def _run_one_worker(
             if attempt >= _MAX_ATTEMPTS:
                 await mark_failed(chunk.id, str(exc))
             else:
-                # Re-enqueue by resetting to pending for the next worker to pick up
                 from companybrain.pipeline import queue as _q
-                import asyncpg as _asyncpg
                 conn = await _q._get_conn()
                 try:
                     await conn.execute(
@@ -165,9 +177,8 @@ async def drain_queue(
     ]
     await asyncio.gather(*workers)
 
-    # Verify completion
     stats = await queue_stats(job_id, workspace_id)
-    pending = stats.get("pending", 0)
+    pending     = stats.get("pending", 0)
     in_progress = stats.get("in_progress", 0)
     if pending > 0 or in_progress > 0:
         log.warning(
@@ -177,13 +188,15 @@ async def drain_queue(
             in_progress=in_progress,
         )
 
-    done = stats.get("done", 0)
-    failed = stats.get("failed", 0)
+    done     = stats.get("done", 0)
+    failed   = stats.get("failed", 0)
+    filtered = stats.get("filtered", 0)
     log.info(
         "drain_queue.complete",
         job_id=job_id,
         done=done,
         failed=failed,
+        filtered=filtered,
         results=len(results),
     )
     return results
@@ -192,9 +205,7 @@ async def drain_queue(
 def collect_entities_and_edges(
     results: list[ChunkResult],
 ) -> tuple[list, list]:
-    """
-    Flatten ChunkResults into entity list + edge list for the merger.
-    """
+    """Flatten ChunkResults into entity list + edge list for the merger."""
     from companybrain.pipeline.chunk_extractor import ExtractedChunkEntity, ExtractedEdge
 
     entities: list[ExtractedChunkEntity] = []

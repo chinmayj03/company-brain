@@ -408,10 +408,18 @@ async def run_pipeline(
             and focal_context.code_units
         )
 
+        # ADR-0047: EntityExtractor must be instantiated before the chunk-queue
+        # block so that extractor._deduplicate() is available inside it.
+        extractor   = EntityExtractor()
+        cm_agent    = ContextManagerAgent()
+        accumulator = SharedContextAccumulator()
+
         if _use_chunk_queue:
-            await progress("1", "📦", "ADR-0044 chunked extraction — splitting repo into per-method chunks")
+            await progress("1", "📦", "ADR-0047 chunked extraction — splitting repo into per-method chunks")
             try:
                 from companybrain.pipeline.code_chunker import CodeChunker
+                from companybrain.pipeline.chunk_relevance_filter import ChunkRelevanceFilter
+                from companybrain.pipeline.chunk_batcher import ChunkBatcher
                 from companybrain.pipeline.queue import enqueue, ChunkInput, retry_failed
                 from companybrain.pipeline.worker import drain_queue, collect_entities_and_edges
                 from companybrain.pipeline.merger import merge_chunk_entities, resolve_edges
@@ -426,12 +434,51 @@ async def run_pipeline(
                     chunks=len(_method_chunks),
                 )
 
-                # Enqueue (idempotent — duplicate body_hashes are silently skipped)
-                _chunk_inputs = [
+                # ADR-0047 U4: apply relevance filter (tier1 trivial + tier2 reachability)
+                _filter = ChunkRelevanceFilter()
+                _filter_results = _filter.filter(_method_chunks)
+                _keep_chunks = [r.chunk for r in _filter_results if r.keep]
+                _drop_chunks = [r for r in _filter_results if not r.keep]
+
+                await progress(
+                    "1", "🔍",
+                    f"Relevance filter: {len(_keep_chunks)} kept, "
+                    f"{len(_drop_chunks)} filtered out",
+                    kept=len(_keep_chunks),
+                    filtered=len(_drop_chunks),
+                )
+
+                _repo_name = getattr(focal_context.code_units[0], "repo_name", "")
+
+                # Enqueue filtered chunks immediately as status='filtered' for telemetry
+                _filtered_inputs = [
                     ChunkInput(
                         workspace_id=request.workspace_id,
                         job_id=job_id,
-                        repo=getattr(focal_context.code_units[0], "repo_name", ""),
+                        repo=_repo_name,
+                        file_path=r.chunk.file_path,
+                        qname=r.chunk.qname,
+                        body_hash=r.chunk.body_hash,
+                        chunk_kind=r.chunk.kind,
+                        header_context=r.chunk.header_context,
+                        import_context=r.chunk.import_context,
+                        body=r.chunk.body,
+                        language=r.chunk.language,
+                        filter_reason=r.filter_reason,
+                    )
+                    for r in _drop_chunks
+                ]
+
+                # ADR-0047 U2: group small siblings before enqueueing live chunks
+                _batcher = ChunkBatcher()
+                _batches = _batcher.batch(_keep_chunks)
+
+                # Flatten batches back to chunks for the queue (queue is per-chunk)
+                _live_inputs = [
+                    ChunkInput(
+                        workspace_id=request.workspace_id,
+                        job_id=job_id,
+                        repo=_repo_name,
                         file_path=mc.file_path,
                         qname=mc.qname,
                         body_hash=mc.body_hash,
@@ -439,11 +486,20 @@ async def run_pipeline(
                         header_context=mc.header_context,
                         import_context=mc.import_context,
                         body=mc.body,
+                        language=mc.language,
                     )
-                    for mc in _method_chunks
+                    for mc in _keep_chunks
                 ]
-                _inserted = await enqueue(_chunk_inputs)
-                await progress("1", "📥", f"Enqueued {_inserted} chunks ({len(_method_chunks)-_inserted} duplicates skipped)")
+
+                _all_inputs = _filtered_inputs + _live_inputs
+                _inserted = await enqueue(_all_inputs)
+                await progress(
+                    "1", "📥",
+                    f"Enqueued {_inserted} rows "
+                    f"({len(_live_inputs)} live, {len(_filtered_inputs)} pre-filtered, "
+                    f"{len(_all_inputs) - _inserted} duplicate skips)",
+                    batches=len(_batches),
+                )
 
                 # Drain the queue with parallel workers
                 _chunk_results = await drain_queue(
@@ -456,17 +512,16 @@ async def run_pipeline(
                 _raw_chunk_entities, _raw_chunk_edges = collect_entities_and_edges(_chunk_results)
 
                 # Merge duplicate entities (same qname, different body versions)
-                from companybrain.pipeline.merger import merge_chunk_entities
                 _merged = merge_chunk_entities(_raw_chunk_entities)
 
-                # Convert chunk entities → ExtractedEntity for the existing downstream pipeline
+                # Convert chunk entities → ExtractedEntity for the downstream pipeline
                 from companybrain.models.entities import ExtractedEntity
                 entities = [
                     ExtractedEntity(
                         entity_type=ce.entity_type,
                         name=ce.name,
                         file=ce.file_path,
-                        repo=getattr(focal_context.code_units[0], "repo_name", ""),
+                        repo=_repo_name,
                         signature=ce.signature,
                         last_modified_commit="",
                         confidence=ce.confidence,
@@ -480,25 +535,21 @@ async def run_pipeline(
                 await progress(
                     "1", "✅",
                     f"Chunked extraction complete — {len(_merged)} entities from "
-                    f"{len(_chunk_results)} chunks",
+                    f"{len(_chunk_results)} chunks ({len(_batches)} batches)",
                     entities=len(_merged),
                     chunks_processed=len(_chunk_results),
+                    batches=len(_batches),
                 )
 
-                # Signal to downstream stages that extraction is done (skip legacy path)
                 _skip_extraction = True
 
             except Exception as _chunk_err:
-                log.error("ADR-0044 chunked extraction failed — falling back to legacy", error=str(_chunk_err))
+                log.error("ADR-0047 chunked extraction failed — falling back to legacy", error=str(_chunk_err))
                 await progress("1", "⚠️", f"Chunked extraction failed: {_chunk_err} — using legacy path")
                 # _skip_extraction stays False → falls through to legacy path below
 
         if not _skip_extraction:
             await progress("1", "🧠", "Entity extraction — L1/L2 context hierarchy + CM Agent (one class at a time)")
-
-        extractor   = EntityExtractor()
-        cm_agent    = ContextManagerAgent()
-        accumulator = SharedContextAccumulator()
 
         # ADR-0014: warm L2 from the previous run's persisted cache (if available)
         from companybrain.pipeline.shared_context_accumulator import L2Persistence

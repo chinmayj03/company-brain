@@ -1,19 +1,18 @@
 """
-ADR-0044 PR-0044-2: Code chunker — language-agnostic, no truncation.
+ADR-0047 (supersedes ADR-0044 + ADR-0045): Code chunker — language-agnostic, no truncation.
 
-Wraps ASTAnalyzer and the regex MethodChunker to emit MethodChunk objects
-with rich header context (class signature + fields + annotations) and
-deduped import context capped at 50 lines.
-
-Design rules (ADR-0044 working agreement):
+Key invariants (ADR-0047 working agreement):
   1. Language-agnostic — uses tree-sitter grammars for all supported languages.
-  2. No file is too big — body is always verbatim, never sliced.
-  3. Every chunk body is ≤50 000 chars. If a single method exceeds that, the
+  2. Always reads from disk — chunk_file() reads via Path.read_text(), never from
+     a pre-stored string that an upstream caller might have truncated.
+  3. Defensive assert — raises TruncatedContentError if content looks pre-truncated.
+  4. No file is too big — body is always verbatim, never sliced.
+  5. Every chunk body is ≤50 000 chars. If a single method exceeds that, the
      chunker recurses into the next-deepest scope using the AST.
 
 Supported languages
 -------------------
-  java, python, typescript, tsx, javascript, go, kotlin, rust, ruby
+  java, kotlin, python, typescript, tsx, javascript, jsx, go, rust, ruby
 
 For languages without a tree-sitter grammar loaded (e.g. Ruby in some envs),
 falls back to the regex MethodChunker gracefully.
@@ -23,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import structlog
@@ -30,6 +30,31 @@ import structlog
 log = structlog.get_logger(__name__)
 
 CHUNK_BODY_LIMIT = 50_000   # chars; bodies larger than this are recursively split
+
+# Defensive assert thresholds (ADR-0047 D4)
+_TRUNCATION_SENTINEL_LEN = 6019   # exact length seen during ADR-0045 investigation
+_TRUNCATION_MARKER = "(truncated)"
+
+
+class TruncatedContentError(RuntimeError):
+    """Raised when the chunker detects pre-truncated content from an upstream caller."""
+    def __init__(self, file_path: str) -> None:
+        super().__init__(
+            f"Chunker received truncated content for {file_path!r}. "
+            "An upstream caller is still slicing file content. "
+            "Pass file_path through unmodified; the chunker reads from disk."
+        )
+        self.file_path = file_path
+
+
+_LANGUAGE_MAP: dict[str, str] = {
+    ".java": "java", ".kt": "kotlin",
+    ".py": "python",
+    ".ts": "typescript", ".tsx": "tsx",
+    ".js": "javascript", ".jsx": "jsx",
+    ".go": "go", ".rs": "rust", ".rb": "ruby",
+    ".sql": "sql",
+}
 
 
 @dataclass
@@ -65,48 +90,63 @@ def _cap_imports(imports: str, max_lines: int = 50) -> str:
 
 class CodeChunker:
     """
-    Splits a CodeUnit (or any source text) into per-method MethodChunk objects.
+    Splits source files into per-method MethodChunk objects.
 
-    Usage:
-        chunks = CodeChunker().chunk_unit(unit)
-        # chunks is always non-empty: at minimum one chunk covering the whole file.
+    Primary path (ADR-0047): chunk_file(file_path) — reads from disk directly.
+    Legacy path: chunk_unit(unit) — used by tests; falls back to unit.content
+    when the file does not exist on disk.
     """
+
+    def chunk_file(self, fp: str) -> list[MethodChunk]:
+        """
+        ADR-0047 primary path: read file from disk, assert it's not pre-truncated,
+        split into method chunks.
+        """
+        raw = Path(fp).read_text(errors="ignore")
+
+        # Defensive assert — ADR-0047 D4
+        if len(raw) == _TRUNCATION_SENTINEL_LEN or (
+            raw.endswith(_TRUNCATION_MARKER) and len(raw) < 8_000
+        ):
+            log.error(
+                "chunker.truncated_content_detected",
+                path=fp, raw_len=len(raw),
+            )
+            raise TruncatedContentError(fp)
+
+        lang = _LANGUAGE_MAP.get(Path(fp).suffix.lower(), "unknown")
+        class_name = Path(fp).stem
+        return self._split_and_log(raw, lang, fp, class_name)
 
     def chunk_unit(self, unit) -> list[MethodChunk]:
         """
         Split a CodeUnit into MethodChunk objects.
-        Falls back to a single whole-file chunk if splitting is not possible.
+
+        Prefers disk read when the file exists (production path).
+        Falls back to unit.content for tests that use in-memory fixtures.
         """
-        content = unit.content or ""
+        file_path = str(getattr(unit, "file_path", "") or "")
+
+        # Production path: real file → read from disk with defensive assert
+        if file_path and Path(file_path).exists():
+            try:
+                return self.chunk_file(file_path)
+            except TruncatedContentError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "[code-chunker] disk read failed, falling back to unit.content",
+                    file=file_path, error=str(exc),
+                )
+
+        # Test/legacy path: use in-memory content
+        content = getattr(unit, "content", "") or ""
         if not content.strip():
             return []
 
-        lang = (unit.language or "").lower()
-        file_path = str(unit.file_path or "")
-        class_name = unit.class_name or _stem(file_path)
-
-        chunks = self._split(content, lang, file_path, class_name)
-        if not chunks:
-            # Whole-file fallback — still fully verbatim, just not split
-            chunks = [MethodChunk(
-                file_path=file_path,
-                qname=class_name,
-                kind="top_decl",
-                body=content,
-                header_context="",
-                import_context="",
-                body_hash=_sha256(content),
-                language=lang,
-            )]
-
-        log.debug(
-            "[code-chunker] split",
-            file=file_path,
-            language=lang,
-            chunks=len(chunks),
-            total_chars=sum(len(c.body) for c in chunks),
-        )
-        return chunks
+        lang = (getattr(unit, "language", "") or "").lower()
+        class_name = getattr(unit, "class_name", "") or _stem(file_path)
+        return self._split_and_log(content, lang, file_path, class_name)
 
     def chunk_repo(self, code_units: list) -> list[MethodChunk]:
         """Split all units; deduplicate by (file_path, qname, body_hash)."""
@@ -119,6 +159,30 @@ class CodeChunker:
                     seen.add(key)
                     result.append(chunk)
         return result
+
+    def _split_and_log(
+        self, content: str, lang: str, file_path: str, class_name: str,
+    ) -> list[MethodChunk]:
+        chunks = self._split(content, lang, file_path, class_name)
+        if not chunks:
+            chunks = [MethodChunk(
+                file_path=file_path,
+                qname=class_name,
+                kind="top_decl",
+                body=content,
+                header_context="",
+                import_context="",
+                body_hash=_sha256(content),
+                language=lang,
+            )]
+        log.info(
+            "chunker.read_file_directly",
+            file=file_path,
+            language=lang,
+            len=len(content),
+            chunks=len(chunks),
+        )
+        return chunks
 
     # ── Internal dispatch ──────────────────────────────────────────────────────
 

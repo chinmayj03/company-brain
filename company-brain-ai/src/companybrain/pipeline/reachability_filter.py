@@ -166,13 +166,27 @@ def filter_to_reachable(
         }
 
     # Build adjacency by name (the LLM emits names; keep it simple).
+    # Defensive: tolerate raw dicts as well as ExtractedRelationship objects.
+    # pattern_distiller.apply_patterns and various brain_enrich code paths
+    # historically leak dicts into the relationship list. Using getattr
+    # below means we never crash on a dict; we just read its keys instead.
+    def _get(rel, attr: str, default=""):
+        if isinstance(rel, dict):
+            return rel.get(attr) or rel.get(attr.replace("_entity", "")) or default
+        return getattr(rel, attr, default)
+
     forward: dict[str, set[str]] = {}
     reverse: dict[str, set[str]] = {}
     for r in relationships:
-        if r.edge_type in _PROPAGATE_EDGES:
-            forward.setdefault(r.from_entity, set()).add(r.to_entity)
-        if r.edge_type in _REVERSE_ATTACH_EDGES:
-            reverse.setdefault(r.to_entity, set()).add(r.from_entity)
+        et = _get(r, "edge_type", "")
+        fr = _get(r, "from_entity", "")
+        to = _get(r, "to_entity", "")
+        if not et or not fr or not to:
+            continue
+        if et in _PROPAGATE_EDGES:
+            forward.setdefault(fr, set()).add(to)
+        if et in _REVERSE_ATTACH_EDGES:
+            reverse.setdefault(to, set()).add(fr)
 
     # BFS forward from every entry-point name.
     reachable: set[str] = set(entry_names)
@@ -198,6 +212,9 @@ def filter_to_reachable(
     dropped_count = len(entities) - len(kept_entities)
     drop_fraction = dropped_count / max(1, len(entities))
 
+    # Use the same defensive _get when filtering edges below
+    _local_get = _get
+
     if drop_fraction > _MAX_DROP_FRACTION:
         log.warning(
             "Reachability filter would drop > 90% of entities — bailing, "
@@ -216,7 +233,8 @@ def filter_to_reachable(
     kept_names = {e.name for e in kept_entities}
     kept_relationships = [
         r for r in relationships
-        if r.from_entity in kept_names and r.to_entity in kept_names
+        if _local_get(r, "from_entity", "") in kept_names
+        and _local_get(r, "to_entity", "") in kept_names
     ]
 
     # Per-type drop breakdown for the log.

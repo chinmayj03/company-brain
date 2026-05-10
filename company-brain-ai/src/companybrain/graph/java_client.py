@@ -65,10 +65,16 @@ class ArtifactFreshnessResult:
                   AI service skips LLM extraction; existing_entities is populated
                   so relationship extraction / synthesis can reference these nodes.
     fresh=False → LLM extraction is required (new file, changed file, no nodes yet).
+
+    fresh_method_hashes (E4) — set of sha256 body hashes reported as unchanged by
+    the backend. When non-empty, EntityExtractor skips any MethodChunk whose
+    body_hash appears in this set, enabling sub-file granularity for large classes
+    where only a subset of methods changed.
     """
     external_id: str
     fresh: bool
     existing_entities: list[ExistingEntity] = field(default_factory=list)
+    fresh_method_hashes: set[str] = field(default_factory=set)
 
 
 def sha256_content(content: str | None) -> str:
@@ -133,17 +139,33 @@ class JavaGraphClient:
         if not code_units:
             return {}
 
-        # Build request payload — one item per unique code unit
+        # Build request payload — one item per unique code unit.
+        # Each item also carries per-method body hashes (E4) so the backend can
+        # skip individual dirty methods inside an otherwise-fresh file.
         checks = []
         unit_key_map: dict[str, object] = {}   # externalId → CodeUnit
         for unit in code_units:
             ext_id = f"{unit.repo_name}/{unit.file_path}"
             content_hash = sha256_content(unit.content)
-            checks.append({
+
+            # Attach per-method hashes when available (from AST or regex chunker)
+            method_hashes: list[dict] = []
+            if hasattr(unit, "_method_chunks") and unit._method_chunks:
+                method_hashes = [
+                    {"methodName": chunk.method_name, "bodyHash": chunk.body_hash}
+                    for chunk in unit._method_chunks
+                    if chunk.body_hash
+                ]
+
+            entry: dict = {
                 "kind":        "source_file",
                 "externalId":  ext_id,
                 "contentHash": content_hash,
-            })
+            }
+            if method_hashes:
+                entry["methodHashes"] = method_hashes
+
+            checks.append(entry)
             unit_key_map[ext_id] = unit
 
         payload = {
@@ -194,10 +216,17 @@ class JavaGraphClient:
                 )
                 for e in item.get("existingEntities", [])
             ]
+            # E4: backend returns hashes of method bodies that are unchanged
+            fresh_method_hashes: set[str] = {
+                mh["bodyHash"]
+                for mh in item.get("freshMethodHashes", [])
+                if mh.get("bodyHash")
+            }
             results[ext_id] = ArtifactFreshnessResult(
                 external_id=ext_id,
                 fresh=fresh,
                 existing_entities=existing_entities,
+                fresh_method_hashes=fresh_method_hashes,
             )
 
         # Fill in any units the backend didn't return (treat as dirty)

@@ -246,5 +246,16 @@ class Settings(BaseSettings):
     # Keep as fallback while two-agent path stabilises.
     use_legacy_navigator: bool = False
 
+    # ── ADR-0050: big-repo-safe adaptive extraction ───────────────────────────
+    # M1: token pre-flight thresholds for batch sizing.
+    # Batches whose estimated output exceeds this are split before the call.
+    adr0050_max_batch_output_tokens: int = 4_000
+    # Hard limit on batch size regardless of token budget.
+    adr0050_hard_max_per_batch: int = 16
+    # M2: max bisection recursion depth (log2(64)=6 covers any realistic batch).
+    max_split_depth: int = 6
+    # M5: controllers larger than this get a skeleton input instead of full text.
+    adr0050_skeleton_threshold_bytes: int = 50_000
+
 
 settings = Settings()

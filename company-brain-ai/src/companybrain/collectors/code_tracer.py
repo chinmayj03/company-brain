@@ -1210,6 +1210,34 @@ class CodeTracer:
         )
 
 
+    # ── ADR-0050 M4: hierarchical manifest for huge monorepos ─────────────────
+
+    async def adr0050_get_manifest(
+        self,
+        repo_path: Path,
+        endpoint: str,
+        method: str = "GET",
+        max_files: int = 20,
+    ) -> list:
+        """Return a bounded filtered manifest using the three-layer hierarchy.
+
+        Delegates to manifest_filter.build_filtered_manifest. Falls through
+        to the legacy _trace_java path when the filter isn't available.
+        """
+        try:
+            from companybrain.collectors.manifest_filter import build_filtered_manifest
+            candidates = await build_filtered_manifest(
+                repo_path=repo_path,
+                endpoint=endpoint,
+                method=method,
+                max_files=max_files,
+            )
+            return candidates
+        except Exception as exc:
+            log.warning("adr0050_manifest_filter_failed", error=str(exc))
+            return []
+
+
 # ── Module-level helpers ──────────────────────────────────────────────────────
 
 def _knowledge_to_code_units(result, repo_path: Path, repo_name: str) -> list[CodeUnit]:

@@ -265,7 +265,7 @@ async def _smart_zone_assemble(
         neo4j_pass = os.environ.get("NEO4J_PASSWORD", "password")
 
         driver = AsyncGraphDatabase.driver(neo4j_url, auth=(neo4j_user, neo4j_pass))
-        store  = JsonFileBrainStore(brain_root.parent)
+        store  = JsonFileBrainStore(brain_root)
 
         assembler = SmartZoneAssembler(
             brain_root=brain_root,

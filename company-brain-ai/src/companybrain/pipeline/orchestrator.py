@@ -590,8 +590,20 @@ async def run_pipeline(
                 _skip_extraction = True
 
             except Exception as _chunk_err:
-                log.error("ADR-0047 chunked extraction failed — falling back to legacy", error=str(_chunk_err))
-                await progress("1", "⚠️", f"Chunked extraction failed: {_chunk_err} — using legacy path")
+                # Include the full traceback so the legacy-path fallback isn't
+                # silent. Without this, you only see "Failed to parse entity
+                # JSON" warnings from the legacy extractor and have no way to
+                # tell that the chunked path silently bailed before then.
+                import traceback as _tb
+                log.error(
+                    "ADR-0047 chunked extraction failed — falling back to legacy",
+                    error=str(_chunk_err),
+                    error_type=type(_chunk_err).__name__,
+                    traceback=_tb.format_exc(),
+                )
+                await progress("1", "⚠️",
+                               f"Chunked extraction failed: {type(_chunk_err).__name__}: "
+                               f"{_chunk_err} — using legacy path")
                 # _skip_extraction stays False → falls through to legacy path below
 
         if not _skip_extraction:

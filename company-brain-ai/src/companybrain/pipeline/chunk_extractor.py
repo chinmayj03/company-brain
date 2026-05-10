@@ -32,8 +32,11 @@ log = structlog.get_logger(__name__)
 
 MAX_EDGES_PER_CALL = 8
 MAX_FOLLOWUP_CALLS = 3
-MAX_TOKENS_SINGLE   = 600
-MAX_TOKENS_BATCH    = 1200   # batched call returns an array — more headroom
+MAX_TOKENS_SINGLE   = 1_200   # raised 600 → 1200 — single method with verbose
+                              # SQL/jOOQ chains + 21-field BusinessContext was
+                              # clipping at the old cap
+MAX_TOKENS_BATCH    = 2_400   # raised 1200 → 2400 — batched call returns an
+                              # array of N entities × per-entity payload
 
 
 # ── Output models ──────────────────────────────────────────────────────────────

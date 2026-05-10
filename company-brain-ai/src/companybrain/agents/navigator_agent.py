@@ -308,10 +308,25 @@ class NavigatorAgent:
                     actual = candidate
 
             if not source or _is_interface(content):
-                # Interface / no specific method: include full content
-                # (captures all @Query annotations, method signatures)
-                cap = 6000
-                source = content[:cap] + ("\n// ... (truncated)" if len(content) > cap else "")
+                # Interface / no specific method: pass the FULL file content
+                # through (captures all @Query annotations + method
+                # signatures + jOOQ DSL chains).
+                #
+                # The hardcoded `cap = 6000` that used to live here was the
+                # exact bug ADR-0045 was created to kill: every file logged
+                # `source_len=6019` regardless of its real size, the
+                # navigator's classifier saw a uniformly truncated view of
+                # every class, and any method body past offset 6000 (e.g.
+                # `getPayerCompetitors` in CompetitivenessPlanRepository.java
+                # at line 584+) was invisible to downstream stages.
+                #
+                # ADR-0045 D2 says the chunker reads files directly from disk
+                # via `file_path`, so `raw_source` no longer has to BE the
+                # full file — but it can be, and the classifier benefits.
+                # The total classification context is still bounded at
+                # 12_000 chars by the cap below at the call site, so passing
+                # the full body here is safe even for very large files.
+                source = content
                 actual = method_name or ""
 
             return source, actual

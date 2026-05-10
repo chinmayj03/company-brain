@@ -172,11 +172,18 @@ class Settings(BaseSettings):
     #   gap detection       →  3-8 gaps × ~150 tok       →   ~1200  (cap 1000)
     # Caps sit ~2× the empirical p95 so real responses don't get truncated,
     # but we stop paying for unused output budget.
-    max_tokens_entity_extraction:  int = 2_000   # Stage 1
-    max_tokens_intent_synthesis:   int = 700     # Stage 1.5
-    max_tokens_relationship:       int = 2_500   # Stage 2 (raised slightly for 50-type taxonomy → 80 edges)
-    max_tokens_context_synthesis:  int = 900     # Stage 3 (room for 21-field BusinessContext)
-    max_tokens_gap_detection:      int = 1_000   # Stage 4
+    max_tokens_entity_extraction:  int = 6_000   # Stage 1 (raised from 2000 → 4000 → 6000;
+                                                  # large repository impls like
+                                                  # CompetitivenessRepositoryImpl have 30+ methods
+                                                  # with rich query_text/code_snippet — anything
+                                                  # smaller truncates the JSON mid-string)
+    max_tokens_intent_synthesis:   int = 900     # Stage 1.5 (raised 700 → 900 for richer intent)
+    max_tokens_relationship:       int = 4_000   # Stage 2 (raised 2500 → 4000 — 50-type taxonomy
+                                                  # × 80 edges + per-edge evidence strings was hitting
+                                                  # the cap on dense classes)
+    max_tokens_context_synthesis:  int = 1_400   # Stage 3 (raised 900 → 1400 for the 21-field
+                                                  # BusinessContext with longer evidence quotes)
+    max_tokens_gap_detection:      int = 1_500   # Stage 4 (raised 1000 → 1500)
     max_tokens_query:              int = 4_096   # Live query responses — keep generous
 
     # ── Stage skip flags (cost-cut) ──────────────────────────────────────────

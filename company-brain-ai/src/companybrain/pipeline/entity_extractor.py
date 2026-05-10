@@ -1033,8 +1033,24 @@ class EntityExtractor:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
-            log.warning("Failed to parse entity JSON", error=str(e), raw=raw[:300])
-            return []
+            # The LLM hit max_tokens mid-string and the output is unparseable.
+            # Rather than drop ALL entities in this response, recover whatever
+            # complete entity objects appeared before the truncation point.
+            # Strategy: peel off any `{ ... }` objects that DO parse on their
+            # own from the start of the entities array. Anything past the
+            # truncation gets dropped, which is the right outcome.
+            data = _recover_truncated_entities(raw)
+            if not data:
+                log.warning(
+                    "Failed to parse entity JSON (no recoverable entities)",
+                    error=str(e), raw_len=len(raw), raw=raw[:300],
+                )
+                return []
+            log.warning(
+                "Recovered partial entities from truncated JSON",
+                error=str(e), raw_len=len(raw),
+                recovered=len(data.get("entities", [])),
+            )
 
         entities = []
         for item in data.get("entities", []):
@@ -1073,6 +1089,86 @@ class EntityExtractor:
 # ── Module helpers ────────────────────────────────────────────────────────────
 
 import re as _re
+
+
+def _recover_truncated_entities(raw: str) -> dict:
+    """Recover whatever complete entity objects parsed before the truncation.
+
+    The LLM hits max_tokens and the response gets cut mid-string somewhere
+    inside the entities array. The previous behaviour was `json.loads()` →
+    JSONDecodeError → drop EVERY entity in the response. This helper salvages
+    the leading objects that DO close cleanly, so we keep most of the work
+    instead of all-or-nothing.
+
+    Approach: locate `"entities": [`, then scan the array character-by-character
+    tracking brace depth + string state to find each top-level `{...}` object.
+    Stop at the first object that doesn't close (the truncated one). Return
+    a dict shaped like the original `{"entities": [...]}` so the caller's
+    parsing loop is unchanged. Returns {} when nothing is recoverable.
+    """
+    m = _re.search(r'"entities"\s*:\s*\[', raw)
+    if not m:
+        return {}
+    i = m.end()
+    n = len(raw)
+    objects: list[str] = []
+
+    while i < n:
+        # Skip whitespace + commas between objects
+        while i < n and raw[i] in " \t\n\r,":
+            i += 1
+        if i >= n or raw[i] == "]":
+            break
+        if raw[i] != "{":
+            # Malformed; bail with whatever we have
+            break
+
+        start = i
+        depth = 0
+        in_str = False
+        esc = False
+        closed = False
+        while i < n:
+            ch = raw[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        closed = True
+                        break
+            i += 1
+
+        if not closed:
+            # Truncated object — drop it and stop scanning
+            break
+        objects.append(raw[start:i])
+
+    if not objects:
+        return {}
+    try:
+        return {"entities": [json.loads(o) for o in objects]}
+    except json.JSONDecodeError:
+        # One of the "complete" objects had its own escape weirdness; degrade
+        # gracefully by parsing each independently and skipping bad ones.
+        out: list[dict] = []
+        for o in objects:
+            try:
+                out.append(json.loads(o))
+            except json.JSONDecodeError:
+                continue
+        return {"entities": out} if out else {}
 
 
 def _map_node_type(structural_kind: str) -> str:

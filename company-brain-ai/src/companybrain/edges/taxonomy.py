@@ -98,6 +98,9 @@ EDGE_TYPES: frozenset[str] = frozenset({
     "CONFIGURED_BY",
     "INITIALIZED_BY",
     "RATE_LIMITED_BY",
+
+    # ASSUMPTION / DEPENDENCY (static analysis — assumption_miner)
+    "RELIES_ON",
 })
 # fmt: on
 
@@ -130,6 +133,7 @@ EDGE_GROUPS: dict[str, list[str]] = {
     "OBSERVABILITY": ["LOGS_TO", "EMITS_METRIC", "TRACED_BY"],
     "TESTING": ["TESTED_BY", "MOCKS", "FIXTURE_FOR"],
     "CONFIG / LIFECYCLE": ["CONFIGURED_BY", "INITIALIZED_BY", "RATE_LIMITED_BY"],
+    "ASSUMPTION / DEPENDENCY": ["RELIES_ON"],
 }
 
 # ── Structural edges pre-extracted by AST (never emit from LLM pass) ──────────

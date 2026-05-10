@@ -171,6 +171,9 @@ class HarnessLoop:
             "wall_time_seconds": round(time.monotonic() - started, 3),
             "provider": self._provider.provider_name,
             "model": self._provider.model_for_role(self._role),
+            # ADR-0051 P3 — set by build_system_prompt. None if no match.
+            "skill_loaded":    context.get("skill_loaded"),
+            "brain_md_loaded": bool(context.get("brain_md_loaded")),
         }
         return result
 

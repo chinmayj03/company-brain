@@ -1,6 +1,6 @@
 # HARNESS — the agentic extraction loop
 
-**Status:** Phase 2 (tool-use harness with parallel sub-agent fan-out).
+**Status:** Phase 3 (sub-agent fan-out + per-framework skills + per-repo memory).
 **Source:** `company-brain-ai/src/companybrain/harness/`.
 **Driving ADR:** [`ADR-0051`](adrs/ADR-0051-agentic-harness-migration.md).
 
@@ -251,9 +251,92 @@ failures are always observable in the spawn_* tool's return value.
 
 ---
 
+## Skills (Phase 3)
+
+P3 attaches a per-framework `SKILL.md` to the system prompt when the repo
+matches one of the supported frameworks. The skill is a focused ~2 KB
+markdown file teaching the agent the conventions, annotations, and false
+positives of one framework — enough that the same `extract_methods_from_class`
+loop produces sensible output on Spring Boot, FastAPI, NestJS, Django,
+Rails, and Next.js without any per-repo orchestrator change.
+
+```
+companybrain.harness.system_prompt.build_system_prompt(context)
+   ├─ base prompt (canonical pipeline + tool catalog)
+   ├─ skills.detect_framework(repo_path)
+   │     • cheap deterministic scan of file markers
+   │     • Counter of hits per framework, max wins
+   │     • caps to 50 files per pattern, skips node_modules / target / .venv
+   ├─ skills.load_skill(framework) → SKILL.md text
+   │     • appended under "# Framework Skill: <name>"
+   │     • context["skill_loaded"] = framework  (echoed in telemetry)
+   └─ memory.load(repo_path) → BRAIN.md text
+         • appended under "# Repo memory (BRAIN.md)"
+         • context["brain_md_loaded"] = bool
+```
+
+### Supported frameworks
+
+| Framework     | Marker patterns                                                     | Where the SKILL.md lives                  |
+|---------------|---------------------------------------------------------------------|-------------------------------------------|
+| `spring-boot` | `@SpringBootApplication` in `*.java`, `spring-boot-starter` in pom / gradle | `frameworks/spring-boot/SKILL.md` |
+| `fastapi`     | `from fastapi import` in `*.py`, `fastapi` in pyproject / requirements | `frameworks/fastapi/SKILL.md`          |
+| `nestjs`      | `@nestjs/core` / `@nestjs/common` in `*.ts`, `@nestjs/` in `package.json` | `frameworks/nestjs/SKILL.md`         |
+| `django`      | `from django` / `import django`, `manage.py`                        | `frameworks/django/SKILL.md`              |
+| `rails`       | `rails` in `Gemfile`, `Rails.application.routes` in `routes.rb`     | `frameworks/rails/SKILL.md`               |
+| `nextjs`      | `"next":` in `package.json`, `next.config.{js,mjs}`                 | `frameworks/nextjs/SKILL.md`              |
+
+The detector returns `None` for repos that match nothing; the harness then
+runs with the base prompt only.
+
+### Adding a new framework
+
+1. Add an entry to `_FRAMEWORK_MARKERS` in `harness/skills.py`. Each entry
+   is `(glob_pattern, predicate)` pairs the scan will tally.
+2. Create `frameworks/<name>/SKILL.md` with the conventions, common false
+   positives, and DTOs to skip for that framework.
+3. The detector picks the new framework up on the next run — no other code
+   change is required.
+
+The skill text is read fresh on every prompt build, so editing a SKILL.md
+does not require a process restart.
+
+### Per-repo memory — BRAIN.md (Phase 3)
+
+`<repo>/.brain/BRAIN.md` carries repo-specific gotchas the agent could not
+infer from the code alone (column renames, no-op DTOs, legacy passthroughs,
+recurring drops). It has two sections:
+
+```
+## Curated notes (human-edited)
+   The team writes the gotchas they want every run to see.
+
+<!-- AUTO-APPENDED — managed by company-brain. Do not edit by hand. -->
+   The pipeline appends timestamped observations here via memory.auto_append.
+```
+
+* `memory.load(repo_path)` → returns the file contents or `""` if missing.
+  Called by `build_system_prompt` and stitched in under
+  `# Repo memory (BRAIN.md)`.
+* `memory.auto_append(repo_path, observation)` → adds a timestamped bullet
+  to the auto section. Skips when the same observation already appears in
+  the trailing 4 KB (kills repetitive spam) and seeds the file from the
+  `.brain-template/BRAIN.md` template on first call.
+
+Telemetry echoes both attachments:
+
+```
+HarnessResult.telemetry["skill_loaded"]    -> "spring-boot" | "fastapi" | ... | None
+HarnessResult.telemetry["brain_md_loaded"] -> True | False
+```
+
+These bubble through `PipelineResult.telemetry["harness"]` so existing job
+endpoints surface "which skill ran" without an API change.
+
+---
+
 ## What's next
 
-* **P3** — per-framework `SKILL.md` + per-repo `BRAIN.md` memory.
 * **P4** — hooks, capability declarations, streaming TodoWrite progress.
 
 The legacy linear path stays the default until the P4 acceptance suite is

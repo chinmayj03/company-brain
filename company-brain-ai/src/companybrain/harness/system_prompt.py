@@ -1,10 +1,20 @@
-"""System prompt for the HarnessLoop (ADR-0051 P1).
+"""System prompt for the HarnessLoop (ADR-0051 P1, extended in P3).
 
 The prompt is generated from the live tool registry so a newly registered tool
 is announced to the model on the next run with no manual edit to this file.
+
+Phase 3 additions:
+  • Per-framework SKILL.md (companybrain.harness.skills) appended when the repo
+    matches a known framework (Spring Boot, FastAPI, NestJS, Django, Rails,
+    Next.js). Detection mutates the passed `context` dict with `skill_loaded`
+    so HarnessLoop can surface it in telemetry.
+  • Per-repo BRAIN.md (companybrain.harness.memory) appended verbatim when the
+    repo has one. The agent reads curated gotchas + the pipeline's auto-
+    appended observations.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 _PROMPT_TEMPLATE = """\
@@ -91,7 +101,57 @@ def build_system_prompt(context: dict[str, Any]) -> str:
         f"endpoint     : {method} {endpoint}"
     )
 
-    return _PROMPT_TEMPLATE.format(
+    prompt = _PROMPT_TEMPLATE.format(
         tool_list=tool_list,
         context_block=context_block,
     )
+
+    # ── Phase-3 attachments: framework skill + per-repo BRAIN.md ────────────
+    # Both are best-effort: a missing repo, missing framework match, or
+    # missing BRAIN.md is the common case and contributes nothing.
+    repo_path_raw = context.get("repo_path")
+    if repo_path_raw:
+        repo = Path(repo_path_raw)
+        if repo.exists() and repo.is_dir():
+            prompt += _build_skill_section(repo, context)
+            prompt += _build_memory_section(repo, context)
+
+    return prompt
+
+
+def _build_skill_section(repo: Path, context: dict[str, Any]) -> str:
+    """Detect the framework, load its SKILL.md, and record the choice in `context`.
+
+    Mutates `context["skill_loaded"]` so HarnessLoop can echo it into telemetry
+    without re-running detection. Returns "" when no framework matches.
+    """
+    from companybrain.harness.skills import detect_framework, load_skill
+
+    framework = detect_framework(repo)
+    if not framework:
+        context["skill_loaded"] = None
+        return ""
+
+    skill_md = load_skill(framework)
+    context["skill_loaded"] = framework
+    if not skill_md:
+        # We knew the framework but the SKILL.md is missing on disk. Still
+        # record the detection so telemetry reflects reality.
+        return ""
+
+    return f"\n\n# Framework Skill: {framework}\n\n{skill_md.rstrip()}\n"
+
+
+def _build_memory_section(repo: Path, context: dict[str, Any]) -> str:
+    """Append the repo's BRAIN.md verbatim under a clear heading.
+
+    Mutates `context["brain_md_loaded"]` to a bool so callers can tell whether
+    the agent actually saw repo memory.
+    """
+    from companybrain.harness import memory
+
+    brain_md = memory.load(repo)
+    context["brain_md_loaded"] = bool(brain_md)
+    if not brain_md:
+        return ""
+    return f"\n\n# Repo memory (BRAIN.md)\n\n{brain_md.rstrip()}\n"

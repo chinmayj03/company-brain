@@ -1,0 +1,110 @@
+{
+  "name": "company-brain",
+  "displayName": "Company Brain",
+  "description": "Codebase context + extraction insights, inline. Talks to the company-brain MCP server (ADR-0052 P5).",
+  "version": "1.0.0",
+  "publisher": "company-brain",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chinmayj03/company-brain.git",
+    "directory": "ide/vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Education",
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Company Brain",
+      "properties": {
+        "companyBrain.mcpUrl": {
+          "type": "string",
+          "default": "http://localhost:8765",
+          "description": "URL of the brain MCP server (the FastAPI/SSE transport from ADR-0052 P5)."
+        },
+        "companyBrain.workspaceId": {
+          "type": "string",
+          "default": "",
+          "description": "Workspace UUID for this repo. Empty = use the server's default."
+        },
+        "companyBrain.hoverEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable hover tooltips on Spring annotations (@Autowired, @Service, @Repository, @Controller)."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "companyBrain.askBrain",
+        "title": "Brain: Ask about this method"
+      },
+      {
+        "command": "companyBrain.openSidebar",
+        "title": "Brain: Open Sidebar"
+      },
+      {
+        "command": "companyBrain.refreshContext",
+        "title": "Brain: Refresh Context"
+      },
+      {
+        "command": "companyBrain.extractCurrentEndpoint",
+        "title": "Brain: Extract endpoint at cursor"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "companyBrain.askBrain",
+          "group": "navigation@1",
+          "when": "editorTextFocus"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "companyBrain.refreshContext",
+          "when": "view == companyBrain.context",
+          "group": "navigation"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "companyBrain",
+          "title": "Company Brain",
+          "icon": "media/brain.svg"
+        }
+      ]
+    },
+    "views": {
+      "companyBrain": [
+        {
+          "id": "companyBrain.context",
+          "name": "Context for current file"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-yarn",
+    "test:headless": "node ./test/headless-query.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.22.0",
+    "typescript": "^5.3.0"
+  }
+}

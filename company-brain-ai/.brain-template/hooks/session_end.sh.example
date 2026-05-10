@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# session_end hook — fires once when a pipeline run finalises (success or failure).
+#
+# Stdin (JSON):
+#   {
+#     "session_id": "job-abc123",
+#     "status":     "success" | "failed" | "timeout",
+#     "entities":   124,
+#     "edges":      310,
+#     "cost_usd":   0.087,
+#     "duration_s": 42.1
+#   }
+#
+# Use this hook to flush any per-run state, push the .brain/ archive somewhere,
+# or close out the per-job log file opened in session_start.
+
+set -euo pipefail
+PAYLOAD="$(cat)"
+echo "[brain] session ended: $PAYLOAD" >&2
+echo "{}"

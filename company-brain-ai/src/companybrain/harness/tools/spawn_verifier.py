@@ -19,6 +19,7 @@ from typing import Any
 import structlog
 
 from companybrain.config import settings
+from companybrain.harness.permissions import Capability
 from companybrain.harness.subagent import Subagent, run_with_timeout
 from companybrain.harness.tools import register_tool
 from companybrain.llm.base import TaskRole, ToolParameter
@@ -85,6 +86,7 @@ Operating rules
             required=False,
         ),
     ],
+    requires=(Capability.READ_REPO, Capability.LLM_CALL),
 )
 async def handler(args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     claims = list(args.get("claims") or [])

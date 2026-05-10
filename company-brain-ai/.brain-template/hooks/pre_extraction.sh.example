@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# pre_extraction hook — fires once before list_candidate_files runs.
+#
+# Stdin (JSON):
+#   {
+#     "endpoint":   "/health",
+#     "method":     "GET",
+#     "repo_path":  "/abs/path/to/repo",
+#     "candidate_files": ["src/.../X.java", ...]
+#   }
+#
+# Stdout (optional, JSON):
+#   {"drop_globs": ["*_test.java", "**/generated/**"]}
+#       — files matching any of these globs are removed from the manifest.
+#
+# Anything written to stderr is captured into pipeline logs at WARNING level.
+# A non-zero exit code disables this hook for the rest of the run.
+#
+# Activate by:
+#   1. cp pre_extraction.sh.example .brain/hooks/pre_extraction.sh
+#   2. chmod +x .brain/hooks/pre_extraction.sh
+#   3. Edit the JSON payload below to match your repo's needs.
+
+set -euo pipefail
+
+# Drop generated code and unit tests by default. Tweak to taste.
+cat <<'JSON'
+{
+  "drop_globs": [
+    "**/*Test.java",
+    "**/*_test.java",
+    "**/generated/**",
+    "**/__pycache__/**",
+    "**/node_modules/**"
+  ]
+}
+JSON

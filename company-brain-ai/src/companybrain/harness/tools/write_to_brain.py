@@ -5,6 +5,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from companybrain.harness.permissions import Capability
 from companybrain.harness.tools import register_tool
 from companybrain.llm.base import ToolParameter
 from companybrain.store.base import BrainEntity
@@ -31,6 +32,7 @@ _DEFAULT_ENTITY_TYPE = "function_node"
                       "dicts. Edges may also be inlined under each entity.",
                       required=False),
     ],
+    requires=(Capability.WRITE_BRAIN,),
 )
 async def handler(args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     entities = list(args.get("entities") or [])

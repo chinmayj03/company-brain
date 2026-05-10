@@ -280,5 +280,24 @@ class Settings(BaseSettings):
     # Override via env var: SUBAGENT_TIMEOUT_S=180.
     subagent_timeout_s: int = 120
 
+    # ── ADR-0051 P4: hooks + permissions + streaming + introspection ──────────
+    # When False, the harness skips invoking shell hooks regardless of whether
+    # `<repo>/.brain/hooks/*.sh` exists. Defaults to True; tests and locked-
+    # down environments can flip it off via BRAIN_HOOKS_ENABLED=false.
+    hooks_enabled: bool = True
+    # Per-hook wall-clock cap. A long hook must offload work elsewhere.
+    hook_timeout_s: int = 30
+    # Trigger compaction when the running input-token usage exceeds this
+    # fraction of the model's context window. 0.80 leaves ~40K headroom on
+    # a 200K-window provider for the next multi-tool turn.
+    compaction_threshold: float = 0.80
+    # Nominal context window used when the provider doesn't expose its own.
+    # Compaction is provider-agnostic; widening the window here only delays
+    # compaction, it cannot exceed the provider's real ceiling.
+    compaction_context_limit_tokens: int = 200_000
+    # Treat ASK decisions as AUTO-approve. CLI `--yes` plumbs through here;
+    # the env var BRAIN_AUTOAPPROVE=true is also honoured.
+    grants_auto_approve: bool = False
+
 
 settings = Settings()

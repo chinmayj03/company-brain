@@ -352,5 +352,112 @@ def _git_head(repo: Path) -> str:
         return "HEAD"
 
 
+# ── ADR-0051 P4: brain session / brain tools ────────────────────────────────
+
+
+@app.command(name="session")
+def session_cmd(
+    action: str = typer.Argument(..., help="list | resume | transcript"),
+    id: Optional[str] = typer.Argument(None, help="Session id (required for resume/transcript)"),
+):
+    """Inspect or resume a harness session (ADR-0051 P4).
+
+    Examples:
+
+        brain session list
+        brain session transcript sess-abc123
+        brain session resume     sess-abc123
+    """
+    from companybrain.harness import session as session_mod
+
+    action = action.strip().lower()
+    if action == "list":
+        # Pull live sessions from the registry and any saved snapshots from disk.
+        rows = list(session_mod.list_sessions())
+        d = session_mod.session_dir()
+        if d.is_dir():
+            for p in sorted(d.glob("*.json")):
+                try:
+                    s = session_mod.load(p)
+                except Exception as exc:  # noqa: BLE001 — diagnostic only
+                    typer.secho(f"  {p.name}: load failed — {exc}", fg=typer.colors.YELLOW)
+                    continue
+                if not any(r["id"] == s.id for r in rows):
+                    rows.append({
+                        "id":         s.id,
+                        "created_at": s.created_at,
+                        "status":     s.status,
+                        "endpoint":   f"{s.method} {s.endpoint}".strip(),
+                        "cost_usd":   round(s.cost.total_cost_usd, 4),
+                    })
+        if not rows:
+            typer.echo("(no sessions)")
+            return
+        for r in rows:
+            typer.echo(
+                f"  {r['id']:24s}  {r['status']:10s}  "
+                f"${r.get('cost_usd', 0):>7.4f}  {r['endpoint']}  ({r['created_at']})"
+            )
+        return
+
+    if action in {"resume", "transcript"}:
+        if not id:
+            typer.secho(f"`brain session {action}` requires an <id>.", fg=typer.colors.RED)
+            raise typer.Exit(2)
+        # Load from in-memory registry first; fall back to disk.
+        sess = session_mod.get_session_or_none(id)
+        if sess is None:
+            path = session_mod.session_dir() / f"{id}.json"
+            if not path.is_file():
+                typer.secho(f"Session {id!r} not found.", fg=typer.colors.RED)
+                raise typer.Exit(1)
+            sess = session_mod.load(path)
+        if action == "transcript":
+            import json as _json
+            for msg in sess.transcript:
+                typer.echo(_json.dumps(msg, default=str))
+            return
+        # resume: print a "what would happen" preview. Re-running the harness
+        # programmatically against a partially-completed session is left to
+        # follow-up work — this hook is here so the CLI surface exists today.
+        typer.echo(f"Session {sess.id}  status={sess.status}  cost=${sess.cost.total_cost_usd:.4f}")
+        typer.echo(f"  endpoint: {sess.method} {sess.endpoint}")
+        typer.echo(f"  repo:     {sess.repo_path}")
+        typer.echo(f"  todo:     {len(sess.todo.snapshot())} root items")
+        typer.secho("  resume is read-only in P4; run `brain index` to start a fresh session.",
+                    fg=typer.colors.YELLOW)
+        return
+
+    typer.secho(f"Unknown action: {action!r}. Valid: list | resume | transcript",
+                fg=typer.colors.RED)
+    raise typer.Exit(2)
+
+
+@app.command(name="tools")
+def tools_cmd(
+    action: str = typer.Argument("list", help="list (default)"),
+):
+    """Print the harness tool registry (ADR-0051 P4).
+
+    `brain tools list` shows every registered tool with its required
+    capabilities — useful for confirming a tool's permission gate.
+    """
+    if action.strip().lower() != "list":
+        typer.secho(f"Unknown action: {action!r}. Only 'list' is supported.",
+                    fg=typer.colors.RED)
+        raise typer.Exit(2)
+
+    # Late import so the CLI doesn't pay for harness wiring on every invocation.
+    from companybrain.harness.tools import TOOL_REGISTRY
+
+    if not TOOL_REGISTRY:
+        typer.echo("(no tools registered)")
+        return
+    for name, t in sorted(TOOL_REGISTRY.items()):
+        caps = ",".join(c.value for c in t.requires) or "(none)"
+        typer.echo(f"  {name:32s}  [{caps}]")
+        typer.echo(f"      {t.description}")
+
+
 if __name__ == "__main__":
     app()

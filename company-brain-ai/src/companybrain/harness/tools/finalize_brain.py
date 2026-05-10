@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from companybrain.harness.permissions import Capability
 from companybrain.harness.tools import register_tool
 from companybrain.llm.base import ToolParameter
 from companybrain.store.json_store import JsonFileBrainStore
@@ -21,6 +22,7 @@ from companybrain.store.json_store import JsonFileBrainStore
                       "Workspace identifier for the run. Should match context.workspace_id.",
                       required=False),
     ],
+    requires=(Capability.WRITE_BRAIN,),
 )
 async def handler(args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     workspace_id = args.get("workspace_id") or context.get("workspace_id")

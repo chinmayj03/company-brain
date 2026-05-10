@@ -1,6 +1,6 @@
 # HARNESS — the agentic extraction loop
 
-**Status:** Phase 3 (sub-agent fan-out + per-framework skills + per-repo memory).
+**Status:** Phase 4 (hooks + permissions + streaming + introspection).
 **Source:** `company-brain-ai/src/companybrain/harness/`.
 **Driving ADR:** [`ADR-0051`](adrs/ADR-0051-agentic-harness-migration.md).
 
@@ -335,9 +335,139 @@ endpoints surface "which skill ran" without an API change.
 
 ---
 
+## Hooks (Phase 4)
+
+Hooks are shell scripts at `<repo>/.brain/hooks/<event>.sh` that the harness
+fires at well-defined points. Each script receives a JSON payload on stdin
+and may print a JSON object on stdout to modify pipeline behaviour.
+
+| Event             | Fires when                                                        | Modifier                  |
+|-------------------|-------------------------------------------------------------------|---------------------------|
+| `session_start`   | Once at the top of `HarnessLoop.run`                              | (informational)           |
+| `pre_extraction`  | Before `extract_methods_from_class` / `spawn_extractor`           | `{"drop_globs": [...]}`   |
+| `post_extraction` | After extraction returns (per call)                               | `{"warn": "..."}`         |
+| `on_truncation`   | When an LLM response is suspected truncated                       | (informational)           |
+| `pre_storage`     | Before `write_to_brain` / `finalize_brain`                        | `{"abort": "reason"}`     |
+| `post_storage`    | After storage completes                                           | (informational)           |
+| `pre_query`       | Before a `/query` LLM call                                        | `{"hint": "..."}`         |
+| `post_query`      | After a `/query` LLM call                                         | (informational)           |
+| `session_end`     | Once when the run finalises (success or failure)                  | (informational)           |
+
+A missing or non-executable script is treated as absent — the run continues.
+A hook that fails, times out (default 30s), or returns garbage is logged and
+ignored. Defaults are encoded in `companybrain.harness.hooks` and the
+example scripts live in `.brain-template/hooks/*.sh.example`.
+
+Telemetry — `HarnessResult.telemetry["hook_invocations"]` is a `{event: count}`
+dict with one entry per hook that actually ran.
+
+## Permissions (Phase 4)
+
+Each tool declares the capabilities it requires (read_repo, write_brain,
+network, exec_shell, llm_call). A `WorkspaceGrants` table maps each
+capability to one of three decisions:
+
+* `auto` — proceed silently (default for read tools).
+* `ask`  — interactive sessions prompt; non-interactive sessions deny
+            unless `--yes` / `BRAIN_AUTOAPPROVE=true`.
+* `deny` — refuse the tool call; surface as an error to the model so it
+            can re-plan.
+
+Default profile (`DEFAULT_GRANTS` in `harness/permissions.py`):
+
+```
+read_repo   = auto
+read_brain  = auto
+write_brain = ask
+network     = ask
+exec_shell  = deny
+llm_call    = auto
+```
+
+Override via `BRAIN_GRANTS=write_brain:auto,exec_shell:auto` (env) or
+`load_workspace_grants(overrides=...)` in code.
+
+`brain tools list` prints every registered tool with its required
+capabilities so the gate can be inspected without reading the source.
+
+## TodoList streaming (Phase 4)
+
+`harness.progress.TodoList` is a small task tree that the harness updates as
+the run progresses. The FastAPI endpoint
+`/pipeline/jobs/{id}/stream` subscribes to it and emits Server-Sent Events:
+
+```
+data: {"action":"snapshot","items":[...]}
+data: {"action":"add","item":{"id":"call_1","status":"pending",...}}
+data: {"action":"update","item":{"id":"call_1","status":"in_progress",...}}
+data: {"action":"update","item":{"id":"call_1","status":"completed",...}}
+data: {"action":"heartbeat","ts":"2026-05-10T18:00:00+00:00"}
+data: [DONE]
+```
+
+The first event after connect is always a full `snapshot` of the current
+tree, so a UI joining mid-run sees the existing items without waiting for
+the next mutation. A heartbeat is emitted every 15 seconds to keep proxies
+from idling the connection out.
+
+## Compaction (Phase 4)
+
+When the running input-token usage crosses 80% of the configured context
+window (`compaction_context_limit_tokens`, default 200K), the harness
+compacts the message history in place: keep the system prompt + first user
+message + the last 10 turns, replace the middle with a one-line summary
+referring callers to `HarnessResult.messages` for the full transcript.
+
+* No LLM-based summary — the model already produced the dropped content
+  and the results are in `.brain/`. A second LLM pass would add cost and
+  another failure mode for negligible quality gain.
+* Compaction is idempotent and may run multiple times in a long session.
+  `HarnessResult.telemetry["compaction_invocations"]` reports the count;
+  `max_context_used` is the worst case before any compaction.
+
+## Sessions + introspection (Phase 4)
+
+Every harness run has a `Session` (id = job id when driven from a pipeline
+job, else a random `sess-<hex>`). Sessions hold the live `TodoList`,
+`CostTracker`, and the message transcript. They round-trip to disk so
+post-mortem inspection works across processes:
+
+```
+brain session list
+brain session transcript sess-abc123
+brain session resume     sess-abc123     # read-only preview in P4
+brain tools list                          # tool registry + required caps
+```
+
+The on-disk location is `$BRAIN_HOME/sessions/<id>.json` (default
+`~/.brain/sessions/<id>.json`).
+
+## Per-tool cost telemetry (Phase 4)
+
+`CostTracker` aggregates `(input_tokens, output_tokens, cost_usd)` keyed on
+the tool's registry name, plus a synthetic `_loop` bucket for the parent
+loop's own LLM calls. The summary surfaces in
+`HarnessResult.telemetry["cost"]`:
+
+```
+{
+  "total_cost_usd": 0.0823,
+  "total_calls":    14,
+  "by_tool": {
+    "spawn_extractor":            {"calls": 1, "cost_usd": 0.0612, ...},
+    "_loop":                      {"calls": 5, "cost_usd": 0.0184, ...},
+    "extract_methods_from_class": {"calls": 3, "cost_usd": 0.0027, ...}
+  }
+}
+```
+
+Sorted descending by cost so the dominant tool is at the top.
+
+---
+
 ## What's next
 
-* **P4** — hooks, capability declarations, streaming TodoWrite progress.
-
 The legacy linear path stays the default until the P4 acceptance suite is
-green for two weeks (per ADR-0051).
+green for two weeks (per ADR-0051), at which point `BRAIN_USE_HARNESS=true`
+becomes the default and `pipeline/orchestrator.py`'s legacy stage machine is
+removed.

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# pre_storage hook — fires immediately before write_to_brain persists entities.
+#
+# Stdin (JSON):
+#   {
+#     "entities": 124,
+#     "edges":    310,
+#     "diff":     {"new": 12, "updated": 8, "removed": 0}
+#   }
+#
+# Stdout (optional, JSON):
+#   {"abort": "reason"}   — cancels the storage write and surfaces the reason.
+#
+# Use this hook to gate writes (e.g. require a curator's approval when the diff
+# crosses a threshold) or to emit a brain-diff preview into a Slack channel.
+
+set -euo pipefail
+echo "{}"

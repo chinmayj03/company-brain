@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# post_storage hook — fires after write_to_brain completes successfully.
+#
+# Stdin (JSON):
+#   {
+#     "entities":   124,
+#     "edges":      310,
+#     "brain_path": "/abs/path/to/.brain",
+#     "duration_s": 1.42
+#   }
+#
+# Stdout: ignored. Side effects only.
+#
+# Use this hook to push the .brain/ to a remote (S3, an internal index) or to
+# trigger a downstream rebuild.
+
+set -euo pipefail
+PAYLOAD="$(cat)"
+echo "[brain] storage complete: $PAYLOAD" >&2
+echo "{}"

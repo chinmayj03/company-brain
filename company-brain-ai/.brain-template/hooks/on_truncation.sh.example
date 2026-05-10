@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# on_truncation hook — fires when an LLM response is suspected to be truncated
+# (e.g. JSON ends mid-string, output_tokens hit the cap) or when a chunk is
+# split because of token-budget pressure.
+#
+# Stdin (JSON):
+#   {
+#     "file":            "src/.../BigController.java",
+#     "method":          "extract_methods_from_class",
+#     "tokens_out":      6000,
+#     "max_tokens":      6000,
+#     "split_into":      4
+#   }
+#
+# Use this hook to alert when a class repeatedly truncates so a human can bump
+# the per-stage cap or split the file.
+
+set -euo pipefail
+PAYLOAD="$(cat)"
+echo "[brain] truncation detected: $PAYLOAD" >&2
+echo "{}"

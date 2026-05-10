@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# pre_query hook — fires before a /query LLM call resolves a user question.
+#
+# Stdin (JSON):
+#   {
+#     "query":        "where is the lob field stored",
+#     "workspace_id": "ws-1234",
+#     "intent":       "concept"
+#   }
+#
+# Stdout (optional, JSON):
+#   {"hint": "..."}   — appended to the system prompt for this query only.
+#
+# Use this hook to inject organisation-specific guidance into the query agent
+# without modifying the codebase.
+
+set -euo pipefail
+echo "{}"

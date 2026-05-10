@@ -217,6 +217,15 @@ class Settings(BaseSettings):
     # Override via env var: BRAIN_JOB_BUDGET_USD=0.50
     brain_job_budget_usd: float = 0.50
 
+    # ── ADR-0044: chunked extraction ──────────────────────────────────────────
+    # Routes extraction through the per-method chunk queue (no truncation).
+    # Override via env var: BRAIN_USE_CHUNK_QUEUE=false to temporarily disable.
+    use_chunk_queue: bool = True
+    # Escape hatch: BRAIN_LEGACY_EXTRACT=true restores the old per-file path.
+    use_legacy_extract: bool = False
+    # Max parallel workers draining the extraction queue per pipeline run.
+    chunk_queue_max_workers: int = 4
+
     # ── ADR-0042 E10: intent router ────────────────────────────────────────────
     # When True, the intent router is called before SmartZoneAssembler.
     # Adds ~200ms per query but dramatically improves subgraph selection.

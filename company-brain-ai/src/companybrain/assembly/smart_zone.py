@@ -33,7 +33,13 @@ class SmartZoneAssembler:
                                        embedder=self.embedder)
 
     async def assemble(self, *, task: str, entities: list[str] | None = None,
-                       budget: TokenBudget | None = None) -> SmartZonePayload:
+                       budget: TokenBudget | None = None,
+                       qdrant_index: str = "default") -> SmartZonePayload:
+        """Assemble T0/T1/T2 tiered context for `task`.
+
+        qdrant_index (ADR-0043 WS2): passed to HybridSearcher.search() so the
+        primary retrieval step queries the intent-appropriate Qdrant collection.
+        """
         budget = budget or TokenBudget()
         task_type = classify(task)
         params = TASK_PARAMS[task_type]
@@ -43,7 +49,7 @@ class SmartZoneAssembler:
             primary = entities[:40]
             scores = {u: 1.0 for u in primary}
         else:
-            hits = self.searcher.search(task, top_k=40)
+            hits = self.searcher.search(task, top_k=40, index=qdrant_index)
             primary = [h.urn for h in hits]
             scores = {h.urn: h.score for h in hits}
 

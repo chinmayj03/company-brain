@@ -49,7 +49,11 @@ from companybrain.pipeline.context_manager_agent import ContextManagerAgent
 from companybrain.pipeline.shared_context_accumulator import SharedContextAccumulator
 from companybrain.pipeline.assumption_miner import mine_assumptions  # ADR-0017
 from companybrain.pipeline.derived_query_extractor import DerivedQueryExtractor  # Tier 1.C
-from companybrain.pipeline.extraction_loop import ExtractionLoop  # ADR-0041 Phase 2
+from companybrain.pipeline.extraction_loop import ExtractionLoop  # ADR-0041 Phase 2 / ADR-0042 E1
+from companybrain.pipeline.passes import (   # ADR-0042 E2/E3/E5/E6/E7
+    AnnotationPass, StorageTargetPass, SchemaMigrationPass,
+    ClientCallPass, TestCoveragePass,
+)
 from companybrain.graph.java_client import JavaGraphClient, ArtifactFreshnessResult
 from companybrain.models.entities import PipelineStartRequest, ExtractedEntity
 from companybrain.store.base import BrainEntity as _BrainEntity  # ADR-0017
@@ -324,6 +328,11 @@ async def run_pipeline(
                     fresh_units.append(unit)
                 else:
                     dirty_units.append(unit)
+                    # E4: annotate the unit with any method-level hashes the
+                    # backend confirmed as unchanged so EntityExtractor can
+                    # skip individual unchanged methods within a dirty file.
+                    if result and result.fresh_method_hashes:
+                        unit._fresh_method_hashes = result.fresh_method_hashes
 
             # Reconstruct ExtractedEntity objects from fresh node projections
             # so relationship extraction / synthesis can reference them.
@@ -1191,6 +1200,10 @@ async def run_pipeline(
         # BFS from the entry endpoint via structural edges; drop everything
         # not reached. Skippable via BRAIN_SKIP_REACHABILITY_FILTER=true if
         # an operator wants the unfiltered superset.
+        #
+        # Runs BEFORE the ADR-0042 passes so the passes only spend LLM calls
+        # on the reachable set (cheaper) and don't pollute their summaries
+        # with drift entities.
         from companybrain.pipeline.reachability_filter import filter_to_reachable
 
         if os.environ.get("BRAIN_SKIP_REACHABILITY_FILTER", "").lower() != "true":
@@ -1212,6 +1225,55 @@ async def run_pipeline(
                     **{k: v for k, v in _reach_stats.items()
                        if k in ("total", "reachable", "dropped")},
                 )
+
+        # ── Stage 2.6: ADR-0042 extraction passes (E2/E3/E5/E6/E7) ──────────────
+        # Each pass is independent, language-agnostic, and individually skip-able.
+        # Results are merged into the relationship set before Stage 3.
+        # Runs on the reachable entity set produced by Stage 2.5.
+        pass_rels: list = []
+        if entities:
+            await progress("2.6", "🔬", "ADR-0042 extraction passes — annotations, storage targets, client calls, test coverage")
+            _passes = [
+                AnnotationPass(),
+                StorageTargetPass(),
+                SchemaMigrationPass(),
+                ClientCallPass(),
+                TestCoveragePass(),
+            ]
+            for _pass in _passes:
+                try:
+                    _pass_rels, _pass_summary = await _pass.run(entities)
+                    pass_rels.extend(_pass_rels)
+                    stages_summary.append(_pass_summary)
+                    await progress(
+                        "2.6", "✅",
+                        f"{_pass.name}: {_pass_summary['edges_emitted']} edges",
+                        **{k: v for k, v in _pass_summary.items()
+                           if k in ("edges_emitted", "skipped_via_env", "duration_ms")},
+                    )
+                except Exception as _pe:
+                    log.warning(f"Extraction pass failed (non-fatal)",
+                                pass_name=_pass.name, error=str(_pe))
+
+            # Merge pass edges into the relationship set (dedup)
+            all_pass_rels_count = len(pass_rels)
+            relationships = _dedup_relationships(relationships + pass_rels)
+            log.info("ADR-0042 passes complete",
+                     pass_edges=all_pass_rels_count,
+                     total_after_merge=len(relationships))
+
+        # ── Cost guard (ADR-0042) ────────────────────────────────────────────
+        _cost_so_far = _run_tracker.summary().get("total_cost_usd", 0.0)
+        if _cost_so_far > settings.brain_job_budget_usd:
+            log.error(
+                "Job exceeded budget — aborting before Stage 3",
+                spent=_cost_so_far,
+                budget=settings.brain_job_budget_usd,
+            )
+            raise RuntimeError(
+                f"JobBudgetExceeded: spent ${_cost_so_far:.4f}, "
+                f"budget ${settings.brain_job_budget_usd:.4f}"
+            )
 
         # ── Stage 3: Business context synthesis ───────────────────────────────
         await progress("3", "📖", "Context synthesis — explaining WHY each entity exists (using git history)")

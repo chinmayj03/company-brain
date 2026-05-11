@@ -155,6 +155,27 @@ make redis-shell  # redis-cli
 
 ---
 
+## Supported Languages
+
+The extraction pipeline works for any language — no per-language code paths exist
+in orchestrator logic. All framework-specific knowledge lives inside focused LLM
+prompts (ADR-0042).
+
+| Language / Runtime | Frameworks detected | Extraction passes |
+|---|---|---|
+| **Java** | Spring Boot, Hibernate/JPA, jOOQ, Flyway, Liquibase | All 5 passes |
+| **Python** | FastAPI, Flask, SQLAlchemy, Alembic, Prisma (Python) | All 5 passes |
+| **TypeScript / JavaScript** | Next.js, NestJS, Drizzle ORM, Prisma, Knex | All 5 passes |
+| **Ruby** | Rails (test coverage detection) | TestCoveragePass |
+| **Go** | Standard `testing` package | TestCoveragePass |
+| **.NET / C#** | xUnit, NUnit, MSTest | TestCoveragePass |
+| **Other** | Any HTTP/REST/gRPC call patterns | ClientCallPass |
+
+To add a new framework: update the system prompt in the relevant pass file in
+`company-brain-ai/src/companybrain/pipeline/passes/`. No orchestrator changes needed.
+
+---
+
 ## Environment Variables
 
 Key variables in `.env` (generated from `.env.example`):

@@ -1,6 +1,6 @@
 # ADR-0042 — Language-Agnostic Extraction Enhancements
 
-Status:      Proposed
+Status:      Accepted
 Date:        2026-05-10
 Supersedes:  partial of ADR-0006 (heuristic extractors), ADR-0040 (Tier 1.B caps)
 Companion:   See `SONNET-IMPLEMENTATION-PROMPT-ADR-0042.md` for the implementation

@@ -283,6 +283,35 @@ def _parse_llm_response(raw: str, context: str | None) -> QueryResponse:
         )
 
 
+def _strip_uncited(text: str) -> str:
+    """Drop code-shaped identifiers (CamelCase, camelCase) from sentences that
+    lack a `[urn:...]` citation. Sentences containing a URN citation are kept verbatim.
+    Suppresses LLM hallucinations of code names that weren't in retrieved context.
+    """
+    out_sentences: list[str] = []
+    for sentence in text.split(". "):
+        if "[urn:" in sentence:
+            out_sentences.append(sentence)
+            continue
+        kept: list[str] = []
+        for raw_token in sentence.split():
+            stripped = raw_token.strip(",.;:!?()[]{}'\"")
+            if not _looks_like_code_identifier(stripped):
+                kept.append(raw_token)
+        out_sentences.append(" ".join(kept))
+    return ". ".join(out_sentences)
+
+
+def _looks_like_code_identifier(token: str) -> bool:
+    """True if token has internal capitalization (PaymentService, getFoo) — i.e.,
+    a code identifier rather than a sentence-initial capitalized word."""
+    if len(token) < 2 or not any(c.isalpha() for c in token):
+        return False
+    has_lower = any(c.islower() for c in token)
+    has_upper_after_first = any(c.isupper() for c in token[1:])
+    return has_lower and has_upper_after_first
+
+
 def _plain_user_message(question: str, context: str | None) -> str:
     if context:
         return (

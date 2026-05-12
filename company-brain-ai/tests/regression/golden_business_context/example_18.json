@@ -1,0 +1,12 @@
+{
+  "i": "void track(@NotNull String event, @NotNull Map<String,String> props)",
+  "o": {
+    "is_idempotent": false,
+    "null_handling": {
+      "event": "throws",
+      "props": "throws"
+    },
+    "performance_class": "O(1)",
+    "transaction_mode": "no_transaction"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "i": "Controller @PreAuthorize(\"hasRole('ADMIN')\") deletePayer(Long id)",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "id": "throws"
+    },
+    "performance_class": "O(1)",
+    "security_class": "admin_only",
+    "transaction_mode": "read_write"
+  }
+}

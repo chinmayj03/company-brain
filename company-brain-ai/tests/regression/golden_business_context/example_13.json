@@ -1,0 +1,9 @@
+{
+  "i": "Controller @GetMapping(\"/health\") @PermitAll healthCheck()",
+  "o": {
+    "is_idempotent": true,
+    "performance_class": "O(1)",
+    "security_class": "public",
+    "transaction_mode": "no_transaction"
+  }
+}

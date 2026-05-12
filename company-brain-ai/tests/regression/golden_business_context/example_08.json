@@ -1,0 +1,8 @@
+{
+  "i": "@Transactional(readOnly=true) List<X> listAll()",
+  "o": {
+    "is_idempotent": true,
+    "performance_class": "O(n)",
+    "transaction_mode": "read_only"
+  }
+}

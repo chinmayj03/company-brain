@@ -1,0 +1,11 @@
+{
+  "i": "Repository Long createClaim(Claim c); INSERT INTO claims...",
+  "o": {
+    "is_idempotent": false,
+    "null_handling": {
+      "c": "throws"
+    },
+    "performance_class": "O(1)",
+    "transaction_mode": "read_write"
+  }
+}

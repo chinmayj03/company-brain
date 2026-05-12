@@ -1,0 +1,9 @@
+{
+  "i": "@Scheduled(cron=\"0 */5 * * *\") void rollupMetrics()",
+  "o": {
+    "is_idempotent": true,
+    "performance_class": "O(n)",
+    "security_class": "internal_only",
+    "transaction_mode": "read_write"
+  }
+}

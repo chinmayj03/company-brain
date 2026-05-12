@@ -1,0 +1,11 @@
+{
+  "i": "Repo List<X> findByLob(String lob)",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "lob": "unchecked"
+    },
+    "performance_class": "O(n)",
+    "transaction_mode": "read_only"
+  }
+}

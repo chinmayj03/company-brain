@@ -1,0 +1,14 @@
+{
+  "i": "static PayerDto toDto(Payer p) { return new PayerDto(p.id, p.name); }",
+  "o": {
+    "anti_patterns": [
+      "unchecked_dereference"
+    ],
+    "is_idempotent": true,
+    "null_handling": {
+      "p": "unchecked"
+    },
+    "performance_class": "O(1)",
+    "transaction_mode": "no_transaction"
+  }
+}

@@ -398,3 +398,171 @@ class ImplicitContract:
     preconditions: list[str] = field(default_factory=list)
     postconditions: list[str] = field(default_factory=list)
     confidence: float = 0.0
+
+
+# ── ADR-0057 additions ────────────────────────────────────────────────────────
+# Universal File Extraction: dataclasses emitted by the per-kind extractors in
+# companybrain.extractors. These are pipeline-internal models — persistence into
+# Neo4j is owned by a follow-up PR. See docs/adrs/ADR-0057-universal-file-extraction.md.
+
+@dataclass
+class Documentation:
+    """A Markdown / AsciiDoc / RST document, treated as a structured artifact."""
+    file: str
+    repo: str
+    title: str                           # first H1 heading or filename stem
+    headings: list[str] = field(default_factory=list)   # all H1/H2 heading texts in order
+    code_blocks: list[str] = field(default_factory=list)  # fenced code block contents
+    raw_text: str = ""                   # full doc body, for downstream summarisation
+
+
+@dataclass
+class ConfigKey:
+    """A single key/value pair from a config file (YAML/TOML/properties/.env)."""
+    file: str
+    repo: str
+    path: str                            # dotted path e.g. "spring.datasource.url"
+    value: str                           # stringified value
+    semantic_tag: Optional[str] = None   # populated by semantic_tags.tag_config_path
+
+
+@dataclass
+class Dependency:
+    """A build-manifest dependency entry (POM / npm / Cargo / pip / etc.)."""
+    file: str
+    repo: str
+    name: str                            # full coordinate, e.g. "org.postgresql:postgresql" or "react"
+    version: Optional[str] = None
+    scope: Optional[str] = None          # "compile" | "test" | "runtime" | "dev" | None
+    ecosystem: str = ""                  # "maven" | "npm" | "pip" | "cargo" | "go" | etc.
+
+
+@dataclass
+class BuildPlugin:
+    """A build-tool plugin (Maven plugin, Gradle plugin, etc.)."""
+    file: str
+    repo: str
+    name: str
+    version: Optional[str] = None
+
+
+@dataclass
+class ContainerImage:
+    """A FROM directive in a Dockerfile — base image used by a stage."""
+    file: str
+    repo: str
+    name: str                            # e.g. "openjdk:17-jdk-slim"
+    stage_alias: Optional[str] = None    # name from "FROM x AS stage"
+
+
+@dataclass
+class RuntimeStage:
+    """A logical stage in a multi-stage Dockerfile (alias + commands)."""
+    file: str
+    repo: str
+    name: str                            # stage alias or "stage_N"
+    base_image: str
+    exposed_ports: list[int] = field(default_factory=list)
+    entrypoint: Optional[str] = None
+    cmd: Optional[str] = None
+
+
+@dataclass
+class ServiceDefinition:
+    """A service block in a docker-compose file."""
+    file: str
+    repo: str
+    name: str                            # service key, e.g. "postgres"
+    image: Optional[str] = None
+    ports: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    depends_on: list[str] = field(default_factory=list)
+
+
+@dataclass
+class WorkflowJob:
+    """A job in a CI workflow (GitHub Actions / GitLab / Jenkins / etc.)."""
+    file: str
+    repo: str
+    name: str
+    triggers: list[str] = field(default_factory=list)   # ["push", "pull_request", ...]
+    runs_on: Optional[str] = None
+    steps: list[str] = field(default_factory=list)      # step names or run-commands
+    ci_system: str = ""                  # "github" | "gitlab" | "jenkins" | "circle" | ...
+
+
+@dataclass
+class BehavioralSpec:
+    """A test method recast as a behavioural spec (GIVEN/WHEN/THEN)."""
+    file: str
+    repo: str
+    specifies_method: str                # URN/external_id of the method under test
+    given: str
+    when: str
+    then: str
+
+
+@dataclass
+class MethodDoc:
+    """A Javadoc / docstring / JSDoc block attached to a method."""
+    file: str
+    repo: str
+    method_urn: str
+    summary: str
+    params: dict[str, str] = field(default_factory=dict)   # name → description
+    returns: Optional[str] = None
+    throws: dict[str, str] = field(default_factory=dict)   # exception → description
+
+
+@dataclass
+class ExtractedBatch:
+    """
+    Per-file output of a universal extractor.
+
+    Each list is heterogeneous-by-extractor — populate only the buckets the
+    extractor produces (e.g. ConfigExtractor emits config_keys only).
+    """
+    file: str
+    repo: str
+    extractor_kind: str                  # "doc" | "config" | "manifest_xml" | ...
+    documentation:    list[Documentation]    = field(default_factory=list)
+    config_keys:      list[ConfigKey]        = field(default_factory=list)
+    dependencies:     list[Dependency]       = field(default_factory=list)
+    build_plugins:    list[BuildPlugin]      = field(default_factory=list)
+    container_images: list[ContainerImage]   = field(default_factory=list)
+    runtime_stages:   list[RuntimeStage]     = field(default_factory=list)
+    service_defs:     list[ServiceDefinition] = field(default_factory=list)
+    workflow_jobs:    list[WorkflowJob]      = field(default_factory=list)
+    behavioral_specs: list[BehavioralSpec]   = field(default_factory=list)
+    method_docs:      list[MethodDoc]        = field(default_factory=list)
+
+    @property
+    def entity_count(self) -> int:
+        return (
+            len(self.documentation) + len(self.config_keys) + len(self.dependencies)
+            + len(self.build_plugins) + len(self.container_images)
+            + len(self.runtime_stages) + len(self.service_defs)
+            + len(self.workflow_jobs) + len(self.behavioral_specs) + len(self.method_docs)
+        )
+
+
+# Edge type constants emitted alongside the new entities. Centralised here so
+# downstream persistence layers can iterate them without string-typos.
+EDGE_DOCUMENTS         = "DOCUMENTS"
+EDGE_EXAMPLES          = "EXAMPLES"
+EDGE_CONFIGURES        = "CONFIGURES"
+EDGE_DEPENDS_ON_LIB    = "DEPENDS_ON_LIBRARY"
+EDGE_BASED_ON          = "BASED_ON"
+EDGE_EXPOSES_PORT      = "EXPOSES_PORT"
+EDGE_RUNS_COMMAND      = "RUNS_COMMAND"
+EDGE_DEPLOYS           = "DEPLOYS"
+EDGE_LINKS_TO          = "LINKS_TO"
+EDGE_RUNS_ON_PR        = "RUNS_ON_PR"
+EDGE_RUNS_ON_PUSH      = "RUNS_ON_PUSH"
+EDGE_SPECIFIES         = "SPECIFIES"
+
+ADR_0057_EDGE_TYPES = frozenset({
+    EDGE_DOCUMENTS, EDGE_EXAMPLES, EDGE_CONFIGURES, EDGE_DEPENDS_ON_LIB,
+    EDGE_BASED_ON, EDGE_EXPOSES_PORT, EDGE_RUNS_COMMAND, EDGE_DEPLOYS,
+    EDGE_LINKS_TO, EDGE_RUNS_ON_PR, EDGE_RUNS_ON_PUSH, EDGE_SPECIFIES,
+})

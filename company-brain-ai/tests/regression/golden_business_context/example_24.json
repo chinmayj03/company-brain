@@ -1,0 +1,10 @@
+{
+  "i": "try { svc.call(); } catch (Exception e) { log.warn(...); }",
+  "o": {
+    "anti_patterns": [
+      "broad_exception_catch"
+    ],
+    "is_idempotent": true,
+    "performance_class": "O(1)"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "i": "double[][] mul(double[][] a, double[][] b)",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "a": "unchecked",
+      "b": "unchecked"
+    },
+    "performance_class": "O(n\u00b2)"
+  }
+}

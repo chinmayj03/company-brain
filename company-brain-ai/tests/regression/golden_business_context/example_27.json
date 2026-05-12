@@ -1,0 +1,14 @@
+{
+  "i": "boolean verifySig(byte[] payload, String sig, String secret)",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "payload": "throws",
+      "secret": "throws",
+      "sig": "throws"
+    },
+    "performance_class": "O(n)",
+    "security_class": "internal_only",
+    "transaction_mode": "no_transaction"
+  }
+}

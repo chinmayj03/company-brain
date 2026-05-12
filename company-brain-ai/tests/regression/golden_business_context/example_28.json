@@ -1,0 +1,14 @@
+{
+  "i": "X getX(Long id); cache.get(id, k -> repo.findById(k))",
+  "o": {
+    "engineering_notes": [
+      "cache-aside"
+    ],
+    "is_idempotent": true,
+    "null_handling": {
+      "id": "throws"
+    },
+    "performance_class": "O(1)",
+    "transaction_mode": "read_only"
+  }
+}

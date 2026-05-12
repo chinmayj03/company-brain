@@ -1,0 +1,12 @@
+{
+  "i": "GET /payers/{id}; getPayer(Long id)",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "id": "throws"
+    },
+    "performance_class": "O(1)",
+    "security_class": "authenticated",
+    "transaction_mode": "read_only"
+  }
+}

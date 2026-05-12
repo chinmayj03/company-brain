@@ -1,0 +1,12 @@
+{
+  "i": "int findIndex(int[] sorted, int target)",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "sorted": "unchecked",
+      "target": "tolerates"
+    },
+    "performance_class": "O(log n)",
+    "transaction_mode": "no_transaction"
+  }
+}

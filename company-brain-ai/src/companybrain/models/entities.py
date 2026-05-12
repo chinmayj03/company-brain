@@ -221,6 +221,44 @@ class BusinessContext:
     related_concepts: list[str] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
 
+    # ── ADR-0060 additions ──────────────────────────────────────────────────
+    # Schema version. v1 = original 21-field shape. v2 = adds the typed
+    # engineering-rigour fields below. Old payloads without this field
+    # deserialise as 1 by default so v1↔v2 can co-exist during migration.
+    schema_version: int = 1
+
+    # Answers "is it safe to retry?" SELECT-only methods → True. Any
+    # INSERT/UPDATE/DELETE → False. None = couldn't determine from body.
+    is_idempotent: Optional[bool] = None
+
+    # Per-parameter null contract. Keys are parameter names; values are one
+    # of {"checked", "throws", "tolerates", "unchecked"}.
+    #   checked   = explicit if-null branch handles the null
+    #   throws    = if-null path throws (NPE, IllegalArgumentException, etc.)
+    #   tolerates = passed through to a callee that handles null
+    #   unchecked = NPE risk; no null handling at this level
+    null_handling: dict[str, str] = field(default_factory=dict)
+
+    # Extracted from @Transactional or equivalent. One of
+    # {"read_only", "read_write", "no_transaction"} or None when no tx.
+    transaction_mode: Optional[str] = None
+
+    # Codebase-convention violations: literal-instead-of-constant,
+    # potential_n_plus_1, broad_exception_catch, etc.
+    anti_patterns: list[str] = field(default_factory=list)
+
+    # Free-form annotations: "uses LATERAL because unnest references outer
+    # column", "materialised join to avoid two-table scan", etc.
+    engineering_notes: list[str] = field(default_factory=list)
+
+    # Rough complexity class. One of {"O(1)", "O(log n)", "O(n)",
+    # "O(n log n)", "O(n²)", "unbounded"} or None when ambiguous.
+    performance_class: Optional[str] = None
+
+    # Auth posture. One of {"public", "authenticated", "authorised",
+    # "internal_only", "admin_only"} or None when unknown.
+    security_class: Optional[str] = None
+
 
 @dataclass
 class PipelineGap:

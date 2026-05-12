@@ -1,0 +1,13 @@
+{
+  "i": "List<R> fanOut(List<Url> urls) { for (u : urls) http.get(u); }",
+  "o": {
+    "anti_patterns": [
+      "serial_remote_calls"
+    ],
+    "is_idempotent": true,
+    "null_handling": {
+      "urls": "throws"
+    },
+    "performance_class": "O(n)"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "i": "getPayerCompetitors(base, req); LATERAL unnest + asMaterialized",
+  "o": {
+    "engineering_notes": [
+      "LATERAL unnest outer col",
+      "asMaterialized avoids double scan"
+    ],
+    "is_idempotent": true,
+    "null_handling": {
+      "base": "throws",
+      "req": "tolerates"
+    },
+    "performance_class": "O(n log n)",
+    "transaction_mode": "read_only"
+  }
+}

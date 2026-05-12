@@ -1,0 +1,13 @@
+{
+  "i": "List<Node> walk(Node n) { /* recurses without depth cap */ }",
+  "o": {
+    "anti_patterns": [
+      "unbounded_recursion"
+    ],
+    "is_idempotent": true,
+    "null_handling": {
+      "n": "throws"
+    },
+    "performance_class": "unbounded"
+  }
+}

@@ -1275,6 +1275,56 @@ async def run_pipeline(
                 f"budget ${settings.brain_job_budget_usd:.4f}"
             )
 
+        # ── ADR-0055 Stage 2.7: Cross-file cross-cutting pass ─────────────────
+        # Runs AFTER Stage 2.6 (ADR-0042 passes) so it can also reason over the
+        # edges those passes produced, and BEFORE Stage 3 (context synthesis)
+        # so the synthesiser can pick up Pattern / SharedInvariant /
+        # DomainEntity facts when narrating each entity. Skippable via
+        # BRAIN_SKIP_CROSS_FILE_PASS=true. Numbered 2.7 because the ADR-0042
+        # passes already claim 2.6.
+        if os.environ.get("BRAIN_SKIP_CROSS_FILE_PASS", "").lower() != "true":
+            from companybrain.pipeline.cross_file_pass import (
+                project_cross_file_entities,
+                run_cross_file_pass,
+            )
+
+            await progress(
+                "2.7", "🕸️ ",
+                "Cross-file cross-cutting pass — patterns, invariants, domains",
+            )
+            try:
+                cross_file_result = await run_cross_file_pass(entities, relationships)
+                if cross_file_result.new_edges:
+                    relationships = _dedup_relationships(
+                        list(relationships) + list(cross_file_result.new_edges)
+                    )
+                stages_summary.append({
+                    "stage": "2.7",
+                    "label": "Cross-File Cross-Cutting Pass",
+                    **cross_file_result.summary,
+                })
+                await progress(
+                    "2.7", "✅",
+                    "Cross-file pass: "
+                    f"{cross_file_result.summary['patterns']} patterns, "
+                    f"{cross_file_result.summary['shared_invariants']} invariants, "
+                    f"{cross_file_result.summary['domain_entities']} domains",
+                    **cross_file_result.summary,
+                )
+                # Hand the new entities to downstream stages so they end up in
+                # the BrainStore alongside Functions / Classes. Treated as
+                # ExtractedEntity-shaped projections for write-time uniformity.
+                entities = list(entities) + project_cross_file_entities(cross_file_result)
+            except Exception as exc:
+                # ADR-0055: never let the cross-file pass break the pipeline.
+                # Log + carry on with original entities + relationships.
+                log.warning("cross_file_pass failed (non-fatal)", error=str(exc))
+                stages_summary.append({
+                    "stage": "2.7",
+                    "label": "Cross-File Cross-Cutting Pass (errored)",
+                    "error": str(exc),
+                })
+
         # ── Stage 3: Business context synthesis ───────────────────────────────
         await progress("3", "📖", "Context synthesis — explaining WHY each entity exists (using git history)")
 

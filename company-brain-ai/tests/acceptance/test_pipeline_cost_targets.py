@@ -48,12 +48,12 @@ def test_cold_run_cost_target():
     tracker = UsageTracker()
     # Entity extraction: 5 chunks × haiku (~$0.0001 each)
     for _ in range(5):
-        tracker.record(MagicMock(), _make_record(20_000, 2_000, cost=0.0001))
+        tracker.record(_make_record(20_000, 2_000, cost=0.0001))
     # Synthesis + gap detection: 2 sonnet calls (~$0.003 each)
     for _ in range(2):
-        tracker.record(MagicMock(), _make_record(10_000, 1_000, cost=0.003))
+        tracker.record(_make_record(10_000, 1_000, cost=0.003))
     # Query: 1 sonnet call
-    tracker.record(MagicMock(), _make_record(8_000, 800, cost=0.003))
+    tracker.record(_make_record(8_000, 800, cost=0.003))
 
     summary = tracker.summary()
     assert summary["total_cost_usd"] <= 0.03, (
@@ -75,11 +75,18 @@ def test_warm_rerun_uses_extraction_cache():
     for i in range(10):
         is_hit = i < 8
         chunk = QueueChunk(
-            job_id=f"job-{i}",
+            id=f"row-{i}",
             workspace_id="ws-1",
-            endpoint_path="/api/test",
-            body=f"def fn_{i}(): pass",
+            job_id=f"job-{i}",
+            repo="api",
+            file_path="api/test.py",
+            qname=f"fn_{i}",
             body_hash=f"hash-{i}",
+            chunk_kind="method",
+            header_context="",
+            import_context="",
+            body=f"def fn_{i}(): pass",
+            attempt_count=0,
             language="python",
             result_json='{"entities": [], "relationships": []}' if is_hit else None,
             source_job_id="prior-job" if is_hit else None,

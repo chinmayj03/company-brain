@@ -1322,6 +1322,9 @@ async def run_pipeline(
         # DomainEntity facts when narrating each entity. Skippable via
         # BRAIN_SKIP_CROSS_FILE_PASS=true. Numbered 2.7 because the ADR-0042
         # passes already claim 2.6.
+        # ADR-0059: keep SP-5's DomainEntity dataclasses in scope so Pass T2
+        # can refine them instead of re-emitting duplicates.
+        _cross_file_domains: list = []
         if os.environ.get("BRAIN_SKIP_CROSS_FILE_PASS", "").lower() != "true":
             from companybrain.pipeline.cross_file_pass import (
                 project_cross_file_entities,
@@ -1334,6 +1337,7 @@ async def run_pipeline(
             )
             try:
                 cross_file_result = await run_cross_file_pass(entities, relationships)
+                _cross_file_domains = list(cross_file_result.domain_entities)
                 if cross_file_result.new_edges:
                     relationships = _dedup_relationships(
                         list(relationships) + list(cross_file_result.new_edges)
@@ -1425,6 +1429,154 @@ async def run_pipeline(
             f"Generated T0/T1 memory tokens for {len(memory_tokens)} entities",
             tokens=len(memory_tokens),
         )
+
+        # ── ADR-0059 Stage 3.6: Temporal ownership pass (T1) ───────────────────
+        # Reads git blame for each Method/Class/ApiEndpoint to populate
+        # entity.temporal with primary author, bus factor, churn, etc. Runs
+        # after Stage 3 (per ADR-0059) so the synthesised BusinessContext is
+        # already on the entity and we can attach ownership without re-doing
+        # context inference. Skippable via BRAIN_SKIP_TEMPORAL_PASS=true.
+        _risk_alerts: list = []
+        _onboarding_paths: list = []
+        if os.environ.get("BRAIN_SKIP_TEMPORAL_PASS", "").lower() != "true":
+            from companybrain.pipeline.temporal_pass import run_temporal_pass
+            from companybrain.pipeline.risk_alert_detector import (
+                detect_risk_alerts, project_risk_alerts,
+            )
+            from companybrain.pipeline.git_blame_aggregator import author_last_commit
+
+            await progress("3.6", "⏱️ ", "Temporal pass — git blame ownership + churn")
+
+            def _repo_resolver(repo_name: str) -> Optional[_Path]:
+                for r in request.repos:
+                    if r.local_path:
+                        # Match against either the bare folder name or the
+                        # full local_path; the entities' ``repo`` field uses
+                        # the repo's display name from RepoConfig.
+                        rp = _Path(r.local_path)
+                        if rp.name == repo_name or str(rp) == repo_name:
+                            return rp
+                # Fall back to the first repo that has a local_path — covers
+                # single-repo runs where the display name doesn't line up.
+                for r in request.repos:
+                    if r.local_path:
+                        return _Path(r.local_path)
+                return None
+
+            try:
+                entities, _temporal_stats = await run_temporal_pass(
+                    entities, repo_resolver=_repo_resolver,
+                )
+
+                # First-repo root powers the author-active lookup; multi-repo
+                # support is fine here because each entity carries its own
+                # repo and the cache keys on (root, email).
+                _first_root: Optional[_Path] = None
+                for r in request.repos:
+                    if r.local_path:
+                        _first_root = _Path(r.local_path)
+                        break
+
+                def _author_last_seen(author: str):
+                    if _first_root is None:
+                        return None
+                    return author_last_commit(_first_root, author)
+
+                _risk_alerts, _alert_edges = detect_risk_alerts(
+                    entities,
+                    author_last_seen_lookup=_author_last_seen,
+                )
+                if _alert_edges:
+                    relationships = _dedup_relationships(
+                        list(relationships) + list(_alert_edges)
+                    )
+                entities = list(entities) + project_risk_alerts(_risk_alerts)
+
+                stages_summary.append({
+                    "stage": "3.6",
+                    "label": "Temporal Ownership Pass",
+                    **_temporal_stats.as_dict(),
+                    "risk_alerts": len(_risk_alerts),
+                })
+                await progress(
+                    "3.6", "✅",
+                    f"Temporal pass: {_temporal_stats.entities_blamed} entities blamed, "
+                    f"{len(_risk_alerts)} risk alerts",
+                )
+            except Exception as exc:
+                # ADR-0059: never let the temporal pass break the pipeline.
+                log.warning("temporal_pass failed (non-fatal)", error=str(exc))
+                stages_summary.append({
+                    "stage": "3.6",
+                    "label": "Temporal Ownership Pass (errored)",
+                    "error": str(exc),
+                })
+
+        # ── ADR-0059 Stage 3.7: Domain inference pass (T2) + onboarding (T2b) ─
+        # One LLM call refines/augments the DomainEntities from ADR-0055 SP-5,
+        # then a heuristic builder derives an OnboardingPath per DomainEntity.
+        # Skippable via BRAIN_SKIP_DOMAIN_INFERENCE_PASS=true.
+        if os.environ.get("BRAIN_SKIP_DOMAIN_INFERENCE_PASS", "").lower() != "true":
+            from companybrain.pipeline.domain_inference_pass import (
+                project_domain_entities, run_domain_inference_pass,
+            )
+            from companybrain.pipeline.onboarding_path_builder import (
+                build_onboarding_paths, project_onboarding_paths,
+            )
+
+            await progress(
+                "3.7", "🧭",
+                "Domain inference (T2) + onboarding curriculum (T2b)",
+            )
+            try:
+                _t2_result = await run_domain_inference_pass(
+                    entities,
+                    existing_domains=_cross_file_domains,
+                )
+                if _t2_result.edges:
+                    relationships = _dedup_relationships(
+                        list(relationships) + list(_t2_result.edges)
+                    )
+                # Refined-only domains are mutated in place (no new projection);
+                # genuinely new ones get projected here.
+                if _t2_result.domains:
+                    entities = list(entities) + project_domain_entities(_t2_result)
+
+                # Build onboarding paths from EVERY DomainEntity we know about
+                # (SP-5 refined + T2 new), so the answer set includes domains
+                # T2 didn't strictly need to touch.
+                all_domains = list(_cross_file_domains) + list(_t2_result.domains)
+                _onboarding_result = build_onboarding_paths(all_domains, entities)
+                _onboarding_paths = _onboarding_result.paths
+                if _onboarding_result.edges:
+                    relationships = _dedup_relationships(
+                        list(relationships) + list(_onboarding_result.edges)
+                    )
+                if _onboarding_paths:
+                    entities = list(entities) + project_onboarding_paths(_onboarding_paths)
+
+                stages_summary.append({
+                    "stage": "3.7",
+                    "label": "Domain Inference + Onboarding",
+                    "new_domains":      len(_t2_result.domains),
+                    "refined_domains":  sum(
+                        1 for d in _cross_file_domains
+                        if d.name not in {td.name for td in _t2_result.domains}
+                    ),
+                    "onboarding_paths": len(_onboarding_paths),
+                })
+                await progress(
+                    "3.7", "✅",
+                    f"Domain inference: {len(_t2_result.domains)} new domains, "
+                    f"{len(_onboarding_paths)} onboarding paths",
+                )
+            except Exception as exc:
+                log.warning("domain_inference_pass failed (non-fatal)", error=str(exc))
+                stages_summary.append({
+                    "stage": "3.7",
+                    "label": "Domain Inference + Onboarding (errored)",
+                    "error": str(exc),
+                })
 
         # ── Stage 4: Gap detection ─────────────────────────────────────────────
         # Cost-cut: when settings.skip_gap_detection is True (or env var
@@ -2258,6 +2410,14 @@ _ENTITY_TYPE_MAP: dict[str, str] = {
     "assumption":         "assumption",
     "business_context":   "business_context",
     "function_node":      "function_node",
+    # ADR-0055 cross-file entities + ADR-0059 derived entities. We persist
+    # under dedicated subdirectories so /query can read them back without
+    # filtering a flat "component" bucket.
+    "Pattern":            "pattern",
+    "SharedInvariant":    "shared_invariant",
+    "DomainEntity":       "domain_entity",
+    "RiskAlert":          "risk_alert",
+    "OnboardingPath":     "onboarding_path",
 }
 
 

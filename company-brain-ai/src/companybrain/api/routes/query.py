@@ -166,6 +166,12 @@ async def query_graph(request: QueryRequest):
     # ── Step 4b: Surface per-entity sticky notes (ADR-0052 P6) ───────────────
     await _attach_notes(query_response, str(request.workspace_id))
 
+    # ── Step 4c: Surface ADR-0059 risk alerts + domains + onboarding paths ──
+    # Read derived entities from .brain/ and attach to the response so the
+    # frontend / SDK can render the Risk Dashboard (Product 2) and the
+    # onboarding curriculum without a second round-trip.
+    _attach_adr_0059_derivatives(query_response, getattr(request, "repo_path", None))
+
     # ── Step 5: Render markdown blob ──────────────────────────────────────────
     render_to_markdown(query_response)
     # ADR-0049 O5a-5: expose raw markdown without double-encoding.
@@ -537,3 +543,79 @@ async def _attach_notes(response: QueryResponse, workspace_id: str) -> None:
     for urn in sorted(by_urn):
         out.extend(notes_mod.render_for_query(by_urn[urn]))
     response.notes = out
+
+
+# ── ADR-0059: temporal-pass derived entities surfacing ──────────────────────
+
+# Hard cap so a workspace with hundreds of alerts doesn't blow up the response.
+_MAX_ALERTS_IN_RESPONSE = 50
+_MAX_DOMAINS_IN_RESPONSE = 30
+_MAX_ONBOARDING_PATHS_IN_RESPONSE = 30
+
+
+def _attach_adr_0059_derivatives(
+    response: QueryResponse,
+    repo_path: str | None,
+) -> None:
+    """Populate ``response.risk_alerts`` / ``domain_entities`` /
+    ``onboarding_paths`` from the workspace's ``.brain/`` directory.
+
+    Best-effort: a missing ``.brain/`` or read error leaves the fields empty.
+    Filtering by relevance to the question is intentionally NOT done here —
+    the frontend's Risk Dashboard tile renders all alerts, and the onboarding
+    panel renders all paths so the user can pick a domain.
+    """
+    brain_root = _resolve_brain_root(repo_path)
+    if brain_root is None:
+        return
+    response.risk_alerts      = _load_brain_subdir(brain_root, "risk_alert",
+                                                   limit=_MAX_ALERTS_IN_RESPONSE)
+    response.domain_entities  = _load_brain_subdir(brain_root, "domain_entity",
+                                                   limit=_MAX_DOMAINS_IN_RESPONSE)
+    response.onboarding_paths = _load_brain_subdir(brain_root, "onboarding_path",
+                                                   limit=_MAX_ONBOARDING_PATHS_IN_RESPONSE)
+
+
+def _resolve_brain_root(repo_path: str | None) -> Path | None:
+    """Locate the workspace's ``.brain/`` directory. Mirrors the resolution
+    used by SmartZoneAssembler so /query and the assembler agree on roots."""
+    if repo_path:
+        candidate = Path(repo_path) / ".brain"
+        if candidate.is_dir():
+            return candidate
+    env_root = os.environ.get("BRAIN_ROOT")
+    if env_root:
+        candidate = Path(env_root)
+        if candidate.is_dir():
+            return candidate
+        candidate = Path(env_root) / ".brain"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _load_brain_subdir(brain_root: Path, subdir: str, *, limit: int) -> list[dict]:
+    """Read every JSON file in ``brain_root/<subdir>/`` and return up to
+    ``limit`` rows. Each row is the file's ``metadata`` dict (the projection
+    we wrote at Stage 5) plus the ``qualified_name`` for display."""
+    folder = brain_root / subdir
+    if not folder.is_dir():
+        return []
+    out: list[dict] = []
+    try:
+        files = sorted(folder.glob("*.json"))[:limit]
+    except OSError:
+        return []
+    for path in files:
+        try:
+            blob = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        meta = blob.get("metadata") or {}
+        row = {
+            "name":     blob.get("qualified_name", path.stem),
+            "summary":  meta.get("code_snippet") or meta.get("signature", ""),
+            "metadata": meta,
+        }
+        out.append(row)
+    return out

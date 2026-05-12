@@ -76,6 +76,17 @@ class QueryResponse(BaseModel):
     # Empty when no notes exist or the notes table is unavailable.
     notes: list[dict] = []
 
+    # ── ADR-0059 additions ────────────────────────────────────────────────
+    # Surfaced from .brain/ when the pipeline produced them. Each is a list
+    # of plain dicts so the contract is stable across pydantic versions and
+    # we don't import internal pipeline dataclasses into the API model.
+    # risk_alerts: [{kind, severity, affected_entity_urn, message}, ...]
+    # domain_entities: [{name, aliases, description, anchor_class_urns}, ...]
+    # onboarding_paths: [{domain_name, anchor_class_urns, rationale}, ...]
+    risk_alerts: list[dict] = []
+    domain_entities: list[dict] = []
+    onboarding_paths: list[dict] = []
+
     # Legacy aliases so callers that read .answer or .sources keep working.
     @property
     def answer(self) -> str:

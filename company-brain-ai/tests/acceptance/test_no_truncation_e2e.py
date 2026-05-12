@@ -31,9 +31,12 @@ def _build_synthetic_java_file(n_methods: int) -> str:
     methods = []
     for i in range(n_methods):
         column = f"synthetic_column_{i:03d}"
-        # Pad body to ~4000 chars so each method is clearly "large" enough to be
-        # kept but small enough to stay as individual chunks.
-        padding = f"// padding line {j}\n" * 50  # ~750 chars of padding
+        # Pad body to ~3500 chars so each method is clearly "large" enough to
+        # exercise the chunker against the 50k cap, but small enough to stay
+        # as a single chunk. 30 methods × ~3500 chars > 100k overall.
+        padding = "\n".join(
+            f"// padding line {i}-{k}: lorem ipsum dolor sit amet" for k in range(70)
+        )
         body = textwrap.dedent(f"""\
             public List<String> fetchColumn{i:03d}(Connection conn) throws Exception {{
                 // Reads column: {column}

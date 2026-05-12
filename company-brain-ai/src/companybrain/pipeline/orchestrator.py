@@ -288,6 +288,22 @@ async def run_pipeline(
             dirty=len(_prepass.dirty_units),
         )
 
+        # ── ADR-0057: Universal File Extraction (Stage 0.5b) ──────────────────
+        # Runs the deterministic per-kind extractors (doc / config / manifest /
+        # infra / ci / javadoc) over the repo. Phase 1 surfaces the counts in
+        # telemetry only; persistence into Neo4j is owned by a follow-up PR.
+        try:
+            from companybrain.pipeline.universal_extraction import (
+                run_universal_extraction,
+            )
+            _universal_summary = await run_universal_extraction(request=request, progress=progress)
+            stages_summary.append({"stage": "0.5b", "label": "Universal Extraction",
+                                   **_universal_summary})
+        except Exception as _universal_err:
+            # Universal extraction is additive — never block the legacy pipeline.
+            log.warning("ADR-0057 universal extraction failed (non-fatal)",
+                        error=str(_universal_err))
+
         # ── Pre-flight: Freshness check — skip LLM for unchanged files ────────
         # Build the graph client early so we can call check_freshness before Stage 1.
         # This is the single biggest speed win: on average 80-90% of files are unchanged

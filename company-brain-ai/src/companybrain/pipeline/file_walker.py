@@ -76,6 +76,30 @@ EXTRACTABLE_EXTENSIONS: frozenset[str] = frozenset({
     ".toml",                              # Cargo.toml, pyproject.toml
 })
 
+# ── ADR-0057 additions ────────────────────────────────────────────────────────
+# Universal File Extraction expands the walker beyond code to docs, configs,
+# infra, CI, and manifests. The router in companybrain.extractors.dispatch is
+# the ground truth — this set is a coarse pre-filter so we don't stat every
+# binary in the repo.
+
+EXTENSIONLESS_EXTRACTABLE_NAMES: frozenset[str] = frozenset({
+    "Dockerfile", "Makefile", "GNUmakefile", "Procfile", "Jenkinsfile",
+    "go.mod",
+})
+
+UNIVERSAL_EXTRA_EXTENSIONS: frozenset[str] = frozenset({
+    ".md", ".markdown", ".adoc", ".asciidoc", ".rst", ".txt",
+    ".properties", ".env",
+    ".xml",     # POM / general XML configs
+    ".tf",      # Terraform (shallow; deep extraction owned by ADR-0058)
+})
+
+# Set used by the walker after ADR-0057. Code-only callers still consume
+# EXTRACTABLE_EXTENSIONS; universal callers consume this combined view.
+UNIVERSAL_EXTRACTABLE_EXTENSIONS: frozenset[str] = (
+    EXTRACTABLE_EXTENSIONS | UNIVERSAL_EXTRA_EXTENSIONS
+)
+
 # ── Generated file detection ──────────────────────────────────────────────────
 # Files matching any of these patterns are classified as GeneratedFile.
 # They are indexed with entity_type=GeneratedFile but body extraction is skipped.
@@ -124,6 +148,11 @@ class FileInfo:
     is_oversized: bool = False  # > MAX_FILE_BYTES
     is_large: bool = False      # > REVIEW_FILE_BYTES (flag but still extract)
     skip_reason: str = ""       # non-empty if should_extract is False
+    # ADR-0057: which universal extractor (if any) handles this file.
+    # "code" for source-code units handled by the existing chunker;
+    # "doc"/"config"/"manifest"/"infra"/"ci"/"javadoc"/"test_spec" for the
+    # universal extractors; "" when no extractor claims the file.
+    extractor_kind: str = ""
 
     @property
     def should_extract(self) -> bool:
@@ -248,6 +277,77 @@ class FileWalker:
         for info in self.walk():
             if info.should_extract:
                 yield info
+
+    def walk_universal(self) -> Iterator[FileInfo]:
+        """
+        ADR-0057: yield every file claimed by any extractor in the
+        ``companybrain.extractors`` dispatch, including docs, configs,
+        infra, CI, and manifests. Code files are also included with
+        ``extractor_kind`` set to ``"code"`` so callers can route them
+        to the existing chunker.
+
+        Filters (cheapest first):
+          1. Directory skip list
+          2. .gitignore + .cbignore
+          3. Pre-filter: extension in UNIVERSAL_EXTRACTABLE_EXTENSIONS
+             OR name in EXTENSIONLESS_EXTRACTABLE_NAMES
+             OR file lives under .github/workflows
+          4. Classify via FileInfo, then ask the extractor dispatch what
+             kind of file this is. Files not claimed by any extractor are
+             skipped.
+        """
+        from companybrain.extractors.dispatch import extractor_kind_for
+
+        skip_dirs = SKIP_DIRS | self._extra_skip_dirs
+        walked = 0
+
+        for path in self.repo_root.rglob("*"):
+            if not path.is_file():
+                continue
+
+            rel = path.relative_to(self.repo_root)
+            if any(part in skip_dirs for part in rel.parts[:-1]):
+                continue
+            if self._gitignore_matcher and self._is_gitignored(path, rel):
+                continue
+
+            # Pre-filter
+            suffix = path.suffix.lower()
+            name = path.name
+            parts_lower = [p.lower() for p in rel.parts]
+            in_workflows = ".github" in parts_lower and "workflows" in parts_lower
+            if (
+                suffix not in UNIVERSAL_EXTRACTABLE_EXTENSIONS
+                and name not in EXTENSIONLESS_EXTRACTABLE_NAMES
+                and not name.startswith("Dockerfile.")
+                and not name.startswith("docker-compose")
+                and not in_workflows
+                and not name.startswith(".env")
+            ):
+                continue
+
+            info = self._classify(path, rel)
+
+            # Primary routing: source-code files (excluding ambiguous data
+            # formats like .yml/.json/.toml/.xml which the dispatch claims as
+            # config/manifest) are always "code" — the existing chunker handles
+            # them. Javadoc / test_spec extraction is a SECONDARY pass that
+            # runs alongside code extraction, so it's not the primary kind here.
+            if suffix in EXTRACTABLE_EXTENSIONS and suffix not in (
+                ".yml", ".yaml", ".json", ".toml", ".xml"
+            ):
+                kind = "code"
+            else:
+                kind = extractor_kind_for(path) or ""
+
+            if not kind:
+                continue
+
+            info.extractor_kind = kind
+            walked += 1
+            yield info
+
+        log.info("FileWalker (universal) complete", repo=str(self.repo_root), walked=walked)
 
     def walk_by_language(self, language: str) -> Iterator[FileInfo]:
         """Yield only extractable files for a given language."""

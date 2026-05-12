@@ -240,6 +240,44 @@ class BusinessContext:
     related_concepts: list[str] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
 
+    # ── ADR-0060 additions ──────────────────────────────────────────────────
+    # Schema version. v1 = original 21-field shape. v2 = adds the typed
+    # engineering-rigour fields below. Old payloads without this field
+    # deserialise as 1 by default so v1↔v2 can co-exist during migration.
+    schema_version: int = 1
+
+    # Answers "is it safe to retry?" SELECT-only methods → True. Any
+    # INSERT/UPDATE/DELETE → False. None = couldn't determine from body.
+    is_idempotent: Optional[bool] = None
+
+    # Per-parameter null contract. Keys are parameter names; values are one
+    # of {"checked", "throws", "tolerates", "unchecked"}.
+    #   checked   = explicit if-null branch handles the null
+    #   throws    = if-null path throws (NPE, IllegalArgumentException, etc.)
+    #   tolerates = passed through to a callee that handles null
+    #   unchecked = NPE risk; no null handling at this level
+    null_handling: dict[str, str] = field(default_factory=dict)
+
+    # Extracted from @Transactional or equivalent. One of
+    # {"read_only", "read_write", "no_transaction"} or None when no tx.
+    transaction_mode: Optional[str] = None
+
+    # Codebase-convention violations: literal-instead-of-constant,
+    # potential_n_plus_1, broad_exception_catch, etc.
+    anti_patterns: list[str] = field(default_factory=list)
+
+    # Free-form annotations: "uses LATERAL because unnest references outer
+    # column", "materialised join to avoid two-table scan", etc.
+    engineering_notes: list[str] = field(default_factory=list)
+
+    # Rough complexity class. One of {"O(1)", "O(log n)", "O(n)",
+    # "O(n log n)", "O(n²)", "unbounded"} or None when ambiguous.
+    performance_class: Optional[str] = None
+
+    # Auth posture. One of {"public", "authenticated", "authorised",
+    # "internal_only", "admin_only"} or None when unknown.
+    security_class: Optional[str] = None
+
 
 @dataclass
 class PipelineGap:
@@ -573,6 +611,328 @@ ADR_0057_EDGE_TYPES = frozenset({
     EDGE_BASED_ON, EDGE_EXPOSES_PORT, EDGE_RUNS_COMMAND, EDGE_DEPLOYS,
     EDGE_LINKS_TO, EDGE_RUNS_ON_PR, EDGE_RUNS_ON_PUSH, EDGE_SPECIFIES,
 })
+
+
+# ── ADR-0058 additions ────────────────────────────────────────────────────────
+# Generated-Code & Schema-Format Awareness: typed entities for SQL DDL,
+# generated jOOQ Tables.java bindings, OpenAPI specs, Protobuf and GraphQL.
+# These are pipeline-internal dataclasses; persistence into Neo4j is owned by
+# a follow-up PR (same staging pattern as ADR-0057). See
+# docs/adrs/ADR-0058-generated-code-and-schema-awareness.md.
+
+# ── S1: SQL DDL ─────────
+@dataclass
+class DatabaseTable:
+    entity_type: str = "DatabaseTable"
+    name: str = ""
+    schema: str = "public"
+    source_file: str = ""
+    line_range: tuple[int, int] = (0, 0)
+    primary_key_columns: list[str] = field(default_factory=list)
+    is_partitioned: bool = False
+    partition_strategy: Optional[str] = None  # "RANGE" | "LIST" | "HASH" | None
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"table::{self.schema}.{self.name}"
+
+
+@dataclass
+class DatabaseColumn:
+    entity_type: str = "DatabaseColumn"
+    name: str = ""
+    table_urn: str = ""
+    type: str = ""             # raw type string e.g. "text", "text[]", "varchar(64)", "jsonb"
+    nullable: bool = True
+    default_value: Optional[str] = None
+    is_primary_key: bool = False
+    is_foreign_key: bool = False
+    fk_references: Optional[str] = None   # "schema.table.column" when FK
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"column::{self.table_urn}.{self.name}"
+
+    @property
+    def is_array(self) -> bool:
+        return self.type.rstrip().endswith("]")
+
+
+@dataclass
+class DatabaseIndex:
+    entity_type: str = "DatabaseIndex"
+    name: str = ""
+    table_urn: str = ""
+    columns: list[str] = field(default_factory=list)
+    is_unique: bool = False
+    where_clause: Optional[str] = None    # populated for partial indexes
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"index::{self.name}"
+
+
+@dataclass
+class MigrationFile:
+    """A migration file (e.g. Flyway V1__baseline.sql / Liquibase changeset)."""
+    entity_type: str = "MigrationFile"
+    file: str = ""
+    repo: str = ""
+    version: str = ""           # "V1", "V12_3", "R__seed", or "" if not Flyway-named
+    creates: list[str] = field(default_factory=list)  # table external_ids
+    alters: list[str] = field(default_factory=list)   # table external_ids
+
+    @property
+    def external_id(self) -> str:
+        return f"migration::{self.file}"
+
+
+# ── S2: jOOQ Tables.java ─────────
+@dataclass
+class JooqTableBinding:
+    """Maps a generated jOOQ class constant to a DatabaseTable."""
+    entity_type: str = "JooqTableBinding"
+    jooq_class: str = ""             # fully-qualified class, e.g. "com.example.db.Tables"
+    java_constant: str = ""          # e.g. "PLAN_INFO"
+    db_table_urn: str = ""           # "table::public.plan_info" — resolved by schema_resolver
+    db_table_name: str = ""          # raw DB name as referenced in Tables.java
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"jooq_table::{self.jooq_class}.{self.java_constant}"
+
+
+@dataclass
+class JooqFieldBinding:
+    """Maps a jOOQ field constant (TABLE.FIELD) to a DatabaseColumn."""
+    entity_type: str = "JooqFieldBinding"
+    jooq_constant: str = ""          # e.g. "PLAN_INFO.PAYER_PLAN_ID"
+    db_column_urn: str = ""          # resolved column URN
+    db_column_name: str = ""         # raw column name from Tables.java
+    db_type: str = ""                # jOOQ-emitted SQLDataType — e.g. "VARCHAR(64)"
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"jooq_field::{self.jooq_constant}"
+
+
+# ── S3: OpenAPI ─────────
+@dataclass
+class OpenAPIOperation:
+    entity_type: str = "OpenAPIOperation"
+    operation_id: str = ""
+    method: str = ""                 # uppercase HTTP verb
+    path: str = ""
+    summary: str = ""
+    description: str = ""
+    tags: list[str] = field(default_factory=list)
+    request_schema_ref: Optional[str] = None
+    response_schemas: dict[int, str] = field(default_factory=dict)
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        # operation_id may be empty in older specs; fall back to method+path.
+        oid = self.operation_id or f"{self.method.upper()}_{self.path}"
+        return f"openapi::{oid}"
+
+
+@dataclass
+class OpenAPISchema:
+    entity_type: str = "OpenAPISchema"
+    name: str = ""
+    type: str = ""                   # "object" | "array" | "string" | ...
+    properties: dict[str, dict] = field(default_factory=dict)  # field_name → {type, format, ...}
+    required: list[str] = field(default_factory=list)
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"openapi_schema::{self.name}"
+
+
+# ── S4: Protobuf ─────────
+@dataclass
+class ProtoMessage:
+    entity_type: str = "ProtoMessage"
+    name: str = ""
+    package: str = ""
+    fields: list[dict] = field(default_factory=list)   # [{name, type, number, repeated}]
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"proto_message::{self.package}.{self.name}" if self.package else f"proto_message::{self.name}"
+
+
+@dataclass
+class ProtoService:
+    entity_type: str = "ProtoService"
+    name: str = ""
+    package: str = ""
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"proto_service::{self.package}.{self.name}" if self.package else f"proto_service::{self.name}"
+
+
+@dataclass
+class ProtoRpc:
+    entity_type: str = "ProtoRpc"
+    name: str = ""
+    service_urn: str = ""
+    request_type: str = ""
+    response_type: str = ""
+    client_streaming: bool = False
+    server_streaming: bool = False
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"proto_rpc::{self.service_urn}.{self.name}"
+
+
+# ── S5: GraphQL ─────────
+@dataclass
+class GraphQLType:
+    entity_type: str = "GraphQLType"
+    name: str = ""
+    kind: str = ""                   # "OBJECT" | "INTERFACE" | "UNION" | "ENUM" | "SCALAR" | "INPUT_OBJECT"
+    fields: list[dict] = field(default_factory=list)   # [{name, type, args}]
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"gql_type::{self.name}"
+
+
+@dataclass
+class GraphQLField:
+    entity_type: str = "GraphQLField"
+    name: str = ""
+    parent_type_urn: str = ""
+    type: str = ""                   # GraphQL type spelling, e.g. "[User!]!"
+    args: list[dict] = field(default_factory=list)
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"gql_field::{self.parent_type_urn}.{self.name}"
+
+
+@dataclass
+class GraphQLQuery:
+    """Top-level Query / Mutation / Subscription field — a callable operation."""
+    entity_type: str = "GraphQLQuery"
+    name: str = ""
+    operation: str = "query"         # "query" | "mutation" | "subscription"
+    return_type: str = ""
+    args: list[dict] = field(default_factory=list)
+    source_file: str = ""
+    repo: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"gql_op::{self.operation}::{self.name}"
+
+
+# Edge type constants emitted by the schema extractors / resolver.
+EDGE_MIGRATION_CREATES   = "MIGRATION_CREATES"
+EDGE_MIGRATION_ALTERS    = "MIGRATION_ALTERS"
+EDGE_INDEXES             = "INDEXES"
+EDGE_FOREIGN_KEY         = "FOREIGN_KEY"
+EDGE_BINDS_TO_TABLE      = "BINDS_TO_TABLE"
+EDGE_BINDS_TO_COLUMN     = "BINDS_TO_COLUMN"
+EDGE_DOCUMENTS_OPENAPI   = "DOCUMENTS"          # reuses the ADR-0057 constant intentionally
+EDGE_SCHEMA_REQUEST      = "SCHEMA_REQUEST"
+EDGE_SCHEMA_RESPONSE     = "SCHEMA_RESPONSE"
+EDGE_IMPLEMENTS_RPC      = "IMPLEMENTS_RPC"
+EDGE_RESOLVES            = "RESOLVES"
+EDGE_READS_COLUMN        = "READS_COLUMN"
+
+ADR_0058_EDGE_TYPES = frozenset({
+    EDGE_MIGRATION_CREATES, EDGE_MIGRATION_ALTERS, EDGE_INDEXES,
+    EDGE_FOREIGN_KEY, EDGE_BINDS_TO_TABLE, EDGE_BINDS_TO_COLUMN,
+    EDGE_DOCUMENTS_OPENAPI, EDGE_SCHEMA_REQUEST, EDGE_SCHEMA_RESPONSE,
+    EDGE_IMPLEMENTS_RPC, EDGE_RESOLVES, EDGE_READS_COLUMN,
+})
+
+
+@dataclass
+class SchemaEdge:
+    """Lightweight edge record emitted by the schema extractors / resolver.
+
+    Kept simple (not an ExtractedRelationship) because these edges connect
+    schema entities that don't yet have ``ExtractedEntity`` wrappers.
+    """
+    edge_type: str
+    from_urn: str
+    to_urn: str
+    evidence: str = ""
+    confidence: float = 1.0
+
+
+@dataclass
+class SchemaExtractedBatch:
+    """Extension of the ExtractedBatch concept for the ADR-0058 entity types.
+
+    Kept as a sibling of ExtractedBatch so the existing ``entity_count`` and
+    ADR-0057 buckets keep their shape. Universal-extraction routes ADR-0058
+    extractors to emit this; the orchestrator surfaces totals in telemetry.
+    """
+    file: str = ""
+    repo: str = ""
+    extractor_kind: str = ""
+
+    tables:           list[DatabaseTable]      = field(default_factory=list)
+    columns:          list[DatabaseColumn]     = field(default_factory=list)
+    indexes:          list[DatabaseIndex]      = field(default_factory=list)
+    migrations:       list[MigrationFile]      = field(default_factory=list)
+    jooq_tables:      list[JooqTableBinding]   = field(default_factory=list)
+    jooq_fields:      list[JooqFieldBinding]   = field(default_factory=list)
+    openapi_ops:      list[OpenAPIOperation]   = field(default_factory=list)
+    openapi_schemas:  list[OpenAPISchema]      = field(default_factory=list)
+    proto_messages:   list[ProtoMessage]       = field(default_factory=list)
+    proto_services:   list[ProtoService]       = field(default_factory=list)
+    proto_rpcs:       list[ProtoRpc]           = field(default_factory=list)
+    gql_types:        list[GraphQLType]        = field(default_factory=list)
+    gql_fields:       list[GraphQLField]       = field(default_factory=list)
+    gql_ops:          list[GraphQLQuery]       = field(default_factory=list)
+    edges:            list[SchemaEdge]         = field(default_factory=list)
+
+    @property
+    def entity_count(self) -> int:
+        return (
+            len(self.tables) + len(self.columns) + len(self.indexes)
+            + len(self.migrations) + len(self.jooq_tables) + len(self.jooq_fields)
+            + len(self.openapi_ops) + len(self.openapi_schemas)
+            + len(self.proto_messages) + len(self.proto_services) + len(self.proto_rpcs)
+            + len(self.gql_types) + len(self.gql_fields) + len(self.gql_ops)
+        )
+
+    def to_extracted_batch(self) -> ExtractedBatch:
+        """Wrap as an ADR-0057 ExtractedBatch so the existing universal-extraction
+        pipeline can carry the file + repo + kind metadata uniformly. The
+        ADR-0058 buckets are accessed via ``getattr(batch, '_schema_batch', ...)``
+        attached by the schema dispatcher; see schema_resolver."""
+        return ExtractedBatch(file=self.file, repo=self.repo, extractor_kind=self.extractor_kind)
 
 
 # ── ADR-0059 additions ────────────────────────────────────────────────────────

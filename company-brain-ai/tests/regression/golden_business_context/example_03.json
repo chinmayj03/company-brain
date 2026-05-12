@@ -1,0 +1,11 @@
+{
+  "i": "Repo upsertPayer(Payer p); ON CONFLICT DO UPDATE",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "p": "throws"
+    },
+    "performance_class": "O(1)",
+    "transaction_mode": "read_write"
+  }
+}

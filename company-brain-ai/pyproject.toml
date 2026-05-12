@@ -118,6 +118,17 @@ dependencies = [
     #              optional 'verifier' extras to keep the default image small.
     "apscheduler>=3.10.4",
     "nbformat>=5.10.0",
+
+    # ADR-0058 — Generated-Code & Schema-Format Awareness
+    # sqlparse   : Postgres-flavoured DDL parser used by schema_sql.py. The ADR
+    #              originally specified tree-sitter-sql; sqlparse ships pure-Python
+    #              wheels and produces equivalent typed entities for our purposes.
+    # graphql-core: official GraphQL Foundation Python AST parser used by
+    #              schema_graphql.py. (openapi-spec-validator + PyYAML are already
+    #              listed above and cover schema_openapi.py.) Protobuf parsing is
+    #              hand-rolled (deterministic) so no new proto-parser dep.
+    "sqlparse>=0.5.0",
+    "graphql-core>=3.2.0",
 ]
 
 [project.optional-dependencies]

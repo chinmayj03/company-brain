@@ -1,0 +1,11 @@
+{
+  "i": "CompletableFuture<Void> enqueueAudit(Event e); persists then publishes",
+  "o": {
+    "is_idempotent": false,
+    "null_handling": {
+      "e": "throws"
+    },
+    "performance_class": "O(1)",
+    "transaction_mode": "read_write"
+  }
+}

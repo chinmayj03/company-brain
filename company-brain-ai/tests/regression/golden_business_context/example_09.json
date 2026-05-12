@@ -1,0 +1,14 @@
+{
+  "i": "for (Id id : ids) repo.findById(id); \u2014 no batch fetch",
+  "o": {
+    "anti_patterns": [
+      "potential_n_plus_1"
+    ],
+    "is_idempotent": true,
+    "null_handling": {
+      "ids": "unchecked"
+    },
+    "performance_class": "O(n)",
+    "transaction_mode": "read_only"
+  }
+}

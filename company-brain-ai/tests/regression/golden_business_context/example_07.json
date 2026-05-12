@@ -1,0 +1,13 @@
+{
+  "i": "Service computeScore(Payer p) { return p.getName().length(); }",
+  "o": {
+    "anti_patterns": [
+      "unchecked_dereference"
+    ],
+    "is_idempotent": true,
+    "null_handling": {
+      "p": "unchecked"
+    },
+    "performance_class": "O(1)"
+  }
+}

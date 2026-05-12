@@ -528,3 +528,118 @@ class ContextSynthesizer:
                             context_map[name]["has_rich_pr"] = True
 
         return context_map
+
+    # ── ADR-0060 additions ──────────────────────────────────────────────────
+    # Opt-in v2 synthesis path. The original `synthesise_all` keeps the v1
+    # prompt + v1 field extraction so existing callers are untouched. v2
+    # consumers (orchestrator flag flip lands in a follow-up) call
+    # `synthesise_all_v2` to get BusinessContext objects with the seven
+    # engineering-rigour fields populated and schema_version=2.
+
+    async def synthesise_all_v2(
+        self,
+        entities: list[ExtractedEntity],
+        clusters: list[CommitCluster],
+        annotations: list[dict],
+    ) -> dict[str, BusinessContext]:
+        """v2 entry point — same shape as synthesise_all but uses the v2
+        prompt and harvests the seven new typed fields. See ADR-0060."""
+        from companybrain.pipeline.business_context_v2_prompt import build_system_prompt
+
+        _SKIP_TYPES = frozenset({
+            "SchemaField", "DatabaseColumn", "DTO", "Request", "Response",
+            "Model", "Entity", "Payload", "ValueObject",
+        })
+        entities = [e for e in entities if e.entity_type not in _SKIP_TYPES]
+        log.info("Starting v2 context synthesis", entity_count=len(entities))
+
+        entity_context_map = self._build_entity_context_map(entities, clusters, annotations)
+        system_prompt = build_system_prompt()
+        context_map: dict[str, BusinessContext] = {}
+
+        async def _one(entity: ExtractedEntity) -> BusinessContext | None:
+            ctx = entity_context_map.get(entity.name, {})
+            user_content = self._build_user_message(entity, ctx)
+            async with self._semaphore:
+                raw = await self._provider.chat_json(
+                    messages=[
+                        ChatMessage(role="system", content=system_prompt),
+                        ChatMessage(role="user", content=user_content),
+                    ],
+                    role=TaskRole.FAST,
+                    max_tokens=settings.max_tokens_context_synthesis,
+                )
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                log.warning("v2 LLM returned non-JSON", entity=entity.name)
+                return None
+            return _bc_from_v2_payload(entity, data, ctx)
+
+        results = await asyncio.gather(
+            *[_one(e) for e in entities], return_exceptions=True
+        )
+        for entity, result in zip(entities, results):
+            if isinstance(result, Exception):
+                log.warning("v2 synthesis failed", entity=entity.name, error=str(result))
+                continue
+            if result is not None:
+                context_map[entity.external_id] = result
+
+        log.info("v2 context synthesis complete", synthesised=len(context_map))
+        return context_map
+
+
+def _bc_from_v2_payload(
+    entity: ExtractedEntity,
+    data: dict,
+    entity_ctx: dict,
+) -> BusinessContext:
+    """Build a v2 BusinessContext from an LLM JSON payload.
+
+    Defensive on every key: missing fields default to schema-safe values so
+    a partial response from the model still round-trips through the JSON
+    store and the postgres consumer.
+    """
+    confidence = "low"
+    if entity_ctx.get("has_human_annotation"):
+        confidence = "high"
+    elif entity_ctx.get("has_rich_pr"):
+        confidence = "medium"
+
+    null_handling = data.get("null_handling") or {}
+    if not isinstance(null_handling, dict):
+        null_handling = {}
+
+    return BusinessContext(
+        entity_external_id=entity.external_id,
+        purpose=data.get("purpose", ""),
+        history_summary=data.get("history_summary", ""),
+        invariants=data.get("invariants", []) or [],
+        change_risk=data.get("change_risk", "MEDIUM"),
+        change_risk_reason=data.get("change_risk_reason", ""),
+        source_confidence=confidence,
+        owner_team=data.get("owner_team"),
+        external_dependencies=data.get("external_dependencies", []) or [],
+        gaps=data.get("gaps", []) or [],
+        business_capability=data.get("business_capability"),
+        personas_affected=data.get("personas_affected", []) or [],
+        failure_modes=data.get("failure_modes", []) or [],
+        side_effects=data.get("side_effects", []) or [],
+        idempotency=data.get("idempotency"),
+        blast_radius=data.get("blast_radius", []) or [],
+        deprecation_status=data.get("deprecation_status"),
+        data_sensitivity=data.get("data_sensitivity"),
+        compliance_tags=data.get("compliance_tags", []) or [],
+        performance_notes=data.get("performance_notes"),
+        related_concepts=data.get("related_concepts", []) or [],
+        # v2 typed fields
+        schema_version=2,
+        is_idempotent=data.get("is_idempotent"),
+        null_handling={str(k): str(v) for k, v in null_handling.items()},
+        transaction_mode=data.get("transaction_mode"),
+        anti_patterns=data.get("anti_patterns", []) or [],
+        engineering_notes=data.get("engineering_notes", []) or [],
+        performance_class=data.get("performance_class"),
+        security_class=data.get("security_class"),
+    )

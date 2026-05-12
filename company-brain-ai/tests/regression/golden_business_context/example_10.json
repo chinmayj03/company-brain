@@ -1,0 +1,10 @@
+{
+  "i": "filter.put(\"lob\", value); // should be JsonKeyMapping.LOB",
+  "o": {
+    "anti_patterns": [
+      "literal_should_use_constant"
+    ],
+    "is_idempotent": true,
+    "performance_class": "O(1)"
+  }
+}

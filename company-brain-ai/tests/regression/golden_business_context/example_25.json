@@ -1,0 +1,14 @@
+{
+  "i": "Repository @Query(\"SELECT ... FOR UPDATE\") lockRow(Long id)",
+  "o": {
+    "engineering_notes": [
+      "pessimistic row lock"
+    ],
+    "is_idempotent": true,
+    "null_handling": {
+      "id": "throws"
+    },
+    "performance_class": "O(1)",
+    "transaction_mode": "read_write"
+  }
+}

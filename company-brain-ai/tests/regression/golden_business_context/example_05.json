@@ -1,0 +1,11 @@
+{
+  "i": "DTO setter void setLob(String lob)",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "lob": "tolerates"
+    },
+    "performance_class": "O(1)",
+    "transaction_mode": "no_transaction"
+  }
+}

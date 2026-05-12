@@ -1,0 +1,11 @@
+{
+  "i": "Repository void deleteByPayerId(Long id)",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "id": "throws"
+    },
+    "performance_class": "O(n)",
+    "transaction_mode": "read_write"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "i": "List<X> rank(List<X> xs) { xs.sort(...); return xs; }",
+  "o": {
+    "anti_patterns": [
+      "mutates_input_argument"
+    ],
+    "is_idempotent": true,
+    "null_handling": {
+      "xs": "throws"
+    },
+    "performance_class": "O(n log n)",
+    "transaction_mode": "no_transaction"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "i": "Page<X> findAll(Pageable p)",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "p": "throws"
+    },
+    "performance_class": "O(n)",
+    "transaction_mode": "read_only"
+  }
+}

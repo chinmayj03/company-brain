@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package payers.v1;
+
+// Top-level payer entity exposed to internal consumers.
+message Payer {
+    string id = 1;
+    string name = 2;
+    repeated string lob = 3;
+    map<string, string> labels = 4;
+}
+
+message ListPayersRequest {
+    int32 page_size = 1;
+    string page_token = 2;
+}
+
+message ListPayersResponse {
+    repeated Payer payers = 1;
+    string next_page_token = 2;
+}
+
+service PayerService {
+    rpc ListPayers (ListPayersRequest) returns (ListPayersResponse);
+    rpc StreamPayers (ListPayersRequest) returns (stream Payer);
+}

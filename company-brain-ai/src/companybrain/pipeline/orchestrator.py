@@ -308,6 +308,30 @@ async def run_pipeline(
             log.warning("ADR-0057 universal extraction failed (non-fatal)",
                         error=str(_universal_err))
 
+        # ── ADR-0058: Schema-Format Awareness (Stage 0.5c) ────────────────────
+        # Walks each repo for SQL DDL, jOOQ Tables.java, OpenAPI specs, .proto
+        # and GraphQL SDL. Emits DatabaseTable/Column/Index, JooqBindings,
+        # OpenAPIOperation/Schema, ProtoMessage/Service/Rpc, GraphQLType/Field.
+        # Surfaces counts in telemetry; persistence into Neo4j is owned by a
+        # follow-up PR (same staging contract as ADR-0057).
+        try:
+            from companybrain.extractors.schema_resolver import run_schema_extraction
+            await progress("0.5c", "🗄️ ",
+                           "Schema awareness — DDL / jOOQ / OpenAPI / proto / GraphQL")
+            _schema_summary = run_schema_extraction(request.repos)
+            stages_summary.append({"stage": "0.5c", "label": "Schema Awareness",
+                                   **_schema_summary})
+            await progress(
+                "0.5c", "✅",
+                f"{_schema_summary['files']} schema files, "
+                f"{_schema_summary['entities']} entities, "
+                f"{_schema_summary['edges']} edges",
+                **_schema_summary,
+            )
+        except Exception as _schema_err:
+            log.warning("ADR-0058 schema extraction failed (non-fatal)",
+                        error=str(_schema_err))
+
         # ── Pre-flight: Freshness check — skip LLM for unchanged files ────────
         # Build the graph client early so we can call check_freshness before Stage 1.
         # This is the single biggest speed win: on average 80-90% of files are unchanged

@@ -1,0 +1,12 @@
+{
+  "i": "@ExceptionHandler(NotFound.class) ResponseEntity handle(NotFound ex)",
+  "o": {
+    "is_idempotent": true,
+    "null_handling": {
+      "ex": "checked"
+    },
+    "performance_class": "O(1)",
+    "security_class": "internal_only",
+    "transaction_mode": "no_transaction"
+  }
+}

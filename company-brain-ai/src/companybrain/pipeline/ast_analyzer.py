@@ -87,6 +87,12 @@ def _get_parser(lang: str):
         elif lang in ("javascript", "jsx"):
             import tree_sitter_javascript as _js
             language = Language(_js.language())
+        elif lang == "go":
+            # tree-sitter-go is in pyproject for ADR-006 §2 but wasn't wired
+            # into the parser dispatch here, so Go files dropped through to
+            # the regex fallback (which can't split funcs).
+            import tree_sitter_go as _go
+            language = Language(_go.language())
         else:
             return None
 
@@ -443,6 +449,8 @@ class ASTAnalyzer:
                 classes = _extract_java(tree, content)
             elif lang == "python":
                 classes = _extract_python(tree, content)
+            elif lang == "go":
+                classes = _extract_go(tree, content)
             else:
                 # TS/JS: use Java-like brace extraction as a bridge until
                 # the TypeScript grammar is properly wired
@@ -833,4 +841,114 @@ def _normalize_lang(lang: str) -> str:
         "javascript": "javascript",
         "js":         "javascript",
         "jsx":        "javascript",
+        "go":         "go",
+        "golang":     "go",
     }.get(lang.lower(), "")
+
+
+# ── Go extractor ──────────────────────────────────────────────────────────────
+
+def _extract_go(tree, content: str) -> list[ClassInfo]:
+    """Walk the tree-sitter Go CST.
+
+    Go has no classes; we synthesise a ClassInfo per receiver type so the
+    rest of the pipeline (which is class-centric) can consume the result.
+    Free functions become methods of a ClassInfo named after the file's
+    package (one synthetic "package-level" bucket).
+    """
+    content_bytes = content.encode("utf-8", errors="replace")
+
+    def text(node) -> str:
+        return content_bytes[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+
+    def line(node) -> int:
+        return node.start_point[0] + 1
+
+    def end_line(node) -> int:
+        return node.end_point[0] + 1
+
+    # Collect imports.
+    imports: list[str] = []
+    package_name = ""
+    for child in tree.root_node.children:
+        if child.type == "package_clause":
+            for c in child.children:
+                if c.type == "package_identifier":
+                    package_name = text(c)
+        elif child.type == "import_declaration":
+            for ic in child.children:
+                if ic.type == "import_spec":
+                    imports.append(text(ic).strip())
+                elif ic.type == "import_spec_list":
+                    for spec in ic.children:
+                        if spec.type == "import_spec":
+                            imports.append(text(spec).strip())
+
+    # Group methods by receiver type.
+    by_receiver: dict[str, list[MethodInfo]] = {}
+
+    def receiver_type_name(receiver_node) -> str:
+        """Extract the underlying type name from a method receiver list,
+        e.g. ``(r *OrderRepo)`` → "OrderRepo"."""
+        for child in receiver_node.children:
+            if child.type == "parameter_declaration":
+                for c in child.children:
+                    if c.type == "pointer_type":
+                        for pc in c.children:
+                            if pc.type == "type_identifier":
+                                return text(pc)
+                    if c.type == "type_identifier":
+                        return text(c)
+        return ""
+
+    def make_method(node, name_node) -> Optional[MethodInfo]:
+        if name_node is None:
+            return None
+        name = text(name_node)
+        return MethodInfo(
+            name=name,
+            return_type="",
+            parameters=[],
+            annotations=[],
+            modifiers=[],
+            start_line=line(node),
+            end_line=end_line(node),
+            body_text=text(node),
+        )
+
+    for node in tree.root_node.children:
+        if node.type == "function_declaration":
+            name_node = next((c for c in node.children if c.type == "identifier"), None)
+            m = make_method(node, name_node)
+            if m:
+                bucket = package_name or "package"
+                by_receiver.setdefault(bucket, []).append(m)
+        elif node.type == "method_declaration":
+            receiver_node = next(
+                (c for c in node.children if c.type == "parameter_list"), None,
+            )
+            name_node = next(
+                (c for c in node.children if c.type == "field_identifier"), None,
+            )
+            if receiver_node is None or name_node is None:
+                continue
+            receiver = receiver_type_name(receiver_node) or "package"
+            m = make_method(node, name_node)
+            if m:
+                by_receiver.setdefault(receiver, []).append(m)
+
+    classes: list[ClassInfo] = []
+    for receiver, methods in by_receiver.items():
+        classes.append(ClassInfo(
+            name=receiver,
+            kind="class",
+            superclass=None,
+            interfaces=[],
+            annotations=[],
+            fields=[],
+            methods=methods,
+            imports=list(imports),
+            start_line=min(m.start_line for m in methods) if methods else 1,
+            end_line=max(m.end_line for m in methods) if methods else 1,
+        ))
+    return classes

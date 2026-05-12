@@ -337,6 +337,11 @@ class QueryRequest(BaseModel):
     # ADR-0056: opt into surfacing entities the verifier flagged as hallucinated
     # or conflicting. Defaults False so /query callers see only verified sources.
     include_unverified: bool = Field(default=False)
+    # ADR-0061 E5: when the previous response returned a ClarificationOption set,
+    # the client re-issues the same question with ``interpret`` carrying the
+    # chosen option id. The route uses it to inject an interpretation hint into
+    # the user message and skip the ambiguity detector.
+    interpret: Optional[str] = Field(default=None)
 
 
 class LegacyQueryResponse(BaseModel):
@@ -580,6 +585,8 @@ class ExtractedBatch:
     workflow_jobs:    list[WorkflowJob]      = field(default_factory=list)
     behavioral_specs: list[BehavioralSpec]   = field(default_factory=list)
     method_docs:      list[MethodDoc]        = field(default_factory=list)
+    # ADR-0061 E7: vision-extracted diagrams from docs/**/*.{png,svg}.
+    diagrams:         list["Diagram"]        = field(default_factory=list)
 
     @property
     def entity_count(self) -> int:
@@ -588,6 +595,7 @@ class ExtractedBatch:
             + len(self.build_plugins) + len(self.container_images)
             + len(self.runtime_stages) + len(self.service_defs)
             + len(self.workflow_jobs) + len(self.behavioral_specs) + len(self.method_docs)
+            + len(self.diagrams)
         )
 
 
@@ -1029,4 +1037,73 @@ EDGE_READ_FIRST      = "READ_FIRST"        # OnboardingPath -> first anchor clas
 
 ADR_0059_EDGE_TYPES = frozenset({
     EDGE_AFFECTS, EDGE_GUIDES, EDGE_READ_FIRST,
+})
+
+
+# ── ADR-0061 additions ────────────────────────────────────────────────────────
+# Iterative exploration + the remaining Claude-Code patterns. Adds entity types
+# for diagrams (E7) and clarification options (E5), plus the SimilarTo edge
+# constant used by cross-repo similarity surfacing (E6).
+#
+# See docs/adrs/ADR-0061-iterative-exploration-and-additional-claude-code-patterns.md.
+
+@dataclass
+class DiagramComponent:
+    """A box / actor / system labelled in a diagram. Free-form name + role hint."""
+    name: str
+    role: Optional[str] = None        # e.g. "service", "database", "queue", "client"
+
+
+@dataclass
+class DiagramEdge:
+    """A labelled arrow between two DiagramComponents."""
+    source: str                       # component name (matches a DiagramComponent.name)
+    target: str
+    label: Optional[str] = None       # e.g. "publishes", "writes to"
+
+
+@dataclass
+class Diagram:
+    """
+    A vision-extracted summary of an image in ``docs/`` — the answer to "show
+    the architecture". The extractor's job is to enumerate boxes + arrows; the
+    domain mapping happens via ``REPRESENTS`` edges into DomainEntity rows.
+
+    ``components`` and ``edges`` are deliberately loose (free-form strings) so
+    we don't have to teach the vision model the brain's URN scheme.
+    """
+    repo: str
+    file_path: str                    # relative to repo root, e.g. "docs/architecture.png"
+    title: str = ""
+    description: str = ""
+    components: list[DiagramComponent] = field(default_factory=list)
+    edges: list[DiagramEdge] = field(default_factory=list)
+    qualified_name: str = ""          # set at write time to "<repo>.<rel-no-ext>"
+
+    @property
+    def external_id(self) -> str:
+        return f"diagram::{self.repo}::{self.file_path}"
+
+
+@dataclass
+class ClarificationOption:
+    """
+    One interpretation of an ambiguous /query question (E5). Returned to the
+    UI so the user can pick a path instead of getting a wrong answer.
+
+    ``id`` is a stable token the caller passes back on the retry as the
+    ``interpret`` field on QueryRequest. The legacy free-form text query is
+    re-issued with the chosen interpretation injected into the user message.
+    """
+    id: str                           # "json_key" | "db_column" | "both" | …
+    description: str                  # one-line plain English for chip rendering
+
+
+# Edge type constants for ADR-0061. EDGE_REPRESENTS is reused from ADR-0055
+# (already defined above for DomainEntity wiring) — we simply route Diagram
+# rows through the same edge type instead of inventing a parallel constant.
+EDGE_SIMILAR_TO     = "SIMILAR_TO"        # Pattern -> Pattern across workspaces (E6)
+
+ADR_0061_EDGE_TYPES = frozenset({
+    EDGE_SIMILAR_TO, EDGE_REPRESENTS,
 })

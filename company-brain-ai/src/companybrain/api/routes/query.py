@@ -65,13 +65,51 @@ async def query_graph(request: QueryRequest):
     POST /query
 
     0. IntentRouter classifies the question (ADR-0043 WS2)
+    0b. ADR-0061 E5 ambiguity check — bail out with clarification chips if the
+        question is ambiguous and no ``interpret`` hint was supplied.
     1. SmartZoneAssembler.assemble() builds T0/T1/T2 tiered context (ADR-0018)
     2. Per-intent user message is rendered (ADR-0043 WS2)
     3. Call LLM with structured system prompt (ADR-0043)
     4. Parse typed QueryResponse
+    4d. ADR-0061 E1 — fire ExplorationAgent on low-confidence answers.
+    4e. ADR-0061 E2 — re-read source for shaky citations.
+    4f. ADR-0061 E6 — surface cross-repo similarity insights.
     5. Return structured response
     """
     from companybrain.config import settings
+
+    # ── Step 0b: ADR-0061 E5 ambiguity check ──────────────────────────────────
+    # When the request carries ``interpret`` we trust the client and skip; when
+    # the agent is firing nested we also skip (avoids interactive loops).
+    _is_nested = bool(getattr(request, "_no_iterative", False))
+    if not request.interpret and not _is_nested:
+        try:
+            from companybrain.api.routes.clarification import detect_ambiguity
+            clarification = detect_ambiguity(
+                request.question,
+                repo_path=getattr(request, "repo_path", None),
+                workspace_id=str(request.workspace_id),
+            )
+            if clarification.ambiguous:
+                log.info("[query] Returning clarification request",
+                         term=clarification.term,
+                         n_options=len(clarification.interpretations or []))
+                resp = QueryResponse(
+                    summary=(
+                        f"The term '{clarification.term}' is ambiguous — please pick "
+                        "an interpretation."
+                    ),
+                    confidence=Confidence(level="low",
+                                          rationale="ambiguous query — awaiting clarification"),
+                )
+                resp.ambiguity = True
+                resp.interpretations = clarification.interpretations or []
+                resp.suggested_followup = clarification.suggested_followup
+                resp.telemetry = {"clarification_returned": True}
+                return resp
+        except Exception as exc:
+            log.debug("[query] Ambiguity detector failed (non-fatal)",
+                      error=str(exc))
 
     t0 = time.monotonic()
     provider = get_provider()
@@ -142,6 +180,17 @@ async def query_graph(request: QueryRequest):
                     error=str(exc))
         user_content = _plain_user_message(request.question, assembled_context)
 
+    # ADR-0061 E5: when the client carries an interpretation choice, prepend a
+    # one-line hint so the LLM scopes its answer accordingly.
+    if request.interpret:
+        try:
+            from companybrain.api.routes.clarification import interpretation_hint
+            hint = interpretation_hint(request.interpret, request.question)
+            if hint:
+                user_content = f"{hint}\n\n{user_content}"
+        except Exception:
+            pass
+
     # ── Step 3: Call LLM ──────────────────────────────────────────────────────
     t1 = time.monotonic()
     log.info("[query] Calling LLM",
@@ -165,6 +214,31 @@ async def query_graph(request: QueryRequest):
 
     # ── Step 4b: Surface per-entity sticky notes (ADR-0052 P6) ───────────────
     await _attach_notes(query_response, str(request.workspace_id))
+
+    # ── Step 4d: ADR-0061 E1 — fire ExplorationAgent on low-confidence ──────
+    if not _is_nested:
+        query_response = await _maybe_explore(
+            request=request,
+            response=query_response,
+            zone_tokens_used=smart_zone_meta.get("tokens_used", 0),
+        )
+
+    # ── Step 4e: ADR-0061 E2 — re-read source for shaky citations ───────────
+    if not _is_nested:
+        try:
+            from companybrain.api.routes.query_reread import maybe_reread
+            query_response = await maybe_reread(
+                question=request.question,
+                response=query_response,
+                workspace_id=str(request.workspace_id),
+                repo_path=getattr(request, "repo_path", None),
+            )
+        except Exception as exc:
+            log.debug("[query] Re-read step failed (non-fatal)", error=str(exc))
+
+    # ── Step 4f: ADR-0061 E6 — cross-repo similarity insights ───────────────
+    if not _is_nested:
+        _attach_cross_repo_insights(query_response, str(request.workspace_id))
 
     # ── Step 4c: Surface ADR-0059 risk alerts + domains + onboarding paths ──
     # Read derived entities from .brain/ and attach to the response so the
@@ -592,6 +666,102 @@ def _resolve_brain_root(repo_path: str | None) -> Path | None:
         if candidate.is_dir():
             return candidate
     return None
+
+
+# ── ADR-0061: iterative-exploration helpers ──────────────────────────────────
+
+async def _maybe_explore(
+    *,
+    request: QueryRequest,
+    response: QueryResponse,
+    zone_tokens_used: int,
+) -> QueryResponse:
+    """If the initial answer is low-confidence OR context was sparse, spawn
+    the ExplorationAgent (ADR-0061 E1) and merge its findings into the response.
+
+    The exploration agent is *additive* — its prose is appended to the
+    summary rather than replacing structured fields, so URN citations from
+    the initial answer survive. Telemetry records whether it ran and how
+    many tool calls it made.
+    """
+    try:
+        from companybrain.agents.exploration_agent import (
+            ExplorationAgent, should_fire,
+        )
+    except Exception as exc:
+        log.debug("[query] ExplorationAgent unavailable", error=str(exc))
+        return response
+
+    initial_conf = _confidence_to_float(response.confidence)
+    if not should_fire(initial_conf, zone_tokens_used):
+        return response
+
+    try:
+        agent = ExplorationAgent(
+            workspace_id=str(request.workspace_id),
+            repo_path=getattr(request, "repo_path", None),
+        )
+        result = await agent.run(request.question)
+    except Exception as exc:
+        log.warning("[query] ExplorationAgent failed (non-fatal)", error=str(exc))
+        return response
+
+    response.telemetry = dict(response.telemetry or {})
+    response.telemetry["exploration_agent_invoked"] = True
+    response.telemetry["exploration_agent_steps"] = result.steps
+    response.telemetry["exploration_agent_capped"] = result.capped
+    if result.text:
+        bridge = (
+            "\n\n— ExplorationAgent follow-up "
+            f"({result.steps} tool call{'s' if result.steps != 1 else ''}) —\n"
+        )
+        response.summary = (response.summary or "") + bridge + result.text
+        if response.confidence and response.confidence.level == "low":
+            response.confidence = Confidence(
+                level="medium",
+                rationale="Exploration agent added supporting evidence",
+            )
+    return response
+
+
+def _confidence_to_float(conf) -> float:
+    """Map a Confidence(level=...) onto a numeric scale for E1's gate."""
+    if conf is None:
+        return 0.0
+    level = (getattr(conf, "level", "") or "").lower()
+    return {"high": 0.9, "medium": 0.7, "low": 0.4}.get(level, 0.5)
+
+
+def _attach_cross_repo_insights(response: QueryResponse, workspace_id: str) -> None:
+    """ADR-0061 E6 — attach SIMILAR_TO insights for top affected entities."""
+    if not response.affected_entities:
+        return
+    try:
+        from companybrain.retrieval.cross_repo_similarity import (
+            attach_cross_repo_insights,
+        )
+        from companybrain.store.identity import workspace_slug_for
+    except Exception as exc:
+        log.debug("[query] cross-repo similarity module unavailable",
+                  error=str(exc))
+        return
+    seeds = [
+        {"urn": c.urn, "name": c.name, "text": c.why_relevant or c.name}
+        for c in response.affected_entities[:5]
+    ]
+    try:
+        n = attach_cross_repo_insights(
+            response=response,
+            own_workspace_slug=workspace_slug_for(workspace_id),
+            seeds=seeds,
+        )
+    except Exception as exc:
+        log.debug("[query] cross-repo similarity attach failed",
+                  error=str(exc))
+        return
+    if n:
+        response.telemetry = dict(response.telemetry or {})
+        response.telemetry["cross_repo_hits"] = n
 
 
 def _load_brain_subdir(brain_root: Path, subdir: str, *, limit: int) -> list[dict]:

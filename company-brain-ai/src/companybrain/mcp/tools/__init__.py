@@ -25,3 +25,6 @@ from companybrain.mcp.tools import get as _g            # noqa: F401
 from companybrain.mcp.tools import search as _s         # noqa: F401
 from companybrain.mcp.tools import blast_radius as _br  # noqa: F401
 from companybrain.mcp.tools import rebuild as _rb       # noqa: F401
+# ADR-0061 — iterative-exploration tools
+from companybrain.mcp.tools import trace_exception as _te  # noqa: F401
+from companybrain.mcp.tools import diff_since as _ds       # noqa: F401

@@ -782,3 +782,42 @@ async def hybrid_get_node_context(
         node_id_or_name=node_id_or_name,
         trpc=_get_trpc(),
     )
+
+
+# ── ADR-0061: iterative-exploration tools (E3 + E4) ───────────────────────────
+
+from companybrain.mcp.tools.trace_exception import trace_exception as _trace_exception
+from companybrain.mcp.tools.diff_since import diff_since as _diff_since
+
+
+@mcp_app.tool(
+    description=(
+        "Trace where an exception is thrown, caught, and re-wrapped. "
+        "Walks THROWS / CATCHES / WRAPS_EXCEPTION edges in the brain graph "
+        "and returns thrown_by / caught_by / wrapped_by / unhandled_at lists. "
+        "Pass either a bare class name (e.g. 'DatabaseOperationException') or a "
+        "fully-qualified name."
+    )
+)
+async def tool_trace_exception(
+    name: str,
+    limit: int = 25,
+) -> dict[str, Any]:
+    return await _trace_exception(name=name, limit=limit)
+
+
+@mcp_app.tool(
+    description=(
+        "List brain entities whose source file changed since a date or commit. "
+        "Pass either 'date' (YYYY-MM-DD) or 'commit' (sha/ref); defaults to the "
+        "last 7 days. Useful for code review, post-mortems, and 'what changed "
+        "last week' questions."
+    )
+)
+async def tool_diff_since(
+    date: Optional[str] = None,
+    commit: Optional[str] = None,
+    limit: int = 50,
+    repo: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    return await _diff_since(date=date, commit=commit, limit=limit, repo=repo)

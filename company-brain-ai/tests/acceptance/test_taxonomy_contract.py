@@ -115,23 +115,19 @@ def test_render_prompt_reference_is_nonempty():
 # ── RelationshipExtractor prompt vs taxonomy ──────────────────────────────────
 
 def test_relationship_extractor_prompt_uses_only_taxonomy_edges():
-    """The LLM system prompt in RelationshipExtractor should only name edges
-    that exist in the canonical taxonomy (no drift between prompt and code)."""
-    import re
+    """Every underscore-joined ALL_CAPS token in the prompt must be a known edge type."""
     from companybrain.pipeline.relationship_extractor import RELATIONSHIP_SYSTEM_PROMPT
 
-    # Extract all-caps words that look like edge type tokens from the prompt
-    # (≥4 chars, all uppercase letters + underscore, preceded by "- " or newline)
-    candidates = re.findall(r'(?:^|- )([A-Z][A-Z_]{3,})', RELATIONSHIP_SYSTEM_PROMPT,
-                            re.MULTILINE)
-    for candidate in candidates:
-        # Only check things that are plausibly edge type names (contain underscore
-        # or are in EDGE_TYPES). Skip section headers like "EDGE", "RULES", etc.
-        if candidate in EDGE_TYPES:
-            continue  # known — fine
-        if "_" in candidate:
-            # Has underscore but not in taxonomy — potential drift
-            assert candidate in EDGE_TYPES, (
-                f"Edge-like token {candidate!r} in RelationshipExtractor prompt "
-                f"is not in the canonical taxonomy. Add it to taxonomy.py or fix the prompt."
-            )
+    unknown = []
+    for word in RELATIONSHIP_SYSTEM_PROMPT.split():
+        # Strip punctuation that may trail the token (comma, period, etc.)
+        token = word.strip(",-.:;\"'()")
+        # Only test tokens that look like edge types: all-caps + underscore, ≥5 chars
+        if token and "_" in token and token == token.upper() and len(token) >= 5:
+            if token not in EDGE_TYPES:
+                unknown.append(token)
+
+    assert not unknown, (
+        f"Tokens in RelationshipExtractor prompt not in taxonomy: {unknown}. "
+        f"Add them to taxonomy.py or fix the prompt."
+    )

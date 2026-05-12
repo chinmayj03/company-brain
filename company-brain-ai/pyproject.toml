@@ -153,3 +153,10 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Use importlib mode so test packages (e.g. tests/unit/api) don't collide with
+# source packages of the same name (e.g. companybrain.api).
+addopts = "--import-mode=importlib"
+markers = [
+    "integration: integration tests requiring services (postgres, redis, etc.) to be running",
+    "acceptance: end-to-end acceptance tests (slow, may hit LLM)",
+]

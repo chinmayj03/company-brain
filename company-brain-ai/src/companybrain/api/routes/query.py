@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import time
 from pathlib import Path
 from typing import Any
@@ -262,8 +261,12 @@ def _parse_llm_response(raw: str, context: str | None) -> QueryResponse:
     so existing consumers always receive the same schema.
     """
     # Strip markdown fences the LLM sometimes wraps around JSON.
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned.strip())
+    lines = raw.strip().splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    cleaned = "\n".join(lines).strip()
 
     try:
         data: dict[str, Any] = json.loads(cleaned)
@@ -271,30 +274,42 @@ def _parse_llm_response(raw: str, context: str | None) -> QueryResponse:
     except Exception as exc:
         log.warning("[query] LLM output was not valid QueryResponse JSON — wrapping",
                     error=str(exc), preview=raw[:200])
-        confidence_level = (
-            "medium" if context else "low"
-        )
         return QueryResponse(
-            summary=_strip_uncited(raw),
+            summary=raw,
             confidence=Confidence(
-                level=confidence_level,
+                level="medium" if context else "low",
                 rationale="LLM returned free-form text rather than structured JSON",
             ),
         )
 
 
-_CITATION_RE = re.compile(r"\[urn:cb:[^\]]+\]")
-_CODE_TOKEN_RE = re.compile(r"[A-Z][a-z]+[A-Z]|[a-z]+\.[a-zA-Z]+|[A-Z_]{3,}|\w+\.\w+")
-
-
 def _strip_uncited(text: str) -> str:
-    """Remove sentences that contain code-shaped tokens but no URN citation."""
-    result = []
-    for sentence in re.split(r"(?<=[.!?])\s+", text):
-        if _CODE_TOKEN_RE.search(sentence) and not _CITATION_RE.search(sentence):
+    """Drop code-shaped identifiers (CamelCase, camelCase) from sentences that
+    lack a `[urn:...]` citation. Sentences containing a URN citation are kept verbatim.
+    Suppresses LLM hallucinations of code names that weren't in retrieved context.
+    """
+    out_sentences: list[str] = []
+    for sentence in text.split(". "):
+        if "[urn:" in sentence:
+            out_sentences.append(sentence)
             continue
-        result.append(sentence)
-    return " ".join(result) if result else text
+        kept: list[str] = []
+        for raw_token in sentence.split():
+            stripped = raw_token.strip(",.;:!?()[]{}'\"")
+            if not _looks_like_code_identifier(stripped):
+                kept.append(raw_token)
+        out_sentences.append(" ".join(kept))
+    return ". ".join(out_sentences)
+
+
+def _looks_like_code_identifier(token: str) -> bool:
+    """True if token has internal capitalization (PaymentService, getFoo) — i.e.,
+    a code identifier rather than a sentence-initial capitalized word."""
+    if len(token) < 2 or not any(c.isalpha() for c in token):
+        return False
+    has_lower = any(c.islower() for c in token)
+    has_upper_after_first = any(c.isupper() for c in token[1:])
+    return has_lower and has_upper_after_first
 
 
 def _plain_user_message(question: str, context: str | None) -> str:

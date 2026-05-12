@@ -144,6 +144,13 @@ class ExtractedEntity:
                                       "self_correction"]] = None
     verifier_notes:  str                                  = ""
 
+    # ── ADR-0059 additions ────────────────────────────────────────────────
+    # Populated by Pass T1 (TemporalPass) from git blame data. None when the
+    # pass hasn't run for this entity (e.g. file is not under git, blame
+    # disabled via env flag, or the entity's source location couldn't be
+    # resolved).
+    temporal: Optional["TemporalOwnership"] = None
+
     @property
     def external_id(self) -> str:
         """Stable identifier used as the node external_id in the graph."""
@@ -565,4 +572,101 @@ ADR_0057_EDGE_TYPES = frozenset({
     EDGE_DOCUMENTS, EDGE_EXAMPLES, EDGE_CONFIGURES, EDGE_DEPENDS_ON_LIB,
     EDGE_BASED_ON, EDGE_EXPOSES_PORT, EDGE_RUNS_COMMAND, EDGE_DEPLOYS,
     EDGE_LINKS_TO, EDGE_RUNS_ON_PR, EDGE_RUNS_ON_PUSH, EDGE_SPECIFIES,
+})
+
+
+# ── ADR-0059 additions ────────────────────────────────────────────────────────
+# Temporal ownership + domain inference passes. Pass T1 derives per-entity
+# ownership/age/churn facts from git blame; Pass T2 runs one LLM call per repo
+# to infer DomainEntity rows (shape shared with ADR-0055); Pass T2b derives an
+# OnboardingPath per DomainEntity by picking representative anchor classes.
+
+@dataclass
+class TemporalOwnership:
+    """
+    Per-entity ownership / age / churn summary derived from git blame.
+
+    Attached to an ExtractedEntity via ``entity.temporal``. Computed by Pass T1
+    (``pipeline/temporal_pass.py``) from blame data produced by
+    ``pipeline/git_blame_aggregator.py``.
+
+    Field semantics:
+      primary_author   — the email/name with the most blame lines.
+      co_authors       — ``(author, line_count)`` sorted descending; primary
+                         author is index 0 in this list.
+      bus_factor       — count of authors holding >= 10% of the line share.
+      age_days         — days between the first commit touching the entity and
+                         ``last_touched_at``.
+      last_touched_at  — datetime of the most recent commit on the range.
+      last_touched_by  — author of that most recent commit.
+      churn_30d        — distinct commits on the range within the last 30 days.
+      churn_90d        — distinct commits on the range within the last 90 days.
+    """
+    primary_author: str = ""
+    co_authors: list[tuple[str, int]] = field(default_factory=list)
+    bus_factor: int = 0
+    age_days: int = 0
+    last_touched_at: Optional[datetime] = None
+    last_touched_by: str = ""
+    churn_30d: int = 0
+    churn_90d: int = 0
+
+
+@dataclass
+class RiskAlert:
+    """
+    A risk surface derived from TemporalOwnership data.
+
+    Emitted by ``pipeline/risk_alert_detector.py`` after Pass T1 has populated
+    ``entity.temporal`` for every entity that could be blamed. Three kinds:
+
+      - ``bus_factor_one``   single-point-of-failure: primary_author > 70% of
+                             lines and the runner-up has < 10%.
+      - ``high_churn``       instability / active redesign: churn_30d > 5.
+      - ``stale_owner_left`` knowledge departure risk: the last toucher has
+                             not committed anywhere in the repo in 90 days.
+
+    Severity bucketing is heuristic (LOW/MED/HIGH); callers display the
+    ``message`` field verbatim.
+    """
+    entity_type: str = "RiskAlert"
+    kind: Literal["bus_factor_one", "high_churn", "stale_owner_left"] = "bus_factor_one"
+    affected_entity_urn: str = ""
+    severity: Literal["LOW", "MED", "HIGH"] = "MED"
+    message: str = ""
+
+    @property
+    def external_id(self) -> str:
+        return f"alert::{self.kind}::{self.affected_entity_urn}"
+
+
+@dataclass
+class OnboardingPath:
+    """
+    A curated reading order for a DomainEntity — the answer to "what should
+    a new hire read first to understand X?"
+
+    Built by ``pipeline/onboarding_path_builder.py`` from the DomainEntity
+    rows produced by Pass T2 plus the anchor classes' file paths. We rank
+    classes by structural role (Controller → Service → Repository) so the
+    output reads top-of-stack first.
+    """
+    entity_type: str = "OnboardingPath"
+    domain_name: str = ""
+    domain_urn: str = ""
+    anchor_class_urns: list[str] = field(default_factory=list)
+    rationale: str = ""           # 1-line description of why these were picked
+
+    @property
+    def external_id(self) -> str:
+        return f"onboarding::{self.domain_name}"
+
+
+# Edge type constants for ADR-0059 (graph wiring of alerts + onboarding paths).
+EDGE_AFFECTS         = "AFFECTS"           # RiskAlert -> entity it warns about
+EDGE_GUIDES          = "GUIDES"            # OnboardingPath -> DomainEntity it guides
+EDGE_READ_FIRST      = "READ_FIRST"        # OnboardingPath -> first anchor class
+
+ADR_0059_EDGE_TYPES = frozenset({
+    EDGE_AFFECTS, EDGE_GUIDES, EDGE_READ_FIRST,
 })

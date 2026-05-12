@@ -314,5 +314,15 @@ class Settings(BaseSettings):
     # you have a tmp-dir convention.
     worktree_prefix: str = "brain-wt-"
 
+    # ── ADR-0055 additions ─────────────────────────────────────────────────
+    # Cross-file cross-cutting pass (Stage 2.5) tunables. Defaults match the
+    # ADR; override via env vars (e.g. CROSS_FILE_PATTERN_MIN_INSTANCES=4).
+    # Set ``cross_file_enable_llm_passes=False`` to skip SP-3/4/5 and run
+    # only the deterministic SP-1/SP-2 passes — useful for offline tests.
+    cross_file_pattern_min_instances: int = 5
+    cross_file_antipattern_min_strength: float = 0.80
+    cross_file_invariant_window_size: int = 8
+    cross_file_enable_llm_passes: bool = True
+
 
 settings = Settings()

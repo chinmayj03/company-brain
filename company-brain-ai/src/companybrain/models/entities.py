@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -131,6 +131,18 @@ class ExtractedEntity:
     # Both default False so nothing changes for entities written before V15.
     pinned:   bool                              = False
     proposed: bool                              = False
+
+    # ── ADR-0056 additions ────────────────────────────────────────────────
+    # Populated by VerifierLoop between Stage 2.5 and Stage 3. The default
+    # "skipped" means the verifier never ran (skipped via env flag or pre-V16
+    # payload), so old reads remain visible. /query excludes
+    # ``verified in {"hallucinated", "conflicting"}`` unless include_unverified
+    # is set on the request.
+    verified:        Literal["confirmed", "fuzzy", "hallucinated",
+                             "conflicting", "skipped"] = "skipped"
+    verifier_mode:   Optional[Literal["deterministic", "subagent",
+                                      "self_correction"]] = None
+    verifier_notes:  str                                  = ""
 
     @property
     def external_id(self) -> str:
@@ -277,6 +289,9 @@ class QueryRequest(BaseModel):
     workspace_id: str
     repo_path: Optional[str] = None        # Repo root containing .brain/; falls back to BRAIN_ROOT env var
     max_hops: int = Field(default=3, ge=1, le=5)
+    # ADR-0056: opt into surfacing entities the verifier flagged as hallucinated
+    # or conflicting. Defaults False so /query callers see only verified sources.
+    include_unverified: bool = Field(default=False)
 
 
 class LegacyQueryResponse(BaseModel):
@@ -292,6 +307,97 @@ class LegacyQueryResponse(BaseModel):
 
 # Alias kept for backward compatibility; routes/query.py uses the new typed model.
 QueryResponse = LegacyQueryResponse
+
+
+# ── ADR-0055 additions ─────────────────────────────────────────────────────────
+# Cross-file cross-cutting extraction pass (Stage 2.5). Emits Pattern,
+# SharedInvariant, and DomainEntity entities plus new edge types that wire
+# concrete code entities to the inferred cross-cutting facts.
+
+# Edge type constants. These are also appended to companybrain.edges.taxonomy
+# (the canonical SOT). Mirrored here so call-sites that build edges through
+# the entity-model module pick the same string.
+EDGE_IMPLEMENTS_PATTERN     = "IMPLEMENTS_PATTERN"
+EDGE_VIOLATES_PATTERN       = "VIOLATES_PATTERN"
+EDGE_SHARES_INVARIANT       = "SHARES_INVARIANT"
+EDGE_REPRESENTS             = "REPRESENTS"
+EDGE_HAS_IMPLICIT_CONTRACT  = "HAS_IMPLICIT_CONTRACT"
+
+
+@dataclass
+class Pattern:
+    """
+    A repeating idiom or convention spanning multiple call sites.
+
+    Emitted by SP-1 (idiom_detector) for deterministic patterns and
+    optionally by SP-3 (invariant_inferrer) when the LLM names a pattern
+    explicitly. ``instance_count`` is the number of distinct entities that
+    implement the pattern; the corresponding IMPLEMENTS_PATTERN edges carry
+    the membership.
+    """
+    entity_type: str = "Pattern"
+    name: str = ""
+    description: str = ""
+    instance_count: int = 0
+    confidence: float = 0.0
+    inferred_from: str = "deterministic"   # "deterministic" | "llm"
+    instance_urns: list[str] = field(default_factory=list)
+
+    @property
+    def external_id(self) -> str:
+        """Stable identifier used as the node external_id in the graph."""
+        return f"pattern::{self.name}"
+
+
+@dataclass
+class SharedInvariant:
+    """
+    A statement that holds across a window of related methods, not within
+    one. Example: "all reads of plan_info filter is_current=true".
+    """
+    entity_type: str = "SharedInvariant"
+    name: str = ""
+    statement: str = ""
+    affected_method_urns: list[str] = field(default_factory=list)
+    evidence_method_urns: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+    @property
+    def external_id(self) -> str:
+        return f"invariant::{self.name}"
+
+
+@dataclass
+class DomainEntity:
+    """
+    A business/domain concept inferred from naming patterns across many
+    classes — e.g. "Payer" inferred from PayerInfo, PayerPlan, BasePayer,
+    payer_id. Anchored to a handful of representative classes via REPRESENTS
+    edges.
+    """
+    entity_type: str = "DomainEntity"
+    name: str = ""
+    aliases: list[str] = field(default_factory=list)
+    description: str = ""
+    anchor_class_urns: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+    @property
+    def external_id(self) -> str:
+        return f"domain::{self.name}"
+
+
+@dataclass
+class ImplicitContract:
+    """
+    Pre- and post-conditions a method seems to assume from its callers.
+    Attached to a method's BusinessContext rather than stored separately;
+    we keep the dataclass to give SP-4 a typed return value.
+    """
+    method_external_id: str = ""
+    preconditions: list[str] = field(default_factory=list)
+    postconditions: list[str] = field(default_factory=list)
+    confidence: float = 0.0
 
 
 # ── ADR-0057 additions ────────────────────────────────────────────────────────

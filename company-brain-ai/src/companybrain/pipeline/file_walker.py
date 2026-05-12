@@ -92,6 +92,11 @@ UNIVERSAL_EXTRA_EXTENSIONS: frozenset[str] = frozenset({
     ".properties", ".env",
     ".xml",     # POM / general XML configs
     ".tf",      # Terraform (shallow; deep extraction owned by ADR-0058)
+    # ── ADR-0061 additions ──────────────────────────────────────────────
+    # Diagram-image files become Diagram entities via diagram_extractor.py.
+    # The dispatcher's ``supports()`` constrains them to docs/**/ so a
+    # top-level logo.png doesn't accidentally trigger a vision call.
+    ".png", ".svg",
 })
 
 # Set used by the walker after ADR-0057. Code-only callers still consume

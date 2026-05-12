@@ -87,6 +87,28 @@ class QueryResponse(BaseModel):
     domain_entities: list[dict] = []
     onboarding_paths: list[dict] = []
 
+    # ── ADR-0061 additions ────────────────────────────────────────────────
+    # Free-form telemetry the query path attaches so the UI / acceptance tests
+    # can assert which iterative-exploration features fired. Stable keys:
+    #   exploration_agent_invoked: bool       (E1)
+    #   exploration_agent_steps:   int        (E1)
+    #   reread_invoked:            bool       (E2)
+    #   clarification_returned:    bool       (E5)
+    #   cross_repo_hits:           int        (E6)
+    telemetry: dict = {}
+    # ADR-0061 E5: when set, the LLM was bypassed and the client must render a
+    # disambiguation prompt instead of an answer. ``interpretations`` is a list
+    # of {id, description}; ``suggested_followup`` is a one-line example query
+    # string the UI can drop into the search bar.
+    ambiguity: bool = False
+    interpretations: list[dict] = []
+    suggested_followup: Optional[str] = None
+    # ADR-0061 E6: per-result Pattern→Pattern matches surfaced across the
+    # caller's other workspaces. Each item:
+    #   {source_urn, source_name, target_workspace, target_urn, target_name,
+    #    score, note}
+    cross_repo_insights: list[dict] = []
+
     # Legacy aliases so callers that read .answer or .sources keep working.
     @property
     def answer(self) -> str:

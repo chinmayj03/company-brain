@@ -1,0 +1,28 @@
+scalar DateTime
+
+enum Lob {
+  COMMERCIAL
+  MEDICARE
+  MEDICAID
+}
+
+type Payer {
+  id: ID!
+  name: String!
+  lob: [Lob!]!
+  createdAt: DateTime
+}
+
+input PayerFilter {
+  name: String
+  lob: Lob
+}
+
+type Query {
+  payer(id: ID!): Payer
+  listPayers(filter: PayerFilter, limit: Int = 50): [Payer!]!
+}
+
+type Mutation {
+  createPayer(name: String!, lob: [Lob!]!): Payer!
+}

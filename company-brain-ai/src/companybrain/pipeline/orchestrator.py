@@ -1325,6 +1325,39 @@ async def run_pipeline(
                     "error": str(exc),
                 })
 
+        # ── Stage 2.8: Verifier loop (ADR-0056) ───────────────────────────────
+        # Per the ADR, the verifier runs *after* the cross-file pass (ADR-0055)
+        # and before Stage 3 — re-reads source for every emitted claim. Mode A
+        # deterministic substring match → Mode B Haiku sub-agent on Mode-A
+        # escapes → Mode C re-extraction when a high-confidence high-stakes
+        # claim is disputed. Hallucinated / conflicting entities stay in the
+        # list (we don't drop them) but get tagged so /query filters them out
+        # by default. Skip via BRAIN_SKIP_VERIFIER=true to compare runs.
+        if os.environ.get("BRAIN_SKIP_VERIFIER", "").lower() != "true":
+            from companybrain.pipeline.verifier_loop import VerifierLoop
+
+            verifier_roots: list[_Path] = []
+            for r in request.repos:
+                if r.local_path:
+                    verifier_roots.append(_Path(r.local_path))
+            entities, _verify_stats = await VerifierLoop().run(
+                entities, source_roots=verifier_roots,
+            )
+            stages_summary.append({
+                "stage": "2.8",
+                "label": "Verifier",
+                **_verify_stats.as_dict(),
+            })
+            await progress(
+                "2.8", "🔎",
+                f"Verifier: {_verify_stats.confirmed} confirmed, "
+                f"{_verify_stats.fuzzy} fuzzy, "
+                f"{_verify_stats.hallucinated} hallucinated, "
+                f"{_verify_stats.conflicting} conflicting "
+                f"(self-correction fired {_verify_stats.self_correction_fires}x)",
+                **_verify_stats.as_dict(),
+            )
+
         # ── Stage 3: Business context synthesis ───────────────────────────────
         await progress("3", "📖", "Context synthesis — explaining WHY each entity exists (using git history)")
 

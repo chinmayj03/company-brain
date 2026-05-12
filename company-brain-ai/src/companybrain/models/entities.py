@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -131,6 +131,18 @@ class ExtractedEntity:
     # Both default False so nothing changes for entities written before V15.
     pinned:   bool                              = False
     proposed: bool                              = False
+
+    # ── ADR-0056 additions ────────────────────────────────────────────────
+    # Populated by VerifierLoop between Stage 2.5 and Stage 3. The default
+    # "skipped" means the verifier never ran (skipped via env flag or pre-V16
+    # payload), so old reads remain visible. /query excludes
+    # ``verified in {"hallucinated", "conflicting"}`` unless include_unverified
+    # is set on the request.
+    verified:        Literal["confirmed", "fuzzy", "hallucinated",
+                             "conflicting", "skipped"] = "skipped"
+    verifier_mode:   Optional[Literal["deterministic", "subagent",
+                                      "self_correction"]] = None
+    verifier_notes:  str                                  = ""
 
     @property
     def external_id(self) -> str:
@@ -277,6 +289,9 @@ class QueryRequest(BaseModel):
     workspace_id: str
     repo_path: Optional[str] = None        # Repo root containing .brain/; falls back to BRAIN_ROOT env var
     max_hops: int = Field(default=3, ge=1, le=5)
+    # ADR-0056: opt into surfacing entities the verifier flagged as hallucinated
+    # or conflicting. Defaults False so /query callers see only verified sources.
+    include_unverified: bool = Field(default=False)
 
 
 class LegacyQueryResponse(BaseModel):

@@ -123,6 +123,7 @@ async def query_graph(request: QueryRequest):
             request.workspace_id,
             getattr(request, "repo_path", None),
             index=qdrant_index,
+            include_unverified=getattr(request, "include_unverified", False),
         )
         if assembled_context:
             log.info("[query] Using hybrid retrieval context (SmartZone + Java unavailable)",
@@ -431,9 +432,14 @@ async def _assemble_context(
         return None, {}
 
 
+# ADR-0056: which ``verified`` statuses are surfaced to /query by default.
+_VERIFIED_PUBLIC = {"confirmed", "fuzzy", "skipped"}
+
+
 async def _hybrid_retrieve(
     question: str, workspace_id: str, repo_path: str | None = None,
     index: str = "default",
+    include_unverified: bool = False,
 ) -> str | None:
     """Retrieve relevant entities via HybridSearcher as a fallback context source.
 
@@ -442,6 +448,11 @@ async def _hybrid_retrieve(
       2. BRAIN_ROOT env var
 
     Returns None if neither is set OR neither contains a usable .brain/ directory.
+
+    ADR-0056: hits with ``payload.verified`` in {"hallucinated", "conflicting"}
+    are dropped unless ``include_unverified=True``. Entities indexed before the
+    verifier rolled out have no ``verified`` key and default to ``skipped``,
+    which is allowed through.
     """
     try:
         from companybrain.retrieval.hybrid_search import HybridSearcher
@@ -456,8 +467,11 @@ async def _hybrid_retrieve(
         hits = searcher.search(question, top_k=10, index=index)
         if not hits:
             return None
+        filtered_hits = _filter_verified(hits, include_unverified=include_unverified)
+        if not filtered_hits:
+            return None
         lines = ["## Hybrid Retrieval Results\n"]
-        for hit in hits:
+        for hit in filtered_hits:
             payload = hit.payload
             name = payload.get("qualified_name") or hit.urn.split(":")[-1]
             summary = payload.get("t1_summary", "")
@@ -466,6 +480,21 @@ async def _hybrid_retrieve(
     except Exception as exc:
         log.debug("[query] Hybrid retrieval failed (non-fatal)", error=str(exc))
         return None
+
+
+def _filter_verified(hits, include_unverified: bool):
+    """ADR-0056: drop hallucinated/conflicting hits from /query unless the
+    caller explicitly opts in. Public so tests can exercise the filter with
+    fabricated hit lists."""
+    if include_unverified:
+        return list(hits)
+    kept = []
+    for hit in hits:
+        payload = getattr(hit, "payload", {}) or {}
+        verified = payload.get("verified", "skipped")
+        if verified in _VERIFIED_PUBLIC:
+            kept.append(hit)
+    return kept
 
 
 def _symbol_from_file(file_path: str | None) -> str | None:

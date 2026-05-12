@@ -1,20 +1,21 @@
 """
-ExtractionLoop — ADR-0041 Phase 2.
+ExtractionLoop — ADR-0041 Phase 2 / ADR-0042 E1 enhancement.
 
 Wraps the existing EntityExtractor with a call-graph-following loop:
 
   Stage 1: extract entities from initial code_units (controller → service)
   → ReferenceResolver finds unresolved call targets (e.g. "CompetitorRepository")
-  → AdaptiveLocator maps them to file paths
+  → _resolve_symbol_to_file: ripgrep Tier 1 + LLM Tier 2 (capped at 5 resolves)
   → Load those files → extract again
   → Repeat until max_hops reached or no new references found
 
-This makes extraction depth-first along the actual call chain rather than
-relying on the CodeTracer's pre-computed FocalContext (which may not follow
-deep enough for complex chains).
+ADR-0042 E1 changes:
+  - Default max_hops bumped from 2 → 3 (deeper call-graph coverage)
+  - Two-tier symbol resolution: ripgrep first, LLM resolver if ambiguous
+  - LLM resolver capped at 5 calls per pipeline run (class-level counter)
 
 Design constraints:
-  - Max hops: configurable, default 2 (to stay within cost ceiling)
+  - Max hops: configurable, default 3
   - Max NEW files per hop: 3 (prevent fan-out explosion)
   - Non-fatal: if a hop fails, the loop logs and continues with what it has
   - Zero new LLM calls if all hops are structurally resolved
@@ -23,6 +24,7 @@ Design constraints:
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -38,6 +40,8 @@ from companybrain.pipeline.ast_analyzer import ASTAnalyzer
 log = structlog.get_logger(__name__)
 
 _MAX_NEW_FILES_PER_HOP = 3
+# Cap LLM resolver calls per pipeline run to control cost (~$0.0005 each)
+_MAX_LLM_RESOLVES_PER_RUN = 5
 
 
 @dataclass
@@ -69,7 +73,7 @@ class ExtractionLoop:
     def __init__(
         self,
         repo_root: "str | Path",
-        max_hops: int = 2,
+        max_hops: int = 3,  # bumped from 2 → 3 per ADR-0042 E1
         max_files_per_hop: int = _MAX_NEW_FILES_PER_HOP,
     ) -> None:
         self._root             = Path(repo_root)
@@ -78,6 +82,7 @@ class ExtractionLoop:
         self._resolver         = ReferenceResolver()
         self._locator          = AdaptiveLocator(repo_root)
         self._analyzer         = ASTAnalyzer()
+        self._llm_resolve_count = 0  # per-run LLM resolver call counter
 
     async def run(
         self,
@@ -178,14 +183,18 @@ class ExtractionLoop:
     ) -> list[CodeUnit]:
         """
         For each unresolved CallRef, locate the file and load its content.
+
+        ADR-0042 E1 two-tier resolution:
+          Tier 1 — ripgrep: regex for class/def/function declarations across ALL languages.
+          Tier 2 — LLM: if multiple matches, ask the LLM to pick the right one
+                   given the calling context. Capped at _MAX_LLM_RESOLVES_PER_RUN.
+
         Returns at most _max_files_per_hop new CodeUnit objects.
         """
-        # Infer language from existing units
         language = "java"
         if initial_units:
             language = initial_units[0].language or "java"
 
-        # Infer repo name
         repo_name = ""
         if initial_units:
             repo_name = initial_units[0].repo_name or ""
@@ -199,25 +208,41 @@ class ExtractionLoop:
                 continue
 
             class_name = ref.type_hint.split(".")[-1]
-            candidates = self._locator.locate(class_name, language=language)
 
-            for candidate_path in candidates:
+            # Tier 1: ripgrep declaration search (language-agnostic)
+            rg_candidates = await _resolve_symbol_to_file(
+                class_name, self._root
+            )
+
+            # Tier 2: LLM disambiguation when multiple matches
+            if len(rg_candidates) > 1 and self._llm_resolve_count < _MAX_LLM_RESOLVES_PER_RUN:
+                caller_hint = getattr(ref, "caller_name", "") or ""
+                picked = await _llm_pick_file(class_name, rg_candidates, caller_hint)
+                if picked:
+                    rg_candidates = [picked]
+                self._llm_resolve_count += 1
+
+            # Fall back to AdaptiveLocator if ripgrep found nothing
+            if not rg_candidates:
+                rg_candidates = list(self._locator.locate(class_name, language=language))
+
+            for candidate_path in rg_candidates:
                 rel_path = str(candidate_path.relative_to(self._root))
                 if rel_path in seen_files:
                     continue
                 try:
                     content = candidate_path.read_text(encoding="utf-8", errors="ignore")
-                    # Determine role heuristically from file path
                     role = _infer_role(rel_path)
                     unit = CodeUnit(
                         file_path=rel_path,
                         repo_name=repo_name,
                         role=role,
                         language=language,
-                        content=content[:8_000],  # cap at MAX_UNIT_CHARS
+                        content=content[:8_000],
                     )
                     new_units.append(unit)
-                    log.debug("[extraction-loop] Loaded candidate file", path=rel_path)
+                    log.debug("[extraction-loop] Loaded candidate file", path=rel_path,
+                              tier="ripgrep" if rg_candidates else "adaptive_locator")
                     break
                 except (OSError, IOError):
                     continue
@@ -226,6 +251,83 @@ class ExtractionLoop:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _resolve_symbol_to_file(
+    symbol_name: str, repo_root: Path
+) -> list[Path]:
+    """
+    ADR-0042 E1, Tier 1: use ripgrep to locate source files that define symbol_name.
+
+    Searches for class/def/function/interface declarations across ALL languages
+    with a single regex so language detection is not needed in the orchestrator path.
+
+    Returns a list of Path objects (may be empty or have multiple candidates).
+    """
+    if not symbol_name or not repo_root.exists():
+        return []
+
+    # Language-agnostic pattern: matches Java class/interface, Python def/class,
+    # TypeScript class/function/interface, Go func, Ruby class, C# class
+    pattern = (
+        r"(class|interface|struct|def|function|func)\s+" + symbol_name + r"\b"
+    )
+
+    try:
+        result = subprocess.run(
+            ["rg", "--files-with-matches", "--no-ignore", "-l",
+             "-e", pattern, str(repo_root)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode not in (0, 1):  # 1 = no matches (not an error)
+            return []
+        paths = []
+        for line in result.stdout.strip().splitlines():
+            p = Path(line.strip())
+            if p.exists():
+                paths.append(p)
+        return paths
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # ripgrep not available or timed out — fall through to AdaptiveLocator
+        return []
+
+
+async def _llm_pick_file(
+    symbol_name: str,
+    candidates: list[Path],
+    caller_hint: str,
+) -> Path | None:
+    """
+    ADR-0042 E1, Tier 2: ask the LLM to pick the right file when ripgrep
+    returns multiple candidates.
+
+    Called at most _MAX_LLM_RESOLVES_PER_RUN times per pipeline run.
+    """
+    try:
+        from companybrain.llm import get_provider, TaskRole, ChatMessage
+
+        candidate_list = "\n".join(
+            f"{i+1}. {p}" for i, p in enumerate(candidates[:10])
+        )
+        prompt = (
+            f"Symbol '{symbol_name}' is defined in multiple files. "
+            f"Caller context: '{caller_hint}'. "
+            f"Which file most likely contains the implementation (not an interface/abstract)?\n"
+            f"{candidate_list}\n"
+            f"Reply with ONLY the number (e.g. '2'). No prose."
+        )
+        provider = get_provider()
+        resp = await provider.chat(
+            messages=[ChatMessage(role="user", content=prompt)],
+            role=TaskRole.FAST,
+            max_tokens=10,
+        )
+        idx = int(resp.content.strip()) - 1
+        if 0 <= idx < len(candidates):
+            return candidates[idx]
+    except Exception:
+        pass
+    return None
+
 
 _ROLE_HINTS = [
     ("controller", "controller"), ("resource",   "controller"),

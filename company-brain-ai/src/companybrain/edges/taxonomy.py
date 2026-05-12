@@ -101,6 +101,14 @@ EDGE_TYPES: frozenset[str] = frozenset({
 
     # ASSUMPTION / DEPENDENCY (static analysis — assumption_miner)
     "RELIES_ON",
+
+    # ── ADR-0055 additions ──────────────────────────────────────────────
+    # Cross-file cross-cutting pass — pattern, invariant, domain edges.
+    "IMPLEMENTS_PATTERN",
+    "VIOLATES_PATTERN",
+    "SHARES_INVARIANT",
+    "REPRESENTS",
+    "HAS_IMPLICIT_CONTRACT",
 })
 # fmt: on
 
@@ -134,6 +142,11 @@ EDGE_GROUPS: dict[str, list[str]] = {
     "TESTING": ["TESTED_BY", "MOCKS", "FIXTURE_FOR"],
     "CONFIG / LIFECYCLE": ["CONFIGURED_BY", "INITIALIZED_BY", "RATE_LIMITED_BY"],
     "ASSUMPTION / DEPENDENCY": ["RELIES_ON"],
+    # ADR-0055 — cross-file cross-cutting pass
+    "CROSS-CUTTING / PATTERNS": [
+        "IMPLEMENTS_PATTERN", "VIOLATES_PATTERN",
+        "SHARES_INVARIANT", "REPRESENTS", "HAS_IMPLICIT_CONTRACT",
+    ],
 }
 
 # ── Structural edges pre-extracted by AST (never emit from LLM pass) ──────────

@@ -49,7 +49,11 @@ from companybrain.pipeline.context_manager_agent import ContextManagerAgent
 from companybrain.pipeline.shared_context_accumulator import SharedContextAccumulator
 from companybrain.pipeline.assumption_miner import mine_assumptions  # ADR-0017
 from companybrain.pipeline.derived_query_extractor import DerivedQueryExtractor  # Tier 1.C
-from companybrain.pipeline.extraction_loop import ExtractionLoop  # ADR-0041 Phase 2
+from companybrain.pipeline.extraction_loop import ExtractionLoop  # ADR-0041 Phase 2 / ADR-0042 E1
+from companybrain.pipeline.passes import (   # ADR-0042 E2/E3/E5/E6/E7
+    AnnotationPass, StorageTargetPass, SchemaMigrationPass,
+    ClientCallPass, TestCoveragePass,
+)
 from companybrain.graph.java_client import JavaGraphClient, ArtifactFreshnessResult
 from companybrain.models.entities import PipelineStartRequest, ExtractedEntity
 from companybrain.store.base import BrainEntity as _BrainEntity  # ADR-0017
@@ -288,6 +292,22 @@ async def run_pipeline(
             dirty=len(_prepass.dirty_units),
         )
 
+        # ── ADR-0057: Universal File Extraction (Stage 0.5b) ──────────────────
+        # Runs the deterministic per-kind extractors (doc / config / manifest /
+        # infra / ci / javadoc) over the repo. Phase 1 surfaces the counts in
+        # telemetry only; persistence into Neo4j is owned by a follow-up PR.
+        try:
+            from companybrain.pipeline.universal_extraction import (
+                run_universal_extraction,
+            )
+            _universal_summary = await run_universal_extraction(request=request, progress=progress)
+            stages_summary.append({"stage": "0.5b", "label": "Universal Extraction",
+                                   **_universal_summary})
+        except Exception as _universal_err:
+            # Universal extraction is additive — never block the legacy pipeline.
+            log.warning("ADR-0057 universal extraction failed (non-fatal)",
+                        error=str(_universal_err))
+
         # ── Pre-flight: Freshness check — skip LLM for unchanged files ────────
         # Build the graph client early so we can call check_freshness before Stage 1.
         # This is the single biggest speed win: on average 80-90% of files are unchanged
@@ -324,6 +344,11 @@ async def run_pipeline(
                     fresh_units.append(unit)
                 else:
                     dirty_units.append(unit)
+                    # E4: annotate the unit with any method-level hashes the
+                    # backend confirmed as unchanged so EntityExtractor can
+                    # skip individual unchanged methods within a dirty file.
+                    if result and result.fresh_method_hashes:
+                        unit._fresh_method_hashes = result.fresh_method_hashes
 
             # Reconstruct ExtractedEntity objects from fresh node projections
             # so relationship extraction / synthesis can reference them.
@@ -1191,6 +1216,10 @@ async def run_pipeline(
         # BFS from the entry endpoint via structural edges; drop everything
         # not reached. Skippable via BRAIN_SKIP_REACHABILITY_FILTER=true if
         # an operator wants the unfiltered superset.
+        #
+        # Runs BEFORE the ADR-0042 passes so the passes only spend LLM calls
+        # on the reachable set (cheaper) and don't pollute their summaries
+        # with drift entities.
         from companybrain.pipeline.reachability_filter import filter_to_reachable
 
         if os.environ.get("BRAIN_SKIP_REACHABILITY_FILTER", "").lower() != "true":
@@ -1212,6 +1241,138 @@ async def run_pipeline(
                     **{k: v for k, v in _reach_stats.items()
                        if k in ("total", "reachable", "dropped")},
                 )
+
+        # ── Stage 2.6: ADR-0042 extraction passes (E2/E3/E5/E6/E7) ──────────────
+        # Each pass is independent, language-agnostic, and individually skip-able.
+        # Results are merged into the relationship set before Stage 3.
+        # Runs on the reachable entity set produced by Stage 2.5.
+        pass_rels: list = []
+        if entities:
+            await progress("2.6", "🔬", "ADR-0042 extraction passes — annotations, storage targets, client calls, test coverage")
+            _passes = [
+                AnnotationPass(),
+                StorageTargetPass(),
+                SchemaMigrationPass(),
+                ClientCallPass(),
+                TestCoveragePass(),
+            ]
+            for _pass in _passes:
+                try:
+                    _pass_rels, _pass_summary = await _pass.run(entities)
+                    pass_rels.extend(_pass_rels)
+                    stages_summary.append(_pass_summary)
+                    await progress(
+                        "2.6", "✅",
+                        f"{_pass.name}: {_pass_summary['edges_emitted']} edges",
+                        **{k: v for k, v in _pass_summary.items()
+                           if k in ("edges_emitted", "skipped_via_env", "duration_ms")},
+                    )
+                except Exception as _pe:
+                    log.warning(f"Extraction pass failed (non-fatal)",
+                                pass_name=_pass.name, error=str(_pe))
+
+            # Merge pass edges into the relationship set (dedup)
+            all_pass_rels_count = len(pass_rels)
+            relationships = _dedup_relationships(relationships + pass_rels)
+            log.info("ADR-0042 passes complete",
+                     pass_edges=all_pass_rels_count,
+                     total_after_merge=len(relationships))
+
+        # ── Cost guard (ADR-0042) ────────────────────────────────────────────
+        _cost_so_far = _run_tracker.summary().get("total_cost_usd", 0.0)
+        if _cost_so_far > settings.brain_job_budget_usd:
+            log.error(
+                "Job exceeded budget — aborting before Stage 3",
+                spent=_cost_so_far,
+                budget=settings.brain_job_budget_usd,
+            )
+            raise RuntimeError(
+                f"JobBudgetExceeded: spent ${_cost_so_far:.4f}, "
+                f"budget ${settings.brain_job_budget_usd:.4f}"
+            )
+
+        # ── ADR-0055 Stage 2.7: Cross-file cross-cutting pass ─────────────────
+        # Runs AFTER Stage 2.6 (ADR-0042 passes) so it can also reason over the
+        # edges those passes produced, and BEFORE Stage 3 (context synthesis)
+        # so the synthesiser can pick up Pattern / SharedInvariant /
+        # DomainEntity facts when narrating each entity. Skippable via
+        # BRAIN_SKIP_CROSS_FILE_PASS=true. Numbered 2.7 because the ADR-0042
+        # passes already claim 2.6.
+        if os.environ.get("BRAIN_SKIP_CROSS_FILE_PASS", "").lower() != "true":
+            from companybrain.pipeline.cross_file_pass import (
+                project_cross_file_entities,
+                run_cross_file_pass,
+            )
+
+            await progress(
+                "2.7", "🕸️ ",
+                "Cross-file cross-cutting pass — patterns, invariants, domains",
+            )
+            try:
+                cross_file_result = await run_cross_file_pass(entities, relationships)
+                if cross_file_result.new_edges:
+                    relationships = _dedup_relationships(
+                        list(relationships) + list(cross_file_result.new_edges)
+                    )
+                stages_summary.append({
+                    "stage": "2.7",
+                    "label": "Cross-File Cross-Cutting Pass",
+                    **cross_file_result.summary,
+                })
+                await progress(
+                    "2.7", "✅",
+                    "Cross-file pass: "
+                    f"{cross_file_result.summary['patterns']} patterns, "
+                    f"{cross_file_result.summary['shared_invariants']} invariants, "
+                    f"{cross_file_result.summary['domain_entities']} domains",
+                    **cross_file_result.summary,
+                )
+                # Hand the new entities to downstream stages so they end up in
+                # the BrainStore alongside Functions / Classes. Treated as
+                # ExtractedEntity-shaped projections for write-time uniformity.
+                entities = list(entities) + project_cross_file_entities(cross_file_result)
+            except Exception as exc:
+                # ADR-0055: never let the cross-file pass break the pipeline.
+                # Log + carry on with original entities + relationships.
+                log.warning("cross_file_pass failed (non-fatal)", error=str(exc))
+                stages_summary.append({
+                    "stage": "2.7",
+                    "label": "Cross-File Cross-Cutting Pass (errored)",
+                    "error": str(exc),
+                })
+
+        # ── Stage 2.8: Verifier loop (ADR-0056) ───────────────────────────────
+        # Per the ADR, the verifier runs *after* the cross-file pass (ADR-0055)
+        # and before Stage 3 — re-reads source for every emitted claim. Mode A
+        # deterministic substring match → Mode B Haiku sub-agent on Mode-A
+        # escapes → Mode C re-extraction when a high-confidence high-stakes
+        # claim is disputed. Hallucinated / conflicting entities stay in the
+        # list (we don't drop them) but get tagged so /query filters them out
+        # by default. Skip via BRAIN_SKIP_VERIFIER=true to compare runs.
+        if os.environ.get("BRAIN_SKIP_VERIFIER", "").lower() != "true":
+            from companybrain.pipeline.verifier_loop import VerifierLoop
+
+            verifier_roots: list[_Path] = []
+            for r in request.repos:
+                if r.local_path:
+                    verifier_roots.append(_Path(r.local_path))
+            entities, _verify_stats = await VerifierLoop().run(
+                entities, source_roots=verifier_roots,
+            )
+            stages_summary.append({
+                "stage": "2.8",
+                "label": "Verifier",
+                **_verify_stats.as_dict(),
+            })
+            await progress(
+                "2.8", "🔎",
+                f"Verifier: {_verify_stats.confirmed} confirmed, "
+                f"{_verify_stats.fuzzy} fuzzy, "
+                f"{_verify_stats.hallucinated} hallucinated, "
+                f"{_verify_stats.conflicting} conflicting "
+                f"(self-correction fired {_verify_stats.self_correction_fires}x)",
+                **_verify_stats.as_dict(),
+            )
 
         # ── Stage 3: Business context synthesis ───────────────────────────────
         await progress("3", "📖", "Context synthesis — explaining WHY each entity exists (using git history)")

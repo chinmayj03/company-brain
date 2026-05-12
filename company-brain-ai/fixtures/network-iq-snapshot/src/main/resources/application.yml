@@ -1,0 +1,25 @@
+spring:
+  application:
+    name: network-iq
+  datasource:
+    url: jdbc:postgresql://db:5432/network_iq
+    username: network_iq_app
+    password: changeme
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+
+logging:
+  level:
+    root: INFO
+    com.example: DEBUG
+
+features:
+  newReporting:
+    enabled: true

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -46,7 +47,9 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from mcp.server.fastmcp import FastMCP
+from sqlalchemy import text
 
+from companybrain.db import get_session, init_db_pool, close_db_pool
 from companybrain.mcp.client import BackendClient
 from companybrain.mcp.trpc_client import TrpcClient
 from companybrain.mcp.tools.context import get_minimal_context
@@ -87,6 +90,73 @@ log = structlog.get_logger(__name__)
 _BACKEND_URL  = os.getenv("BACKEND_URL",   "http://company-brain-backend:8080")
 _BACKEND_KEY  = os.getenv("BACKEND_API_KEY", "")
 _TRPC_API_URL = os.getenv("TRPC_API_URL",  "http://cb-api:8090/trpc")
+
+# ── MCP Agent Session Telemetry (ADR-0072 A3) ─────────────────────────────────
+# Session IDs are stored per-connection in a request-scoped context variable so
+# that each SSE connection tracks its own row without global mutable state.
+
+import contextvars as _cv
+_session_id_var: _cv.ContextVar[Optional[str]] = _cv.ContextVar("mcp_session_id", default=None)
+
+
+async def _telemetry_register(workspace_id: str, client_id: str) -> Optional[str]:
+    """Insert a new mcp_agent_sessions row. Returns the session UUID or None on error."""
+    try:
+        async with get_session() as db:
+            result = await db.execute(
+                text("""
+                    INSERT INTO mcp_agent_sessions
+                        (workspace_id, agent_name, client_id)
+                    VALUES
+                        (:workspace_id, 'company-brain-mcp', :client_id)
+                    RETURNING id
+                """),
+                {"workspace_id": workspace_id, "client_id": client_id},
+            )
+            row = result.fetchone()
+            await db.commit()
+            sid = str(row[0]) if row else None
+            log.info("MCP agent session registered", session_id=sid, client_id=client_id)
+            return sid
+    except Exception:
+        log.warning("MCP telemetry register failed", exc_info=True)
+        return None
+
+
+async def _telemetry_ping(session_id: str) -> None:
+    """Update last_ping_at and increment query_count for an agent session."""
+    try:
+        async with get_session() as db:
+            await db.execute(
+                text("""
+                    UPDATE mcp_agent_sessions
+                    SET last_ping_at = now(),
+                        query_count  = query_count + 1
+                    WHERE id = :sid
+                """),
+                {"sid": session_id},
+            )
+            await db.commit()
+    except Exception:
+        log.warning("MCP telemetry ping failed", session_id=session_id, exc_info=True)
+
+
+async def _telemetry_close(session_id: str) -> None:
+    """Mark an agent session as disconnected."""
+    try:
+        async with get_session() as db:
+            await db.execute(
+                text("""
+                    UPDATE mcp_agent_sessions
+                    SET disconnected_at = now()
+                    WHERE id = :sid AND disconnected_at IS NULL
+                """),
+                {"sid": session_id},
+            )
+            await db.commit()
+        log.info("MCP agent session closed", session_id=session_id)
+    except Exception:
+        log.warning("MCP telemetry close failed", session_id=session_id, exc_info=True)
 
 # ── FastMCP app ────────────────────────────────────────────────────────────────
 
@@ -529,11 +599,13 @@ async def _lifespan(app: FastAPI):
         backend_url=_BACKEND_URL,
         trpc_url=_TRPC_API_URL,
     )
+    await init_db_pool()
     _client = BackendClient(base_url=_BACKEND_URL, api_key=_BACKEND_KEY)
     _trpc   = TrpcClient(base_url=_TRPC_API_URL)
     yield
     await _client.close()
     await _trpc.close()
+    await close_db_pool()
     log.info("company-brain MCP server stopped")
 
 
@@ -553,6 +625,51 @@ asgi_app.add_middleware(
 
 # Mount the FastMCP SSE handler under /mcp
 asgi_app.mount("/mcp", mcp_app.sse_app())
+
+
+@asgi_app.middleware("http")
+async def _mcp_telemetry_middleware(request: Request, call_next):
+    """
+    Track MCP agent sessions for the SSE transport.
+
+    SSE connection lifecycle:
+      - GET /mcp/sse  → new connection; register a session row.
+      - POST /mcp/messages (tool calls) → ping the session.
+      - SSE disconnect is detected via response completion / generator exhaustion.
+    """
+    path = request.url.path
+
+    if request.method == "GET" and path.startswith("/mcp"):
+        # New SSE connection — derive identifiers from headers / query params
+        workspace_id = (
+            request.headers.get("X-Workspace-Id")
+            or request.query_params.get("workspace_id")
+            or "unknown"
+        )
+        client_id = (
+            request.headers.get("X-Client-Id")
+            or request.headers.get("Authorization", "")[:40]
+            or str(uuid.uuid4())
+        )
+        session_id = await _telemetry_register(workspace_id, client_id)
+        if session_id:
+            _session_id_var.set(session_id)
+
+        response = await call_next(request)
+
+        # SSE connection has ended (generator exhausted or client disconnected)
+        if session_id:
+            await _telemetry_close(session_id)
+        return response
+
+    if request.method == "POST" and path.startswith("/mcp"):
+        # Tool call — ping the active session if we have one
+        session_id = _session_id_var.get()
+        if session_id:
+            await _telemetry_ping(session_id)
+        return await call_next(request)
+
+    return await call_next(request)
 
 
 @asgi_app.get("/health")

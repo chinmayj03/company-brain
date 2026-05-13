@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from companybrain.api.routes import pipeline, query, health, repo, feedback, stream
+from companybrain.api.routes import pipeline, query, health, repo, feedback, stream, mcp_agents, sources, suggestions
 from companybrain.config import settings
 from companybrain.db import init_db_pool, close_db_pool
 
@@ -56,6 +56,10 @@ app.include_router(feedback.router, prefix="/feedback", tags=["feedback"])
 # ADR-0051 P4 — SSE feed of harness TodoList progress for /pipeline/jobs/{id}.
 # Path is fully embedded in the route so no prefix is set here.
 app.include_router(stream.router, tags=["stream"])
+# ADR-0072: MCP telemetry, source registry, suggested questions
+app.include_router(mcp_agents.router, prefix="/mcp", tags=["mcp-agents"])
+app.include_router(sources.router, tags=["sources"])
+app.include_router(suggestions.router, tags=["suggestions"])
 
 # ── ADR-0052 P5: brain-as-MCP route ──────────────────────────────────────
 # Exposes the harness MCP surface (query_brain, read_entity, find_callers, ...)

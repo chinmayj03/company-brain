@@ -61,6 +61,7 @@ DESIGN:
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -77,7 +78,7 @@ log = structlog.get_logger(__name__)
 
 # ── Agent constants ────────────────────────────────────────────────────────────
 
-MAX_TURNS      = 35   # max agent iterations before forcing submit
+MAX_TURNS      = int(os.environ.get("BRAIN_NAVIGATOR_MAX_TURNS", "35"))
               # 12 was too tight for Spring hexagonal apps where RepositoryImpl
               # injects multiple secondary repos (plan, provider, etc.) each
               # needing 1-2 turns to read.  18 covers: entry(1) + service(2) +
@@ -85,7 +86,8 @@ MAX_TURNS      = 35   # max agent iterations before forcing submit
               # 35 is the testing/deep-exploration ceiling — gives the agent room
               # to trace multi-level NIQ-style call chains (controller → service →
               # NiqEngine → payer resolver → rule evaluator → DB) without early
-              # exit. Reduce to 18 for production cost control.
+              # exit. Lower via env var `BRAIN_NAVIGATOR_MAX_TURNS=18` for cost
+              # control on shallow extraction budgets.
 MAX_FILE_CHARS = 8000 # max chars returned by read_file per call (raised for richer context)
 MAX_RESULTS    = 12   # max search results (raised to surface more call sites)
 

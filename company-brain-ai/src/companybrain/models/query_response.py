@@ -7,9 +7,34 @@ it cannot cite rather than fabricate node names.
 """
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator, computed_field
+
+
+def _coerce_confidence(v: Any) -> float:
+    """Normalize confidence to float regardless of input format.
+
+    Handles both the numeric form (0.85) and the legacy ADR-0005 object form
+    {"value": 0.85, "rationale": "..."} so JSON from mixed-vintage brain stores
+    doesn't fail Pydantic validation.
+    """
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, dict):
+        raw = v.get("value") or v.get("score") or v.get("confidence")
+        if raw is not None:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                pass
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.9
+
+
+ConfidenceFloat = Annotated[float, BeforeValidator(_coerce_confidence)]
 
 
 class CallChainStep(BaseModel):
@@ -35,7 +60,7 @@ class Citation(BaseModel):
     urn: str
     name: str
     why_relevant: str
-    confidence: float
+    confidence: ConfidenceFloat = 0.9
 
 
 class RiskAssessment(BaseModel):
@@ -86,6 +111,28 @@ class QueryResponse(BaseModel):
     risk_alerts: list[dict] = []
     domain_entities: list[dict] = []
     onboarding_paths: list[dict] = []
+
+    # ── Computed / serialised convenience fields ──────────────────────────────
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def cited_entity_urns(self) -> list[str]:
+        """Deduplicated list of URNs cited in affected_entities + call_chain.
+
+        Combines both sources so E2E checks and frontend consumers get every
+        URN the response references without having to merge two lists.
+        """
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in self.affected_entities:
+            if c.urn and c.urn not in seen:
+                seen.add(c.urn)
+                out.append(c.urn)
+        for step in self.call_chain:
+            if step.urn and step.urn not in seen:
+                seen.add(step.urn)
+                out.append(step.urn)
+        return out
 
     # Legacy aliases so callers that read .answer or .sources keep working.
     @property

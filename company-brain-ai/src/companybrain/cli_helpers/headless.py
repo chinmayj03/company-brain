@@ -101,6 +101,7 @@ async def run_index_headless(
     extracted: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     total_cost_usd = 0.0
+    total_tool_calls = 0
     for method, path in endpoint_list:
         request = PipelineStartRequest(
             endpoint_path=path,
@@ -129,13 +130,21 @@ async def run_index_headless(
                 or telem.get("cost", {}).get("total_cost_usd")
                 or 0.0
             )
+            # Tool-calls rollup: only present on the harness path.
+            tool_calls = int(
+                telem.get("harness", {}).get("tool_calls_total")
+                or len(telem.get("tool_calls") or [])
+                or 0
+            )
             total_cost_usd += cost
+            total_tool_calls += tool_calls
             extracted.append({
-                "method":     method,
-                "path":       path,
-                "status":     getattr(result, "status", "unknown"),
-                "telemetry":  telem,
-                "cost_usd":   round(cost, 6),
+                "method":          method,
+                "path":            path,
+                "status":          getattr(result, "status", "unknown"),
+                "telemetry":       telem,
+                "cost_usd":        round(cost, 6),
+                "tool_calls_count": tool_calls,
             })
         except Exception as exc:  # noqa: BLE001
             failures.append({
@@ -145,6 +154,7 @@ async def run_index_headless(
 
     summary_lines.append(f"failures={len(failures)}")
     summary_lines.append(f"total_cost_usd=${total_cost_usd:.4f}")
+    summary_lines.append(f"tool_calls={total_tool_calls}")
     payload: dict[str, Any] = {
         "ok":           not failures,
         "dry_run":      False,
@@ -160,6 +170,7 @@ async def run_index_headless(
             "extracted":         extracted,
             "failures":          failures,
             "total_cost_usd":    round(total_cost_usd, 6),
+            "tool_calls_count":  total_tool_calls,
             "wall_time_seconds": round(time.monotonic() - started, 3),
         },
     }

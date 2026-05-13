@@ -262,12 +262,11 @@ class Settings(BaseSettings):
     # instead of the linear stage machine in this file. The harness wraps the
     # existing pipeline tools (discover_routes, find_entry_handler, ContextAgent,
     # write_to_brain, etc.) and lets the model decide call order.
-    # Override via env var: BRAIN_USE_HARNESS=true to opt in to the harness path.
-    # The default was briefly flipped to True (ADR-0051 promotion) but produced
-    # 0 tool calls per extraction in production — the LLM returns plain text
-    # instead of invoking the extraction tools, so no entities are written to
-    # disk. Reverted to default-False until that regression is root-caused.
-    use_harness: bool = False
+    # Override via env var: BRAIN_USE_HARNESS=true/false.
+    # Default is True: AnthropicProvider now overrides chat_with_tools() with
+    # native Anthropic tool-use (P0 fix: text-protocol fallback produced 0
+    # tool calls because Haiku/Sonnet don't reliably emit `TOOL_CALL:` prefixes).
+    use_harness: bool = True
 
     # ── ADR-0051 P2: sub-agents and parallel fan-out ─────────────────────────
     # Maximum concurrent sub-agents per spawn_* tool call. Each sub-agent gets

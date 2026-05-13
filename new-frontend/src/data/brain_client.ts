@@ -176,6 +176,101 @@ export function queryBrainStream(
   return () => ctrl.abort();
 }
 
+// ── Conversation types ────────────────────────────────────────────────────────
+
+export interface ConversationSummary {
+  id: string;
+  question: string;
+  title?: string;
+  asked_at: string;  // ISO timestamp
+  saved: boolean;
+  actor_id?: string;
+  actor_kind?: string;
+}
+
+export interface ConversationDetail extends ConversationSummary {
+  summary_json?: unknown;  // full QueryResponse
+}
+
+// ── MCP Agent types ───────────────────────────────────────────────────────────
+
+export interface McpAgent {
+  id: string;
+  agent_name: string;
+  client_id: string;
+  connected_at: string;
+  last_ping_at: string;
+  query_count: number;
+  qpm: number;
+  status: 'live' | 'idle' | 'gone';
+}
+
+// ── Source types ──────────────────────────────────────────────────────────────
+
+export interface WorkspaceSource {
+  id: string;
+  kind: string;
+  display_name: string;
+  url?: string;
+  last_synced_at?: string;
+  sync_status: 'ok' | 'syncing' | 'error' | 'pending';
+  error_message?: string;
+}
+
+// ── Suggestion type ───────────────────────────────────────────────────────────
+
+export interface Suggestion {
+  question: string;
+}
+
+// ── New API functions ─────────────────────────────────────────────────────────
+
+export async function getConversations(workspaceId: string, saved?: boolean): Promise<ConversationSummary[]> {
+  const params = new URLSearchParams({ workspace_id: workspaceId });
+  if (saved !== undefined) params.set('saved', String(saved));
+  return get<ConversationSummary[]>(`/ai/conversations?${params}`);
+}
+
+export async function getConversation(id: string): Promise<ConversationDetail> {
+  return get<ConversationDetail>(`/ai/conversations/${id}`);
+}
+
+export async function patchConversation(id: string, patch: { saved?: boolean; title?: string }): Promise<void> {
+  const res = await fetch(`/ai/conversations/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status} PATCH /ai/conversations/${id}: ${text}`);
+  }
+}
+
+export async function getMcpAgents(workspaceId: string): Promise<McpAgent[]> {
+  return get<McpAgent[]>(`/ai/mcp/agents?workspace_id=${workspaceId}`);
+}
+
+export async function getSources(workspaceId: string): Promise<WorkspaceSource[]> {
+  return get<WorkspaceSource[]>(`/ai/workspaces/${workspaceId}/sources`);
+}
+
+export async function triggerSync(workspaceId: string, sourceId: string): Promise<void> {
+  const res = await fetch(`/ai/workspaces/${workspaceId}/sources/${sourceId}/sync`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status} POST sync: ${text}`);
+  }
+}
+
+export async function getSuggestions(workspaceId: string, repoPath?: string): Promise<Suggestion[]> {
+  const params = new URLSearchParams({ workspace_id: workspaceId });
+  if (repoPath) params.set('repo_path', repoPath);
+  return get<Suggestion[]>(`/ai/suggestions?${params}`);
+}
+
 // ── Mapping helpers: QueryResponse → component props ─────────────────────────
 
 /**

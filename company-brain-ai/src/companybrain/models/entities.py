@@ -337,6 +337,10 @@ class QueryRequest(BaseModel):
     # ADR-0056: opt into surfacing entities the verifier flagged as hallucinated
     # or conflicting. Defaults False so /query callers see only verified sources.
     include_unverified: bool = Field(default=False)
+    # ADR-0072 A5 (Audit Log): who issued this query.
+    # actor_kind distinguishes human UI users from CI bots / API tokens.
+    actor_id: Optional[str] = None         # e.g. user email, service account name, or CI job ID
+    actor_kind: str = "user"              # 'user' | 'ci' | 'api'
 
 
 class LegacyQueryResponse(BaseModel):

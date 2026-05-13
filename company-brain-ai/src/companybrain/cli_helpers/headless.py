@@ -107,7 +107,7 @@ async def run_index_headless(
             http_method=method,
             branch=branch,
             workspace_id=workspace_id,
-            repos=[RepoConfig(local_path=str(repo_path), type=RepoType.backend,
+            repos=[RepoConfig(local_path=str(repo_path), type=RepoType.BACKEND,
                               branch=branch, name=repo_name)],
         )
         try:

@@ -42,15 +42,31 @@ short text turn before the tool call so the trace is debuggable.
           repositories, DTOs the handler reaches).
   4. For each candidate file:
         extract_methods_from_class(file, methods)
-        — runs the batched ContextAgent extractor and returns entities + edges.
-        Prefer one batched call per file over many per-method calls.
-  5. write_to_brain(entities, edges)
-        — persists the extraction results. Safe to call multiple times.
+        — runs the batched ContextAgent extractor AND persists the resulting
+        entities to the brain store in one step. Returns a compact summary
+        {{written, skipped, errors, qnames_written}} — NOT the full entity
+        payload. Prefer one batched call per file over many per-method calls.
+        You DO NOT need to call write_to_brain afterwards.
+  5. (advanced/manual writes only)
+        write_to_brain(entities, edges)
+        — Only call this if you have entities you constructed yourself (e.g.
+        from grep_code observations) that extract_methods_from_class did not
+        produce. Normal flow skips this step entirely.
   6. finalize_brain(workspace_id)
         — closes the run and updates the brain manifest. Call exactly once at
-          the end.
+        the end, after the last extract_methods_from_class call. As soon as
+        you have finished extracting every relevant file, your next tool call
+        MUST be finalize_brain.
 
 Then emit a short text summary (one paragraph) of what was extracted and stop.
+
+Stop criteria (call finalize_brain + a text turn — DO NOT keep looping):
+  • You have extracted every relevant file in the call chain.
+  • extract_methods_from_class has returned {{written: 0, ...}} twice
+    consecutively (nothing new to extract — that means you're done).
+  • You have already run 6+ extract_methods_from_class calls: stop and call
+    finalize_brain even if you think there is more to do. Coverage gaps
+    belong in the final text turn, not in another extract or write call.
 
 Available tools
 ---------------

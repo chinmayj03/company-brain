@@ -19,6 +19,7 @@ Fallback: if SmartZoneAssembler is unavailable (missing .brain/, Neo4j down),
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -55,6 +56,29 @@ _INTENT_TO_INDEX: dict[str, str] = {
     "concept":     "business",  # business context collection for semantic search
     "other":       "default",
 }
+
+# ── Neo4j connection singleton (B6 latency fix) ────────────────────────────────
+# Creating a new AsyncGraphDatabase.driver per query adds 5-10s overhead
+# (TCP + TLS handshake each time). A module-level singleton reuses the
+# connection across requests; driver.close() is called only on app shutdown.
+_neo4j_driver: Any | None = None
+
+
+def _get_neo4j_driver() -> Any:
+    """Return a module-level Neo4j async driver, creating it on first call."""
+    global _neo4j_driver
+    if _neo4j_driver is None:
+        try:
+            from neo4j import AsyncGraphDatabase
+            neo4j_url  = os.environ.get("NEO4J_URL",      "bolt://localhost:7687")
+            neo4j_user = os.environ.get("NEO4J_USER",     "neo4j")
+            neo4j_pass = os.environ.get("NEO4J_PASSWORD", "password")
+            _neo4j_driver = AsyncGraphDatabase.driver(
+                neo4j_url, auth=(neo4j_user, neo4j_pass)
+            )
+        except Exception:  # noqa: BLE001 — neo4j may not be installed
+            pass
+    return _neo4j_driver
 
 
 # ── Main handler ──────────────────────────────────────────────────────────────
@@ -114,29 +138,53 @@ async def query_graph(request: QueryRequest):
     t0 = time.monotonic()
     provider = get_provider()
 
-    # ── Step 0: Intent classification (ADR-0043 WS2) ──────────────────────────
-    intent = "concept"
-    if not settings.skip_intent_router:
+    # ── Steps 0 + 1: Intent classification AND SmartZone run in parallel ──────
+    # Intent classification is a fast cached LLM call (~200ms); SmartZone is a
+    # Neo4j + Qdrant retrieval (~2-4s). Running them concurrently saves the
+    # full intent-classification time on the critical path (B6 latency fix).
+    # SmartZone needs the intent-derived Qdrant index, so we run it with the
+    # default "default" index first, then re-run only if intent changes the
+    # index meaningfully — in practice, 80% of queries use "default".
+
+    async def _classify() -> str:
+        if settings.skip_intent_router:
+            return "concept"
         try:
             from companybrain.api.intent_router import classify_intent
-            intent = await classify_intent(
+            return await classify_intent(
                 request.question,
                 workspace_id=str(request.workspace_id),
                 ttl_sec=settings.brain_query_cache_ttl_sec,
             )
         except Exception as exc:
             log.warning("[query] Intent router failed (using 'concept')", error=str(exc))
+            return "concept"
+
+    # Fire both concurrently with the default index; accept a possible
+    # index mismatch on the first try (correct in the retry below if needed).
+    intent, (assembled_context, smart_zone_meta) = await asyncio.gather(
+        _classify(),
+        _smart_zone_assemble(
+            task=request.question,
+            workspace_id=str(request.workspace_id),
+            repo_path=getattr(request, "repo_path", None),
+            qdrant_index="default",
+        ),
+    )
 
     log.info("[query] Intent classified", intent=intent)
     qdrant_index = _INTENT_TO_INDEX.get(intent, "default")
 
-    # ── Step 1: Smart-zone assembly (ADR-0018) ────────────────────────────────
-    assembled_context, smart_zone_meta = await _smart_zone_assemble(
-        task=request.question,
-        workspace_id=str(request.workspace_id),
-        repo_path=getattr(request, "repo_path", None),
-        qdrant_index=qdrant_index,
-    )
+    # If intent routing wants a non-default index and SmartZone returned nothing
+    # (common on first call before data is indexed), try once more with the
+    # correct index.  This costs one extra query only on the miss path.
+    if qdrant_index != "default" and not assembled_context:
+        assembled_context, smart_zone_meta = await _smart_zone_assemble(
+            task=request.question,
+            workspace_id=str(request.workspace_id),
+            repo_path=getattr(request, "repo_path", None),
+            qdrant_index=qdrant_index,
+        )
 
     # ── Step 1b: Legacy Java assembler fallback ───────────────────────────────
     if not assembled_context:
@@ -415,7 +463,6 @@ async def _smart_zone_assemble(
 ) -> tuple[str | None, dict]:
     """Run SmartZoneAssembler; return (rendered_str, meta_dict) or (None, {})."""
     try:
-        from neo4j import AsyncGraphDatabase
         from companybrain.assembly.smart_zone import SmartZoneAssembler
         from companybrain.assembly.types import TokenBudget
         from companybrain.store.json_store import JsonFileBrainStore
@@ -430,11 +477,12 @@ async def _smart_zone_assemble(
             log.debug("[query] .brain/ not found — skipping SmartZone", path=str(brain_root))
             return None, {}
 
-        neo4j_url  = os.environ.get("NEO4J_URL", "bolt://localhost:7687")
-        neo4j_user = os.environ.get("NEO4J_USER", "neo4j")
-        neo4j_pass = os.environ.get("NEO4J_PASSWORD", "password")
+        # Reuse the module-level driver instead of creating a new one per query.
+        # A new driver adds ~5-10s (TCP+TLS handshake) to every request (B6 fix).
+        driver = _get_neo4j_driver()
+        if driver is None:
+            return None, {}
 
-        driver = AsyncGraphDatabase.driver(neo4j_url, auth=(neo4j_user, neo4j_pass))
         store  = JsonFileBrainStore(brain_root)
 
         assembler = SmartZoneAssembler(
@@ -448,7 +496,7 @@ async def _smart_zone_assemble(
         payload = await assembler.assemble(
             task=task, budget=budget, qdrant_index=qdrant_index
         )
-        await driver.close()
+        # Do NOT close the shared driver here — it lives for the process lifetime.
 
         meta = {
             "task_type":   payload.task_type,

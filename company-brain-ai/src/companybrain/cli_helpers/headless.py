@@ -101,26 +101,50 @@ async def run_index_headless(
     extracted: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     total_cost_usd = 0.0
+    total_tool_calls = 0
     for method, path in endpoint_list:
         request = PipelineStartRequest(
             endpoint_path=path,
             http_method=method,
             branch=branch,
             workspace_id=workspace_id,
-            repos=[RepoConfig(local_path=str(repo_path), type=RepoType.backend,
+            repos=[RepoConfig(local_path=str(repo_path), type=RepoType.BACKEND,
                               branch=branch, name=repo_name)],
         )
         try:
             result = await run_pipeline(request)
             telem = getattr(result, "telemetry", {}) or {}
-            cost = float(telem.get("cost", {}).get("total_cost_usd", 0.0))
+            # Cost rollup: orchestrator emits the figure at one of three paths
+            # depending on which pipeline path ran.
+            #   • legacy linear stage machine: telem["total_cost_usd"] (top-level,
+            #     written from _run_tracker.summary() at orchestrator.py:1755)
+            #   • harness path: telem["harness"]["cost"]["total_cost_usd"]
+            #     (written from harness_result.telemetry at orchestrator.py:2532)
+            #   • legacy nested fallback some older tests use: telem["cost"]
+            # Previously only the third path was read, so the JSON always
+            # reported $0.00 even when the run cost real money. Read all three
+            # and take the first non-zero number.
+            cost = float(
+                telem.get("total_cost_usd")
+                or telem.get("harness", {}).get("cost", {}).get("total_cost_usd")
+                or telem.get("cost", {}).get("total_cost_usd")
+                or 0.0
+            )
+            # Tool-calls rollup: only present on the harness path.
+            tool_calls = int(
+                telem.get("harness", {}).get("tool_calls_total")
+                or len(telem.get("tool_calls") or [])
+                or 0
+            )
             total_cost_usd += cost
+            total_tool_calls += tool_calls
             extracted.append({
-                "method":     method,
-                "path":       path,
-                "status":     getattr(result, "status", "unknown"),
-                "telemetry":  telem,
-                "cost_usd":   round(cost, 6),
+                "method":          method,
+                "path":            path,
+                "status":          getattr(result, "status", "unknown"),
+                "telemetry":       telem,
+                "cost_usd":        round(cost, 6),
+                "tool_calls_count": tool_calls,
             })
         except Exception as exc:  # noqa: BLE001
             failures.append({
@@ -130,6 +154,7 @@ async def run_index_headless(
 
     summary_lines.append(f"failures={len(failures)}")
     summary_lines.append(f"total_cost_usd=${total_cost_usd:.4f}")
+    summary_lines.append(f"tool_calls={total_tool_calls}")
     payload: dict[str, Any] = {
         "ok":           not failures,
         "dry_run":      False,
@@ -145,6 +170,7 @@ async def run_index_headless(
             "extracted":         extracted,
             "failures":          failures,
             "total_cost_usd":    round(total_cost_usd, 6),
+            "tool_calls_count":  total_tool_calls,
             "wall_time_seconds": round(time.monotonic() - started, 3),
         },
     }

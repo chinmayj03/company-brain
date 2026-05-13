@@ -1403,12 +1403,23 @@ async def run_pipeline(
             )
 
         # ── Stage 3: Business context synthesis ───────────────────────────────
-        await progress("3", "📖", "Context synthesis — explaining WHY each entity exists (using git history)")
+        # ADR-0060: v2 path uses the typed-field prompt + 30-example few-shot
+        # library (is_idempotent, null_handling, transaction_mode, anti_patterns,
+        # engineering_notes, performance_class, security_class). The v2 system
+        # prompt is constant across all batches → prompt-cache eligible.
+        # Fall back to v1 via BRAIN_USE_V2_SYNTHESIS=false.
+        _synth_version = "v2" if settings.use_v2_synthesis else "v1"
+        await progress("3", "📖",
+                       f"Context synthesis [{_synth_version}] — explaining WHY each entity exists (using git history)")
 
-        contexts = await ContextSynthesizer().synthesise_all(entities, git_clusters, annotations)
-        stage_3 = {"stage": "3", "label": "Context Synthesis", "contexts": len(contexts)}
+        synthesizer = ContextSynthesizer()
+        if settings.use_v2_synthesis:
+            contexts = await synthesizer.synthesise_all_v2(entities, git_clusters, annotations)
+        else:
+            contexts = await synthesizer.synthesise_all(entities, git_clusters, annotations)
+        stage_3 = {"stage": "3", "label": f"Context Synthesis ({_synth_version})", "contexts": len(contexts)}
         stages_summary.append(stage_3)
-        await progress("3", "✅", f"Synthesised context for {len(contexts)} entities")
+        await progress("3", "✅", f"Synthesised context for {len(contexts)} entities [{_synth_version}]")
 
         # ── Stage 3.5: Memory tokenization — T0/T1 tokens from synthesised contexts ──
         # Generates compact memory tokens deterministically from BusinessContext objects.
@@ -2427,13 +2438,25 @@ _ENTITY_TYPE_MAP: dict[str, str] = {
 # _run_via_harness() when the flag is set; otherwise the legacy path runs.
 
 def _harness_enabled() -> bool:
-    """True when BRAIN_USE_HARNESS=true OR settings.use_harness is True.
+    """True when the harness path should run; False for the legacy linear pipeline.
 
-    Env var wins so operators can flip it without restarting the worker via a
-    code path that recomputes Settings.
+    Resolution order (env wins both directions so operators can flip the flag
+    without recomputing Settings):
+
+      1. BRAIN_USE_HARNESS=true / 1 / yes / on   → True
+      2. BRAIN_USE_HARNESS=false / 0 / no / off  → False
+      3. Otherwise fall through to settings.use_harness (default False; see
+         config.py for why)
+
+    Previous bug: only the truthy values were checked, so setting
+    BRAIN_USE_HARNESS=false to disable was silently ignored and the env var
+    behaved as a one-way ON switch.
     """
-    if os.environ.get("BRAIN_USE_HARNESS", "").strip().lower() in ("1", "true", "yes"):
+    _raw = os.environ.get("BRAIN_USE_HARNESS", "").strip().lower()
+    if _raw in ("1", "true", "yes", "on"):
         return True
+    if _raw in ("0", "false", "no", "off"):
+        return False
     try:
         from companybrain.config import settings as _adr0051_settings
         return bool(getattr(_adr0051_settings, "use_harness", False))

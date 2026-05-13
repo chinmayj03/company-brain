@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Any
 
@@ -35,8 +36,17 @@ _DEFAULT_ENTITY_TYPE = "function_node"
     requires=(Capability.WRITE_BRAIN,),
 )
 async def handler(args: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    import structlog as _sl
+    _log = _sl.get_logger(__name__)
     entities = list(args.get("entities") or [])
     standalone_edges = list(args.get("edges") or [])
+    _log.info(
+        "write_to_brain.call",
+        n_entities=len(entities),
+        n_edges=len(standalone_edges),
+        sample_qnames=[e.get("qname") for e in entities[:3]],
+        sample_repo=[e.get("repo") for e in entities[:3]],
+    )
 
     workspace_id = context.get("workspace_id")
     if not workspace_id:
@@ -45,6 +55,14 @@ async def handler(args: dict[str, Any], context: dict[str, Any]) -> dict[str, An
     store = _get_store(context)
     run_id = context.get("run_id") or workspace_id
     tenant = workspace_slug_for(workspace_id)
+
+    # Fallback repo identifier: directory name of the repo_path in context.
+    # When the model forwards extract_methods_from_class output it usually
+    # remembers to include `repo`, but if it doesn't we'd previously raise
+    # RepoUnknownForUrn and drop the entity silently. Now we backfill from
+    # context so the write still lands.
+    repo_path = context.get("repo_path") or ""
+    default_repo = os.path.basename(str(repo_path).rstrip(os.sep)) if repo_path else ""
 
     by_qname = {e.get("qname"): e for e in entities if e.get("qname")}
     for edge in standalone_edges:
@@ -60,6 +78,8 @@ async def handler(args: dict[str, Any], context: dict[str, Any]) -> dict[str, An
     errors: list[str] = []
 
     for ent in entities:
+        if not ent.get("repo") and default_repo:
+            ent = {**ent, "repo": default_repo}
         try:
             brain_entity = _to_brain_entity(ent, tenant=tenant)
         except (RepoUnknownForUrn, ValueError) as exc:
@@ -69,7 +89,29 @@ async def handler(args: dict[str, Any], context: dict[str, Any]) -> dict[str, An
         written += 1
 
     skipped = max(len(entities) - written - len(errors), 0)
-    return {"written": written, "skipped": skipped, "errors": errors}
+
+    # Track call count + cumulative writes to detect the harness "write loop"
+    # regression where the model batches one entity per call ad infinitum and
+    # never calls finalize_brain. After the 3rd call OR a zero-write batch we
+    # return an explicit nudge in the result text so the model breaks out.
+    counter = int(context.get("_write_to_brain_calls", 0)) + 1
+    cumulative = int(context.get("_write_to_brain_total", 0)) + written
+    context["_write_to_brain_calls"] = counter
+    context["_write_to_brain_total"] = cumulative
+
+    next_step: str | None = None
+    if written == 0:
+        next_step = ("No new entities written. Call finalize_brain next to "
+                     "commit the previously-buffered writes and end the run.")
+    elif counter >= 3:
+        next_step = (f"You have made {counter} write_to_brain calls "
+                     f"({cumulative} entities total). Call finalize_brain next "
+                     "and stop unless there is an explicit gap to fill.")
+
+    result: dict[str, Any] = {"written": written, "skipped": skipped, "errors": errors}
+    if next_step:
+        result["next_step"] = next_step
+    return result
 
 
 def _get_store(context: dict[str, Any]) -> JsonFileBrainStore:

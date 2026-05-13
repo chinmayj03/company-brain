@@ -196,7 +196,7 @@ async def _index_async(*, repo_path: Path, branch: str, workspace_id: str,
             http_method=method,
             branch=branch,
             workspace_id=workspace_id,
-            repos=[RepoConfig(local_path=str(repo_path), type=RepoType.backend,
+            repos=[RepoConfig(local_path=str(repo_path), type=RepoType.BACKEND,
                               branch=branch, name=repo_name)],
         )
         try:

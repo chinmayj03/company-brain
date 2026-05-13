@@ -98,6 +98,33 @@ class PostgresBrainStore(BrainStore):
         self._buffered_contexts.clear()
 
 
+def _coerce_confidence(raw: object, default: float = 0.9) -> float:
+    """Normalize any confidence representation to a plain float.
+
+    Stored entities can carry confidence in two formats (B5 schema mismatch):
+      • float:  0.85  — produced by ContextAgent and most extractors
+      • object: {"value": 0.85, "rationale": "..."}  — produced by an earlier
+                ADR-0005 rubric variant that has since been deprecated
+    Coerce both forms to float so consumers never receive a dict where they
+    expect a number.
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, dict):
+        val = raw.get("value") or raw.get("score") or raw.get("confidence")
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+    try:
+        return float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 def _to_extracted_entity(entity: BrainEntity) -> "ExtractedEntity":
     """Translate canonical BrainEntity → existing ExtractedEntity."""
     from companybrain.models.entities import ExtractedEntity
@@ -108,7 +135,7 @@ def _to_extracted_entity(entity: BrainEntity) -> "ExtractedEntity":
         repo=entity.repo,
         signature=entity.metadata.get("signature", ""),
         last_modified_commit=entity.metadata.get("last_modified_commit", ""),
-        confidence=entity.metadata.get("confidence", 0.9),
+        confidence=_coerce_confidence(entity.metadata.get("confidence")),
         code_snippet=entity.metadata.get("code_snippet"),
         query_text=entity.metadata.get("query_text"),
     )
@@ -125,7 +152,7 @@ def _to_relationships(entity: BrainEntity) -> "list[ExtractedRelationship]":
             edge_type=rel["edge_type"],
             to_entity=rel["target_id"],
             to_type=rel.get("target_type", "component"),
-            confidence=rel.get("confidence", 0.9),
+            confidence=_coerce_confidence(rel.get("confidence")),
             evidence=rel.get("evidence", rel.get("source", "brain_store")),
         ))
     return out

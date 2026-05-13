@@ -69,7 +69,29 @@ async def handler(args: dict[str, Any], context: dict[str, Any]) -> dict[str, An
         written += 1
 
     skipped = max(len(entities) - written - len(errors), 0)
-    return {"written": written, "skipped": skipped, "errors": errors}
+
+    # Track call count + cumulative writes to detect the harness "write loop"
+    # regression where the model batches one entity per call ad infinitum and
+    # never calls finalize_brain. After the 3rd call OR a zero-write batch we
+    # return an explicit nudge in the result text so the model breaks out.
+    counter = int(context.get("_write_to_brain_calls", 0)) + 1
+    cumulative = int(context.get("_write_to_brain_total", 0)) + written
+    context["_write_to_brain_calls"] = counter
+    context["_write_to_brain_total"] = cumulative
+
+    next_step: str | None = None
+    if written == 0:
+        next_step = ("No new entities written. Call finalize_brain next to "
+                     "commit the previously-buffered writes and end the run.")
+    elif counter >= 3:
+        next_step = (f"You have made {counter} write_to_brain calls "
+                     f"({cumulative} entities total). Call finalize_brain next "
+                     "and stop unless there is an explicit gap to fill.")
+
+    result: dict[str, Any] = {"written": written, "skipped": skipped, "errors": errors}
+    if next_step:
+        result["next_step"] = next_step
+    return result
 
 
 def _get_store(context: dict[str, Any]) -> JsonFileBrainStore:

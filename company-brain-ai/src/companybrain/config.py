@@ -262,8 +262,11 @@ class Settings(BaseSettings):
     # instead of the linear stage machine in this file. The harness wraps the
     # existing pipeline tools (discover_routes, find_entry_handler, ContextAgent,
     # write_to_brain, etc.) and lets the model decide call order.
-    # Override via env var: BRAIN_USE_HARNESS=true. Default false until the P4
-    # acceptance suite is green for two weeks (per ADR-0051).
+    # Override via env var: BRAIN_USE_HARNESS=true to opt in to the harness path.
+    # The default was briefly flipped to True (ADR-0051 promotion) but produced
+    # 0 tool calls per extraction in production — the LLM returns plain text
+    # instead of invoking the extraction tools, so no entities are written to
+    # disk. Reverted to default-False until that regression is root-caused.
     use_harness: bool = False
 
     # ── ADR-0051 P2: sub-agents and parallel fan-out ─────────────────────────
@@ -323,6 +326,16 @@ class Settings(BaseSettings):
     cross_file_antipattern_min_strength: float = 0.80
     cross_file_invariant_window_size: int = 8
     cross_file_enable_llm_passes: bool = True
+
+    # ── ADR-0060: BusinessContext v2 synthesis ─────────────────────────────
+    # When True, Stage 3 calls ContextSynthesizer.synthesise_all_v2() which
+    # uses the v2 prompt + few-shot library (30 anchors, 7 typed fields:
+    # is_idempotent, null_handling, transaction_mode, anti_patterns,
+    # engineering_notes, performance_class, security_class).
+    # The v2 prompt is prompt-cache eligible — identical system prompt across
+    # all entity batches, only user content varies.
+    # Override via env var: BRAIN_USE_V2_SYNTHESIS=false to revert to v1.
+    use_v2_synthesis: bool = True
 
 
 settings = Settings()

@@ -113,7 +113,22 @@ async def run_index_headless(
         try:
             result = await run_pipeline(request)
             telem = getattr(result, "telemetry", {}) or {}
-            cost = float(telem.get("cost", {}).get("total_cost_usd", 0.0))
+            # Cost rollup: orchestrator emits the figure at one of three paths
+            # depending on which pipeline path ran.
+            #   • legacy linear stage machine: telem["total_cost_usd"] (top-level,
+            #     written from _run_tracker.summary() at orchestrator.py:1755)
+            #   • harness path: telem["harness"]["cost"]["total_cost_usd"]
+            #     (written from harness_result.telemetry at orchestrator.py:2532)
+            #   • legacy nested fallback some older tests use: telem["cost"]
+            # Previously only the third path was read, so the JSON always
+            # reported $0.00 even when the run cost real money. Read all three
+            # and take the first non-zero number.
+            cost = float(
+                telem.get("total_cost_usd")
+                or telem.get("harness", {}).get("cost", {}).get("total_cost_usd")
+                or telem.get("cost", {}).get("total_cost_usd")
+                or 0.0
+            )
             total_cost_usd += cost
             extracted.append({
                 "method":     method,

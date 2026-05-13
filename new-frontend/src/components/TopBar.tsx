@@ -1,0 +1,52 @@
+interface TopBarProps {
+  crumb: string;
+  repoLabel?: string;
+}
+
+const IconGitBranch = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ width: 12, height: 12 }}>
+    <circle cx="12" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="18" r="2"/>
+    <path d="M12 8v6"/><path d="M12 14a6 6 0 0 0-6 4M12 14a6 6 0 0 1 6 4"/>
+  </svg>
+);
+const IconShare = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ width: 16, height: 16 }}>
+    <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
+    <line x1="8.6" y1="13.5" x2="15.4" y2="17.5"/><line x1="15.4" y1="6.5" x2="8.6" y2="10.5"/>
+  </svg>
+);
+const IconBook = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ width: 16, height: 16 }}>
+    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+  </svg>
+);
+const IconHome = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ width: 13, height: 13, color: 'var(--text-tertiary)' }}>
+    <path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>
+  </svg>
+);
+
+export default function TopBar({ crumb, repoLabel = 'stripe-node · main · abc1234' }: TopBarProps) {
+  return (
+    <div className="topbar">
+      <div className="crumb">
+        <IconHome />
+        <span className="sep">/</span>
+        <span>Ask</span>
+        <span className="sep">/</span>
+        <span className="now">{crumb}</span>
+      </div>
+      <div className="tb-grow" />
+      <div className="tb-chip">
+        <IconGitBranch />
+        <span className="mono" style={{ fontSize: 11 }}>{repoLabel}</span>
+      </div>
+      <div className="tb-chip tb-chip--accent">
+        <span className="dot dot--ok" />
+        <span>4 agents live</span>
+      </div>
+      <button className="icon-btn" title="Share"><IconShare /></button>
+      <button className="icon-btn" title="Notes"><IconBook /></button>
+    </div>
+  );
+}

@@ -1,0 +1,265 @@
+/* ================================================================
+   PRISM — Dataviz Design System
+   colors_and_type.css
+
+   A calm, minimal foundation for analytics interfaces.
+   Treat data as the primary interface; treat chrome as scaffolding.
+   ================================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  /* -------------------------------------------------------------
+     1. NEUTRALS — the carrier of the whole interface
+     ------------------------------------------------------------- */
+  --neutral-0:   #FFFFFF;   /* canvas */
+  --neutral-50:  #FAFBFC;   /* page background */
+  --neutral-100: #F4F6F8;   /* panel surface */
+  --neutral-150: #ECEFF3;   /* hover surface, gridline-on-bg */
+  --neutral-200: #E1E5EB;   /* primary border */
+  --neutral-300: #C9CFD7;   /* strong border, axis line */
+  --neutral-400: #A4ACB7;   /* tertiary text, axis label muted */
+  --neutral-500: #7C8694;   /* tertiary text */
+  --neutral-600: #5A6573;   /* secondary text */
+  --neutral-700: #3F4956;   /* secondary text strong */
+  --neutral-800: #232A35;   /* primary text on light */
+  --neutral-900: #0F141B;   /* maximum contrast text */
+
+  /* Backgrounds */
+  --bg-canvas:    var(--neutral-0);
+  --bg-page:      var(--neutral-50);
+  --bg-surface:   var(--neutral-100);
+  --bg-hover:     var(--neutral-150);
+  --bg-active:    var(--neutral-200);
+
+  /* Borders */
+  --border-subtle:  var(--neutral-150);
+  --border-default: var(--neutral-200);
+  --border-strong:  var(--neutral-300);
+  --border-focus:   var(--accent-primary);
+
+  /* Text */
+  --text-primary:   var(--neutral-900);
+  --text-secondary: var(--neutral-700);
+  --text-tertiary:  var(--neutral-500);
+  --text-muted:     var(--neutral-400);
+  --text-inverse:   var(--neutral-0);
+  --text-link:      var(--accent-primary);
+
+  /* -------------------------------------------------------------
+     2. ACCENT — one confident voice for selection, focus, primary CTA
+     ------------------------------------------------------------- */
+  --accent-50:   #EEF3FE;
+  --accent-100:  #DBE5FC;
+  --accent-200:  #B3C7F8;
+  --accent-300:  #7E9FF1;
+  --accent-400:  #4D78E8;
+  --accent-500:  #2A57D4;   /* primary */
+  --accent-600:  #1F44B0;   /* hover */
+  --accent-700:  #18378E;   /* press */
+  --accent-primary:        var(--accent-500);
+  --accent-primary-hover:  var(--accent-600);
+  --accent-primary-press:  var(--accent-700);
+  --accent-soft:           var(--accent-50);
+  --accent-soft-border:    var(--accent-200);
+
+  /* -------------------------------------------------------------
+     3. SEMANTIC STATUS — restrained, not decorative
+     ------------------------------------------------------------- */
+  --success:        #1B7B45;
+  --success-soft:   #E8F4ED;
+  --success-border: #B8DCC5;
+
+  --warning:        #B7791F;
+  --warning-soft:   #FBF4E5;
+  --warning-border: #ECD9A8;
+
+  --danger:         #C0392B;
+  --danger-soft:    #FBEAE8;
+  --danger-border:  #ECC2BE;
+
+  --info:           #2A6FDB;
+  --info-soft:      #E8F0FB;
+  --info-border:    #BAD0EF;
+
+  /* -------------------------------------------------------------
+     4. CHART — categorical, sequential, diverging
+     Designed to be distinguishable, never decorative.
+     ------------------------------------------------------------- */
+  /* Categorical — first 4 are the "everyday" set */
+  --series-1: #2E5C8A;   /* deep blue        — default primary series */
+  --series-2: #C8553D;   /* terracotta       — comparison series      */
+  --series-3: #588B6F;   /* sage             — third series           */
+  --series-4: #C39237;   /* amber            — fourth series          */
+  --series-5: #715B91;   /* muted violet                              */
+  --series-6: #3C7A89;   /* teal                                      */
+  --series-7: #A85A6F;   /* dusty rose                                */
+  --series-8: #6B7280;   /* slate / "other"                           */
+
+  /* Faded versions for multi-series focus mode */
+  --series-1-faded: #C8D3E0;
+  --series-2-faded: #ECCFC7;
+  --series-3-faded: #CDDDD2;
+  --series-4-faded: #ECDAB8;
+  --series-5-faded: #D5CCDF;
+  --series-6-faded: #C5D5D9;
+  --series-7-faded: #DEC7CE;
+  --series-8-faded: #D4D7DB;
+
+  /* Sequential (single-hue, blue) — for heatmaps / choropleths */
+  --seq-1: #EEF3FA;
+  --seq-2: #C7D6EA;
+  --seq-3: #93B0D6;
+  --seq-4: #5C89BE;
+  --seq-5: #2E5C8A;
+  --seq-6: #16345A;
+
+  /* Diverging (red ⇄ neutral ⇄ blue) — for variance, deltas */
+  --div-neg-3: #8E2A1F;
+  --div-neg-2: #C8553D;
+  --div-neg-1: #ECCFC7;
+  --div-zero:  #F4F6F8;
+  --div-pos-1: #C7D6EA;
+  --div-pos-2: #5C89BE;
+  --div-pos-3: #16345A;
+
+  /* Trend semantics (delta arrows, sparkline up/down) */
+  --trend-up:   var(--success);
+  --trend-down: var(--danger);
+  --trend-flat: var(--neutral-500);
+
+  /* Chart structure */
+  --axis-line:      var(--neutral-300);
+  --axis-label:     var(--neutral-500);
+  --gridline:       var(--neutral-150);
+  --gridline-major: var(--neutral-200);
+  --crosshair:      var(--neutral-400);
+  --null-pattern:   var(--neutral-150);  /* used as diagonal stripe fill */
+
+  /* -------------------------------------------------------------
+     5. SPACING — 4px base
+     ------------------------------------------------------------- */
+  --space-0:  0;
+  --space-1:  4px;
+  --space-2:  8px;
+  --space-3:  12px;
+  --space-4:  16px;
+  --space-5:  20px;
+  --space-6:  24px;
+  --space-8:  32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --space-20: 80px;
+
+  /* -------------------------------------------------------------
+     6. RADII — tight, never chunky
+     ------------------------------------------------------------- */
+  --radius-xs:   2px;   /* tags, dense chips                    */
+  --radius-sm:   4px;   /* buttons, inputs, tooltip             */
+  --radius-md:   6px;   /* cards, chart containers              */
+  --radius-lg:   10px;  /* modals, drawers                      */
+  --radius-pill: 999px; /* pills, segmented controls            */
+
+  /* -------------------------------------------------------------
+     7. ELEVATION — subtle layering, no heavy shadows
+     ------------------------------------------------------------- */
+  --shadow-0: none;
+  --shadow-1: 0 1px 0 0 rgba(15, 20, 27, 0.04),
+              0 1px 2px 0 rgba(15, 20, 27, 0.04);
+  --shadow-2: 0 1px 0 0 rgba(15, 20, 27, 0.04),
+              0 4px 8px -2px rgba(15, 20, 27, 0.06);
+  --shadow-3: 0 1px 0 0 rgba(15, 20, 27, 0.05),
+              0 8px 24px -4px rgba(15, 20, 27, 0.08);
+  --shadow-4: 0 1px 0 0 rgba(15, 20, 27, 0.06),
+              0 16px 40px -8px rgba(15, 20, 27, 0.12);
+
+  --focus-ring: 0 0 0 3px rgba(42, 87, 212, 0.18);
+
+  /* -------------------------------------------------------------
+     8. TYPE — Inter for UI, JetBrains Mono for numerals & code
+     ------------------------------------------------------------- */
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-numeric: 'Inter', system-ui, sans-serif;
+
+  /* Display / heading scale (page structure) */
+  --display-lg-size: 32px; --display-lg-line: 40px; --display-lg-weight: 600; --display-lg-tracking: -0.02em;
+  --display-md-size: 24px; --display-md-line: 32px; --display-md-weight: 600; --display-md-tracking: -0.015em;
+  --display-sm-size: 20px; --display-sm-line: 28px; --display-sm-weight: 600; --display-sm-tracking: -0.01em;
+
+  /* Heading scale (section structure inside pages) */
+  --h1-size: 18px;  --h1-line: 26px;  --h1-weight: 600;
+  --h2-size: 15px;  --h2-line: 22px;  --h2-weight: 600;
+  --h3-size: 13px;  --h3-line: 20px;  --h3-weight: 600;
+
+  /* Body */
+  --body-lg-size: 15px; --body-lg-line: 22px;
+  --body-md-size: 14px; --body-md-line: 20px;  /* workhorse */
+  --body-sm-size: 13px; --body-sm-line: 18px;  /* table cells, inputs */
+  --body-xs-size: 12px; --body-xs-line: 16px;  /* metadata, axis labels */
+
+  /* Label / caption — small, sometimes uppercase */
+  --label-md-size: 12px; --label-md-line: 16px; --label-md-weight: 500;
+  --label-sm-size: 11px; --label-sm-line: 14px; --label-sm-weight: 500;
+  --overline-size: 11px; --overline-line: 14px; --overline-weight: 600; --overline-tracking: 0.06em;
+
+  /* Numeric — for KPIs and big metric reads */
+  --metric-xl-size: 40px; --metric-xl-line: 44px; --metric-xl-weight: 500; --metric-xl-tracking: -0.02em;
+  --metric-lg-size: 28px; --metric-lg-line: 32px; --metric-lg-weight: 500; --metric-lg-tracking: -0.015em;
+  --metric-md-size: 20px; --metric-md-line: 24px; --metric-md-weight: 500; --metric-md-tracking: -0.01em;
+}
+
+/* ================================================================
+   Base type — semantic classes
+   ================================================================ */
+
+html, body {
+  font-family: var(--font-sans);
+  font-size: var(--body-md-size);
+  line-height: var(--body-md-line);
+  color: var(--text-primary);
+  font-feature-settings: "ss01", "cv11"; /* Inter character variants */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.display-lg { font-size: var(--display-lg-size); line-height: var(--display-lg-line); font-weight: var(--display-lg-weight); letter-spacing: var(--display-lg-tracking); color: var(--text-primary); }
+.display-md { font-size: var(--display-md-size); line-height: var(--display-md-line); font-weight: var(--display-md-weight); letter-spacing: var(--display-md-tracking); color: var(--text-primary); }
+.display-sm { font-size: var(--display-sm-size); line-height: var(--display-sm-line); font-weight: var(--display-sm-weight); letter-spacing: var(--display-sm-tracking); color: var(--text-primary); }
+
+.h1 { font-size: var(--h1-size); line-height: var(--h1-line); font-weight: var(--h1-weight); color: var(--text-primary); }
+.h2 { font-size: var(--h2-size); line-height: var(--h2-line); font-weight: var(--h2-weight); color: var(--text-primary); }
+.h3 { font-size: var(--h3-size); line-height: var(--h3-line); font-weight: var(--h3-weight); color: var(--text-primary); }
+
+.body-lg { font-size: var(--body-lg-size); line-height: var(--body-lg-line); color: var(--text-secondary); }
+.body-md { font-size: var(--body-md-size); line-height: var(--body-md-line); color: var(--text-secondary); }
+.body-sm { font-size: var(--body-sm-size); line-height: var(--body-sm-line); color: var(--text-secondary); }
+.body-xs { font-size: var(--body-xs-size); line-height: var(--body-xs-line); color: var(--text-tertiary); }
+
+.label-md { font-size: var(--label-md-size); line-height: var(--label-md-line); font-weight: var(--label-md-weight); color: var(--text-secondary); }
+.label-sm { font-size: var(--label-sm-size); line-height: var(--label-sm-line); font-weight: var(--label-sm-weight); color: var(--text-tertiary); }
+.overline {
+  font-size: var(--overline-size); line-height: var(--overline-line);
+  font-weight: var(--overline-weight); letter-spacing: var(--overline-tracking);
+  text-transform: uppercase; color: var(--text-tertiary);
+}
+
+.metric-xl { font-size: var(--metric-xl-size); line-height: var(--metric-xl-line); font-weight: var(--metric-xl-weight); letter-spacing: var(--metric-xl-tracking); color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.metric-lg { font-size: var(--metric-lg-size); line-height: var(--metric-lg-line); font-weight: var(--metric-lg-weight); letter-spacing: var(--metric-lg-tracking); color: var(--text-primary); font-variant-numeric: tabular-nums; }
+.metric-md { font-size: var(--metric-md-size); line-height: var(--metric-md-line); font-weight: var(--metric-md-weight); letter-spacing: var(--metric-md-tracking); color: var(--text-primary); font-variant-numeric: tabular-nums; }
+
+.mono { font-family: var(--font-mono); }
+.tabular { font-variant-numeric: tabular-nums; }
+
+/* ================================================================
+   Universal utilities used across previews + UI kit
+   ================================================================ */
+
+.tnum { font-variant-numeric: tabular-nums; }
+
+.surface {
+  background: var(--bg-canvas);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}

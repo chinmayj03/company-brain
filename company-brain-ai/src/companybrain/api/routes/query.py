@@ -312,6 +312,15 @@ async def query_graph(request: QueryRequest):
     if query_response.summary_md is None:
         query_response.summary_md = query_response.raw_markdown or query_response.summary
 
+    # ── Step 6: Persist conversation (ADR-0072 A1/A2/A5) ─────────────────────
+    await _persist_conversation(
+        workspace_id=str(request.workspace_id),
+        question=request.question,
+        query_response=query_response,
+        actor_id=getattr(request, "actor_id", None),
+        actor_kind=getattr(request, "actor_kind", "user"),
+    )
+
     dur = int((time.monotonic() - t0) * 1000)
     log.info(
         "[query] OK",
@@ -870,6 +879,72 @@ async def _iterative_answer(
         agent = AnswererAgent()
         response = await agent.answer(question, context)
         return response, {}
+
+
+# ── ADR-0072: conversation persistence ───────────────────────────────────────
+
+async def _persist_conversation(
+    workspace_id: str,
+    question: str,
+    query_response: QueryResponse,
+    actor_id: str | None,
+    actor_kind: str,
+) -> None:
+    """
+    Insert the completed /query call into the conversations table.
+
+    Best-effort: any exception is swallowed and logged at DEBUG level so that
+    a DB hiccup never causes /query to return an error to the caller.
+
+    Fields persisted:
+      - workspace_id  — scopes the row to the workspace
+      - question      — the raw user question (History tab)
+      - answer_md     — pre-rendered markdown blob (detail view)
+      - summary_json  — full QueryResponse as JSON (round-trip detail view)
+      - title         — first 60 chars of the question (display label)
+      - actor_id      — who asked (Audit Log tab)
+      - actor_kind    — 'user' | 'ci' | 'api' (Audit Log filter)
+    """
+    try:
+        from sqlalchemy import text as _text
+        from companybrain.db import get_session
+
+        title = question[:60]
+        answer_md = getattr(query_response, "raw_markdown", None) or getattr(
+            query_response, "summary_md", None
+        )
+        # Serialize QueryResponse to a plain dict for the JSONB column.
+        try:
+            summary_json = query_response.model_dump()
+        except AttributeError:
+            summary_json = query_response.dict()
+
+        import json as _json
+        summary_json_str = _json.dumps(summary_json)
+
+        sql = _text("""
+            INSERT INTO conversations
+                (workspace_id, question, answer_md, summary_json, title, actor_id, actor_kind)
+            VALUES
+                (:workspace_id, :question, :answer_md, :summary_json::jsonb,
+                 :title, :actor_id, :actor_kind)
+        """)
+        async with get_session() as session:
+            await session.execute(sql, {
+                "workspace_id": workspace_id,
+                "question":     question,
+                "answer_md":    answer_md,
+                "summary_json": summary_json_str,
+                "title":        title,
+                "actor_id":     actor_id,
+                "actor_kind":   actor_kind or "user",
+            })
+            await session.commit()
+
+        log.debug("[query] Conversation persisted", workspace_id=workspace_id)
+
+    except Exception as exc:
+        log.debug("[query] Conversation persistence skipped (non-fatal)", error=str(exc))
 
 
 def _load_brain_subdir(brain_root: Path, subdir: str, *, limit: int) -> list[dict]:

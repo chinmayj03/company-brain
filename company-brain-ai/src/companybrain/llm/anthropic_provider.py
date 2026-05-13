@@ -24,7 +24,7 @@ import structlog
 from anthropic import AsyncAnthropic
 
 from companybrain.llm.base import (
-    LLMProvider, TaskRole, ChatMessage, ChatResponse,
+    LLMProvider, TaskRole, ChatMessage, ChatResponse, ToolCall, ToolDefinition,
     LLMCallRecord, compute_cost_usd, log_llm_call,
 )
 from companybrain.config import settings
@@ -151,6 +151,172 @@ class AnthropicProvider(LLMProvider):
             model=model,
             role=role.value,
             task="",
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cache_read_tokens=cache_read,
+            cache_creation_tokens=cache_creation,
+            cost_usd=cost,
+            ts=datetime.now(timezone.utc).isoformat(),
+        ))
+
+        return chat_response
+
+    async def chat_with_tools(
+        self,
+        messages: list[ChatMessage],
+        tools: list[ToolDefinition],
+        role: TaskRole = TaskRole.BALANCED,
+        max_tokens: int = 2048,
+    ) -> ChatResponse:
+        """Native Anthropic tool-use over the Messages API.
+
+        Without this override the base class falls back to a text-protocol where
+        the model is asked to emit `TOOL_CALL: {json}` strings — Haiku does not
+        reliably produce that magic prefix, so HarnessLoop saw `tool_calls=[]`
+        on every turn and exited at iteration 1 without writing any entities.
+        See `.e2e-session/fixes-summary.md` for the regression trace.
+
+        This implementation:
+          • Converts the canonical ChatMessage list (incl. "tool" role results
+            from previous turns) into Anthropic's tool_use / tool_result block
+            format.
+          • Forwards the tools as Anthropic tool specs with JSON-Schema input.
+          • Parses `tool_use` blocks out of the response into ToolCall objects.
+          • Reuses the same logging + cost-tracking path as chat() so spend
+            telemetry stays consistent.
+        """
+        model = self.model_for_role(role)
+
+        # ── Split system from rest ──────────────────────────────────────────
+        system_msgs = [m for m in messages if m.role == "system"]
+        non_system  = [m for m in messages if m.role != "system"]
+        system_text = "\n\n".join(m.content for m in system_msgs) if system_msgs else None
+        system_param = (
+            [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}]
+            if system_text is not None
+            else []
+        )
+
+        # ── Convert ChatMessages → Anthropic message blocks ─────────────────
+        # Tool results carry role="tool" in our model, but Anthropic expects
+        # them as `tool_result` content blocks inside a `user` message that
+        # immediately follows the assistant turn with the matching tool_use.
+        # We batch consecutive tool messages into one user turn.
+        api_messages: list[dict] = []
+        pending_tool_results: list[dict] = []
+
+        def _flush_tool_results() -> None:
+            if pending_tool_results:
+                api_messages.append({"role": "user", "content": list(pending_tool_results)})
+                pending_tool_results.clear()
+
+        for m in non_system:
+            if m.role == "tool":
+                pending_tool_results.append({
+                    "type":        "tool_result",
+                    "tool_use_id": m.tool_call_id,
+                    "content":     m.content,
+                })
+                continue
+            _flush_tool_results()
+            if m.role == "user":
+                api_messages.append({"role": "user", "content": m.content})
+            elif m.role == "assistant":
+                blocks: list[dict] = []
+                if m.content:
+                    blocks.append({"type": "text", "text": m.content})
+                for tc in m.tool_calls:
+                    blocks.append({
+                        "type":  "tool_use",
+                        "id":    tc.call_id or f"tu_{tc.name}",
+                        "name":  tc.name,
+                        "input": tc.arguments or {},
+                    })
+                api_messages.append({"role": "assistant", "content": blocks or m.content or ""})
+        _flush_tool_results()
+
+        # ── Convert ToolDefinition → Anthropic tool spec ────────────────────
+        anthropic_tools: list[dict] = []
+        for t in tools:
+            props: dict = {}
+            required: list[str] = []
+            for p in t.parameters:
+                schema: dict = {"type": p.type, "description": p.description}
+                if p.enum:
+                    schema["enum"] = p.enum
+                props[p.name] = schema
+                if p.required:
+                    required.append(p.name)
+            anthropic_tools.append({
+                "name":         t.name,
+                "description":  t.description,
+                "input_schema": {
+                    "type":       "object",
+                    "properties": props,
+                    "required":   required,
+                },
+            })
+
+        response = await self._client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0.0,                 # deterministic tool selection
+            system=system_param,
+            messages=api_messages,
+            tools=anthropic_tools or None,
+        )
+
+        # ── Parse response blocks ───────────────────────────────────────────
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        for block in response.content:
+            btype = getattr(block, "type", None)
+            if btype == "text":
+                text_parts.append(getattr(block, "text", "") or "")
+            elif btype == "tool_use":
+                tool_calls.append(ToolCall(
+                    name=getattr(block, "name", ""),
+                    arguments=getattr(block, "input", {}) or {},
+                    call_id=getattr(block, "id", "") or "",
+                ))
+        content = "".join(text_parts)
+
+        # ── Logging + cost telemetry (identical to chat()) ──────────────────
+        cache_creation = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+        cache_read     = getattr(response.usage, "cache_read_input_tokens",     0) or 0
+        log.info(
+            "llm_call",
+            model=model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cache_read_tokens=cache_read,
+            cache_creation_tokens=cache_creation,
+            tool_calls=len(tool_calls),
+        )
+
+        chat_response = ChatResponse(
+            content=content,
+            model=model,
+            provider=self.provider_name,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cache_read_tokens=cache_read,
+            cache_creation_tokens=cache_creation,
+            tool_calls=tool_calls,
+        )
+
+        cost = compute_cost_usd(
+            self.provider_name,
+            model,
+            response.usage.input_tokens,
+            response.usage.output_tokens,
+            cache_read,
+        )
+        log_llm_call(LLMCallRecord(
+            provider=self.provider_name,
+            model=model,
+            role=role.value,
+            task="harness",
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
             cache_read_tokens=cache_read,

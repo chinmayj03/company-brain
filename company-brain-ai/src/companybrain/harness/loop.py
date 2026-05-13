@@ -300,6 +300,45 @@ class HarnessLoop:
                     result.final_text = m.content
                     break
 
+        # ── Defensive auto-finalize ─────────────────────────────────────────
+        # If the model called write_to_brain at any point but never reached
+        # finalize_brain, the buffered entities are still sitting in the
+        # JsonFileBrainStore and will be lost when the run ends. Invoke
+        # finalize_brain ourselves so the writes commit. This is purely a
+        # safety net for the "write-loop" failure mode observed in extraction
+        # runs (see .e2e-session/fixes-summary.md).
+        _names = {c.get("name") for c in result.tool_calls}
+        if "write_to_brain" in _names and "finalize_brain" not in _names:
+            log.warning(
+                "harness.auto_finalize",
+                iterations=result.iterations,
+                tool_calls=result.tool_call_count,
+                reason="write_to_brain called but finalize_brain was not",
+            )
+            try:
+                finalize_tool = TOOL_REGISTRY.get("finalize_brain")
+                if finalize_tool is not None:
+                    auto_args: dict[str, Any] = {"workspace_id": context.get("workspace_id")}
+                    auto_content, ok, err = await self._dispatch(
+                        ToolCall(name="finalize_brain", arguments=auto_args, call_id="auto_finalize"),
+                        context,
+                    )
+                    result.tool_calls.append({
+                        "name":      "finalize_brain",
+                        "arguments": auto_args,
+                        "ok":        ok,
+                        "error":     err,
+                        "auto":      True,
+                    })
+                    log.info(
+                        "harness.auto_finalize.done",
+                        ok=ok,
+                        error=err,
+                        result_preview=(auto_content or "")[:200],
+                    )
+            except Exception as exc:   # noqa: BLE001
+                log.error("harness.auto_finalize.failed", error=str(exc))
+
         # session_end hook — fires once per run, regardless of success.
         wall_time_seconds = round(time.monotonic() - started, 3)
         await self._fire_hook("session_end", {

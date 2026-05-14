@@ -239,26 +239,38 @@ async def query_graph(request: QueryRequest):
         except Exception:
             pass
 
-    # ── Step 3: Call LLM ──────────────────────────────────────────────────────
+    # ── Step 3: Call LLM (single-pass or iterative) ──────────────────────────
     t1 = time.monotonic()
     log.info("[query] Calling LLM",
              intent=intent,
+             iterative=settings.iterative_exploration_enabled,
              task_type=smart_zone_meta.get("task_type"),
              tokens_used=smart_zone_meta.get("tokens_used", 0),
              context_available=bool(assembled_context))
 
-    response = await provider.chat(
-        messages=[
-            ChatMessage(role="system", content=QUERY_SYSTEM_PROMPT),
-            ChatMessage(role="user",   content=user_content),
-        ],
-        role=TaskRole.QUERY,
-        max_tokens=4096,
-    )
+    if settings.iterative_exploration_enabled:
+        query_response, _iter_telemetry = await _iterative_answer(
+            question=request.question,
+            context=assembled_context,
+            workspace_id=str(request.workspace_id),
+            repo_path=getattr(request, "repo_path", None),
+            qdrant_index=qdrant_index,
+        )
+    else:
+        response = await provider.chat(
+            messages=[
+                ChatMessage(role="system", content=QUERY_SYSTEM_PROMPT),
+                ChatMessage(role="user",   content=user_content),
+            ],
+            role=TaskRole.QUERY,
+            max_tokens=4096,
+        )
+        query_response = _parse_llm_response(response.content, assembled_context)
+        _iter_telemetry = {}
+
     llm_dur = int((time.monotonic() - t1) * 1000)
 
-    # ── Step 4: Parse structured response ────────────────────────────────────
-    query_response = _parse_llm_response(response.content, assembled_context)
+    # ── Step 4: (response already typed) ─────────────────────────────────────
 
     # ── Step 4b: Surface per-entity sticky notes (ADR-0052 P6) ───────────────
     await _attach_notes(query_response, str(request.workspace_id))
@@ -810,6 +822,54 @@ def _attach_cross_repo_insights(response: QueryResponse, workspace_id: str) -> N
     if n:
         response.telemetry = dict(response.telemetry or {})
         response.telemetry["cross_repo_hits"] = n
+
+
+# ── ADR-0061 P1: iterative exploration helper ─────────────────────────────────
+
+async def _iterative_answer(
+    question: str,
+    context: str | None,
+    workspace_id: str,
+    repo_path: str | None,
+    qdrant_index: str,
+) -> tuple[QueryResponse, dict]:
+    """
+    Run the iterative exploration loop and return (QueryResponse, telemetry_dict).
+
+    The retrieve_fn closure captures the request-scoped parameters so
+    ExplorationLoop can call back into hybrid_retrieve during iterations.
+    Falls back to single-pass on import error or loop exception.
+    """
+    async def _retrieve(sub_query: str) -> str | None:
+        return await _hybrid_retrieve(
+            sub_query, workspace_id, repo_path, index=qdrant_index
+        )
+
+    try:
+        from companybrain.query.orchestrator import orchestrate_query
+        result = await orchestrate_query(
+            question=question,
+            context=context,
+            retrieve_fn=_retrieve,
+            persona="dev",
+        )
+        telemetry = {
+            "iterations_taken": result.iterations_taken,
+            "verifier_score": result.verifier_score,
+            "exploration_agent_invoked": result.exploration_agent_invoked,
+        }
+        log.info(
+            "[query] iterative loop done",
+            **telemetry,
+            citations=len(result.response.affected_entities),
+        )
+        return result.response, telemetry
+    except Exception as exc:
+        log.warning("[query] iterative path failed — single-pass fallback", error=str(exc))
+        from companybrain.agents.answerer_agent import AnswererAgent
+        agent = AnswererAgent()
+        response = await agent.answer(question, context)
+        return response, {}
 
 
 def _load_brain_subdir(brain_root: Path, subdir: str, *, limit: int) -> list[dict]:

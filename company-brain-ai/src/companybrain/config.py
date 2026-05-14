@@ -336,5 +336,28 @@ class Settings(BaseSettings):
     # Override via env var: BRAIN_USE_V2_SYNTHESIS=false to revert to v1.
     use_v2_synthesis: bool = True
 
+    # ── ADR-0061 P1: iterative exploration + self-verification ────────────
+    # When True, /query runs ExplorationLoop (iterative retrieve-then-answer)
+    # instead of the single-pass AnswererAgent.  Defaults to False until the
+    # acceptance gate in tests/acceptance/test_iterative_quality.py passes.
+    # Override via env var: ITERATIVE_EXPLORATION_ENABLED=true.
+    iterative_exploration_enabled: bool = False
+
+    # Hard cap on additional retrieval+answer iterations per query.
+    # Cost: ~1 QUERY-role LLM call per iteration.  Budget $15 assumes ≤3.
+    # Override via env var: ITERATIVE_MAX_ITERATIONS=3.
+    iterative_max_iterations: int = 3
+
+    # Hard cap on total additional retrieval calls across all iterations.
+    iterative_max_extra_retrieve: int = 5
+
+    # Per-call token budget for the iterative answerer's LLM calls.
+    # 12_000 leaves headroom for a large context block + structured output.
+    iterative_max_tokens_per_query: int = 12_000
+
+    # Minimum verifier score to consider an answer verified.
+    # Below this triggers a revision pass; still below → surface issues.
+    iterative_verifier_score_threshold: float = 0.6
+
 
 settings = Settings()

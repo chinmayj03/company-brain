@@ -342,6 +342,10 @@ class QueryRequest(BaseModel):
     # chosen option id. The route uses it to inject an interpretation hint into
     # the user message and skip the ambiguity detector.
     interpret: Optional[str] = Field(default=None)
+    # ADR-0072 A5 (Audit Log): who issued this query.
+    # actor_kind distinguishes human UI users from CI bots / API tokens.
+    actor_id: Optional[str] = None         # e.g. user email, service account name, or CI job ID
+    actor_kind: str = "user"              # 'user' | 'ci' | 'api'
 
 
 class LegacyQueryResponse(BaseModel):

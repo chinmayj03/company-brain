@@ -1,500 +1,520 @@
-"""ADR-0061 E1 — ExplorationAgent.
+"""
+ExplorationAgent — ADR-0061 E1.
 
-A small tool-using sub-agent that fires when SmartZoneAssembler cannot answer
-a question with high confidence (sparse zone or initial Sonnet confidence
-< 0.6). Mirrors what Claude Code does when its initial context is insufficient:
-glob + grep + read + reason, with a strict step cap.
+Fires when /query receives a low-confidence answer (confidence.level == "low").
+Runs up to MAX_ROUNDS of tool-assisted exploration, then returns a context
+string that query.py injects into a second LLM call.
 
-Design points:
+Budget: $0.10 per invocation, enforced by MAX_ROUNDS + MAX_TOOL_CALLS_PER_ROUND.
 
-* The agent uses a *new* ToolRegistry instance with a curated whitelist of six
-  tools (glob_files, grep_code, read_file, query_brain, list_callers,
-  read_git_blame). That keeps the principle of least privilege from
-  base_agent.py intact and prevents the agent from accidentally invoking
-  heavy harness tools.
-* All tools are pure read-only and synchronous. They are safe to run
-  unattended.
-* The agent caps itself at MAX_STEPS=8 tool calls (cost-cap of ~$0.01 per
-  hard query as specified in the ADR). When the cap is hit we return whatever
-  the model has produced and surface that fact in telemetry.
-* Output is free-form text; the caller is responsible for merging it back
-  into the QueryResponse summary. We do **not** synthesize JSON here —
-  /query already owns that contract.
-
-The agent intentionally does not subclass AgentLoop: its tool surface is
-disjoint from the rest of the agent fleet, so building the registry inline
-is cleaner than registering six more tools globally.
+Tools available to the agent:
+  read_file        — read any source file from the repo
+  search_entities  — hybrid search over .brain/ entities
+  get_neighbors    — Neo4j neighborhood for a URN (falls back to .brain/ scan)
+  get_callers      — callers of a method URN (Neo4j or .brain/ scan)
+  get_schema       — full entity JSON from .brain/ by URN
+  get_git_log      — recent git commits touching a file
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 import structlog
 
-from companybrain.llm import ChatMessage, TaskRole, get_provider
-from companybrain.llm.base import ToolCall, ToolDefinition, ToolParameter
+from companybrain.llm import get_provider, ChatMessage, TaskRole
+from companybrain.llm.base import ToolDefinition, ToolParameter, ToolCall
 
 log = structlog.get_logger(__name__)
 
-
-# ── Configuration ─────────────────────────────────────────────────────────────
-
-MAX_STEPS = 8                    # ADR-0061: hard cap on tool invocations.
-MAX_GLOB_RESULTS = 40            # don't flood the model with thousands of paths
-MAX_GREP_RESULTS = 60
-DEFAULT_FILE_CAP = 8000          # chars returned to the model from one read
-LOW_CONFIDENCE_THRESHOLD = 0.6   # below this, /query should fire the agent
-
-_SYSTEM_PROMPT = """\
-You are ExplorationAgent — a code-archaeology sub-agent for the company-brain
-graph. The brain's primary retrieval (SmartZoneAssembler) could not answer the
-user's question with high confidence, so you have been spawned with six
-read-only tools and a strict {max_steps}-step budget. Your job is to FIND the
-answer in source code, the brain graph, and git history, then return a
-single, citation-rich final answer.
-
-Tools (all read-only):
-  • glob_files   — list files matching a glob (e.g. "**/*.kt", "src/**/api/*.go")
-  • grep_code    — ripgrep-style content search; returns matches with file:line
-  • read_file    — read a file (or byte range) from disk
-  • query_brain  — recursively ask the company-brain pipeline a sub-question
-  • list_callers — graph: who calls this method/function URN
-  • read_git_blame — git blame summary for a file (last touchers, dates)
-
-Rules:
-  1. Plan in your head, then call ONE tool at a time. Read its result before
-     deciding the next call.
-  2. Prefer narrow tools first (grep + glob) over wide ones (read_file).
-  3. Cite every concrete claim with a file:line or URN. Do not invent paths
-     that grep_code / glob_files did not return.
-  4. When you are confident, STOP calling tools and emit the final answer as
-     plain prose. Do not wrap it in JSON or markdown fences.
-  5. If after {max_steps} steps you still cannot answer, state what you found
-     and what is still ambiguous — partial answers are useful.
-
-Repo root: {repo_root}
-Workspace: {workspace_id}
-"""
+# ── Cost / safety caps ─────────────────────────────────────────────────────────
+MAX_ROUNDS = 3
+MAX_TOOL_CALLS_PER_ROUND = 4
+MAX_FILE_CHARS = 6_000
 
 
-# ── Result envelope ───────────────────────────────────────────────────────────
+# ── Result type ────────────────────────────────────────────────────────────────
 
 @dataclass
 class ExplorationResult:
-    """Output of a single ExplorationAgent.run() invocation."""
-    text: str = ""
-    steps: int = 0
-    tool_calls: list[dict[str, Any]] = field(default_factory=list)
-    capped: bool = False                       # True if hit MAX_STEPS
-    error: Optional[str] = None                # set on hard failure
+    context: str               # additional context gathered; inject before re-query
+    citations: list[str] = field(default_factory=list)  # URNs found
+    rounds_taken: int = 0
+    tool_calls_made: int = 0
 
 
-# ── Tools ─────────────────────────────────────────────────────────────────────
+# ── Tool implementations ───────────────────────────────────────────────────────
 
-_SKIP_DIRS = {".git", ".brain", "node_modules", "target", "build", "dist",
-              ".idea", ".gradle", "__pycache__", ".venv", "venv"}
-
-
-def _glob_files(repo_root: str, pattern: str, limit: int = MAX_GLOB_RESULTS) -> list[str]:
-    """List files matching a glob, relative to repo root."""
-    root = Path(repo_root)
-    if not root.is_dir():
-        return []
-    out: list[str] = []
+def _tool_read_file(path: str, max_chars: int = MAX_FILE_CHARS) -> str:
     try:
-        for p in root.glob(pattern):
-            if not p.is_file():
-                continue
-            if any(part in _SKIP_DIRS for part in p.parts):
-                continue
-            out.append(str(p.relative_to(root)))
-            if len(out) >= limit:
-                break
-    except (OSError, ValueError) as e:
-        log.debug("exploration.glob_files failed", error=str(e))
-    return out
+        text = Path(path).read_text(errors="replace")
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n... [truncated at {max_chars} chars]"
+        return text
+    except OSError as exc:
+        return f"(error reading {path}: {exc})"
 
 
-def _grep_code(repo_root: str, pattern: str, glob: str = "",
-               limit: int = MAX_GREP_RESULTS) -> list[dict]:
-    """Ripgrep-style search; returns [{file, line, text}, ...]."""
-    cmd = ["rg", "--line-number", "--no-heading", "--max-count", "5",
-           "--max-columns", "300", "-S"]
-    if glob:
-        cmd.extend(["--glob", glob])
-    cmd.extend([pattern, repo_root])
+def _tool_search_entities(
+    query: str,
+    brain_root: str,
+    workspace_id: str,
+    top_k: int = 8,
+) -> str:
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log.debug("exploration.grep_code failed", error=str(e))
-        return []
-    results: list[dict] = []
-    for line in out.stdout.splitlines()[:limit]:
-        parts = line.split(":", 2)
-        if len(parts) >= 3:
+        from companybrain.retrieval.hybrid_search import HybridSearcher
+        from companybrain.store.identity import workspace_slug_for
+
+        slug = workspace_slug_for(workspace_id)
+        searcher = HybridSearcher(brain_root=Path(brain_root), workspace_slug=slug)
+        hits = searcher.search(query, top_k=top_k)
+        if not hits:
+            return "(no results)"
+        lines = []
+        for h in hits:
+            name = h.payload.get("qualified_name") or h.urn.split(":")[-1]
+            summary = h.payload.get("t1_summary", "")
+            lines.append(f"[{h.urn}] {name}: {summary}")
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"(search_entities error: {exc})"
+
+
+def _tool_get_schema(urn: str, brain_root: str) -> str:
+    """Return the full entity JSON from .brain/ for a URN."""
+    try:
+        root = Path(brain_root)
+        # Try index.json first
+        index_path = root / "index.json"
+        if index_path.exists():
+            index = json.loads(index_path.read_text())
+            rel = index.get(urn)
+            if rel:
+                entity_path = root / rel
+                if entity_path.exists():
+                    return entity_path.read_text()
+
+        # Fall back: scan subdirectories for a file whose content has the URN
+        for json_file in root.rglob("*.json"):
+            if json_file.parent.name == ".bm25":
+                continue
             try:
-                results.append({
-                    "file": _rel(parts[0], repo_root),
-                    "line": int(parts[1]),
-                    "text": parts[2].strip()[:240],
-                })
-            except ValueError:
+                data = json.loads(json_file.read_text())
+                if data.get("id") == urn or data.get("qualified_name") == urn.split(":")[-1]:
+                    return json.dumps(data, indent=2)
+            except (json.JSONDecodeError, OSError):
                 continue
-    return results
+        return f"(entity not found: {urn})"
+    except Exception as exc:
+        return f"(get_schema error: {exc})"
 
 
-def _read_file(path: str, repo_root: str, max_chars: int = DEFAULT_FILE_CAP,
-               start_line: int = 1, end_line: int = 0) -> str:
-    """Read a file (or line range). The agent is told to ask for ranges when
-    the file is large; we still cap at max_chars as a defensive backstop."""
-    abs_path = Path(path)
-    if not abs_path.is_absolute() and repo_root:
-        abs_path = Path(repo_root) / path
+def _tool_get_neighbors(urn: str, brain_root: str, rel_type: str = "", limit: int = 10) -> str:
+    """Get neighboring entities for a URN via Neo4j or .brain/ edge scan."""
     try:
-        content = abs_path.read_text(encoding="utf-8", errors="replace")
-    except (OSError, UnicodeDecodeError) as e:
-        return f"ERROR: could not read {path}: {e}"
-    if start_line > 1 or end_line > 0:
-        lines = content.splitlines()
-        lo = max(0, start_line - 1)
-        hi = end_line if end_line > 0 else len(lines)
-        content = "\n".join(lines[lo:hi])
-    if len(content) > max_chars:
-        content = content[:max_chars] + f"\n// ... (truncated at {max_chars} chars; ask for a smaller line range)"
-    return content
-
-
-async def _query_brain(workspace_id: str, repo_path: Optional[str],
-                       sub_question: str) -> str:
-    """Recursive call into POST /query for a focused sub-question.
-
-    This is intentionally cheap and *cannot* itself fire E1 again — the
-    nested invocation passes ``no_iterative=True`` so we don't recurse into
-    an infinite exploration loop. The brain query API tolerates the unknown
-    flag, but we also defensively cap recursion via depth tracking on the
-    HTTP layer.
-    """
-    try:
-        # Import here to avoid a hard dependency at module import time.
-        from companybrain.api.routes.query import query_graph
-        from companybrain.models.entities import QueryRequest
-
-        req = QueryRequest(
-            question=sub_question,
-            workspace_id=workspace_id,
-            repo_path=repo_path,
-            include_unverified=False,
-        )
-        # Mark the request as a nested call so /query skips iterative recursion.
+        from neo4j import GraphDatabase  # sync driver
+        neo4j_url  = os.environ.get("NEO4J_URL",      "bolt://localhost:7687")
+        neo4j_user = os.environ.get("NEO4J_USER",     "neo4j")
+        neo4j_pass = os.environ.get("NEO4J_PASSWORD", "password")
+        driver = GraphDatabase.driver(neo4j_url, auth=(neo4j_user, neo4j_pass))
         try:
-            setattr(req, "_no_iterative", True)  # noqa: SLF001 (intentional flag)
-        except Exception:
-            pass
-        resp = await query_graph(req)
-        return resp.summary or resp.raw_markdown or ""
-    except Exception as e:
-        log.debug("exploration.query_brain failed", error=str(e))
-        return f"ERROR: query_brain failed: {e}"
-
-
-async def _list_callers(workspace_id: str, urn: str) -> list[dict]:
-    """Graph traversal — who calls this URN. Uses the existing tRPC structural
-    tool when the MCP backend is reachable; falls back to empty on error."""
-    try:
-        from companybrain.mcp.tools.structural_v2 import find_callers as sv2_find_callers
-        from companybrain.mcp.trpc_client import TrpcClient
-        trpc_url = os.environ.get("TRPC_API_URL", "http://cb-api:8090/trpc")
-        trpc = TrpcClient(base_url=trpc_url)
-        try:
-            data = await sv2_find_callers(scope=workspace_id, symbol=urn, trpc=trpc)
+            with driver.session() as session:
+                if rel_type:
+                    cypher = (
+                        "MATCH (a {urn: $urn})-[r:" + rel_type + "]->(b) "
+                        "RETURN b.urn AS urn, b.qualified_name AS name, type(r) AS rel "
+                        "LIMIT $limit"
+                    )
+                else:
+                    cypher = (
+                        "MATCH (a {urn: $urn})-[r]->(b) "
+                        "RETURN b.urn AS urn, b.qualified_name AS name, type(r) AS rel "
+                        "LIMIT $limit"
+                    )
+                result = session.run(cypher, urn=urn, limit=limit)
+                rows = result.data()
+                if not rows:
+                    return "(no neighbors found)"
+                lines = [f"[{r['rel']}] {r['urn']} — {r.get('name', '')}" for r in rows]
+                return "\n".join(lines)
         finally:
-            await trpc.close()
-        callers = data.get("callers") or []
-        return [{"urn": c.get("urn", ""), "name": c.get("name", "")} for c in callers[:20]]
-    except Exception as e:
-        log.debug("exploration.list_callers failed", error=str(e))
-        return []
+            driver.close()
+    except Exception:
+        # Fallback: scan .brain/ JSON files for edges stored in metadata
+        return _neighbors_from_brain(urn, brain_root, rel_type, limit)
 
 
-def _read_git_blame(repo_root: str, file_path: str,
-                    start_line: int = 1, end_line: int = 0) -> list[dict]:
-    """Return a compact blame summary: distinct authors + last-touched dates."""
-    abs_path = Path(file_path)
-    if not abs_path.is_absolute() and repo_root:
-        abs_path = Path(repo_root) / file_path
-    if not abs_path.exists():
-        return []
-    cmd = ["git", "-C", str(abs_path.parent), "log",
-           "--pretty=format:%h|%an|%ad|%s", "--date=short", "--", str(abs_path)]
+def _tool_get_callers(urn: str, brain_root: str, limit: int = 10) -> str:
+    """Get methods that call the given URN via Neo4j or .brain/ scan."""
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
-    entries: list[dict] = []
-    for line in out.stdout.splitlines()[:30]:
-        parts = line.split("|", 3)
-        if len(parts) == 4:
-            entries.append({
-                "commit": parts[0], "author": parts[1],
-                "date": parts[2], "subject": parts[3][:120],
-            })
-    return entries
+        from neo4j import GraphDatabase
+        neo4j_url  = os.environ.get("NEO4J_URL",      "bolt://localhost:7687")
+        neo4j_user = os.environ.get("NEO4J_USER",     "neo4j")
+        neo4j_pass = os.environ.get("NEO4J_PASSWORD", "password")
+        driver = GraphDatabase.driver(neo4j_url, auth=(neo4j_user, neo4j_pass))
+        try:
+            with driver.session() as session:
+                cypher = (
+                    "MATCH (caller)-[:CALLS]->(callee {urn: $urn}) "
+                    "RETURN caller.urn AS urn, caller.qualified_name AS name "
+                    "LIMIT $limit"
+                )
+                result = session.run(cypher, urn=urn, limit=limit)
+                rows = result.data()
+                if not rows:
+                    return "(no callers found)"
+                lines = [f"{r['urn']} — {r.get('name', '')}" for r in rows]
+                return "\n".join(lines)
+        finally:
+            driver.close()
+    except Exception:
+        return _callers_from_brain(urn, brain_root, limit)
 
 
-# ── ToolDefinition builders ──────────────────────────────────────────────────
-
-def _tool_defs() -> list[ToolDefinition]:
-    return [
-        ToolDefinition(
-            name="glob_files",
-            description=(
-                "List files in the repository matching a glob pattern (relative paths). "
-                "Use to discover where a kind of file lives (e.g. '**/*.proto')."
-            ),
-            parameters=[
-                ToolParameter("pattern", "string", "Glob pattern, e.g. '**/*.kt'."),
-                ToolParameter("limit", "integer", "Max results (default 40).",
-                              required=False),
-            ],
-        ),
-        ToolDefinition(
-            name="grep_code",
-            description=(
-                "Ripgrep across the repository. Returns matches as "
-                "{file, line, text}. Use a glob to scope (e.g. '*.java')."
-            ),
-            parameters=[
-                ToolParameter("pattern", "string", "Regex or literal to search."),
-                ToolParameter("glob", "string", "Optional file glob, e.g. '*.py'.",
-                              required=False),
-            ],
-        ),
-        ToolDefinition(
-            name="read_file",
-            description=(
-                "Read a file (or a line range) from disk. Pass relative path "
-                "from the repo root, optional start_line/end_line."
-            ),
-            parameters=[
-                ToolParameter("path", "string", "Relative or absolute path."),
-                ToolParameter("start_line", "integer", "1-indexed first line.",
-                              required=False),
-                ToolParameter("end_line", "integer",
-                              "1-indexed last line (0 = end of file).",
-                              required=False),
-            ],
-        ),
-        ToolDefinition(
-            name="query_brain",
-            description=(
-                "Recursively ask the company-brain graph a focused sub-question. "
-                "Use when you need a structured answer for a smaller piece of "
-                "the puzzle. Will NOT itself trigger another exploration agent."
-            ),
-            parameters=[
-                ToolParameter("sub_question", "string", "Plain English question."),
-            ],
-        ),
-        ToolDefinition(
-            name="list_callers",
-            description=(
-                "Graph traversal: list direct callers of a method/function URN."
-            ),
-            parameters=[
-                ToolParameter("urn", "string", "Entity URN, e.g. 'urn:cb:method:...'."),
-            ],
-        ),
-        ToolDefinition(
-            name="read_git_blame",
-            description=(
-                "Compact git blame for a file — last authors, dates, commit "
-                "subjects. Use to answer 'who/when' questions."
-            ),
-            parameters=[
-                ToolParameter("file_path", "string", "Path relative to repo root."),
-            ],
-        ),
-    ]
+def _tool_get_git_log(file_path: str, limit: int = 10) -> str:
+    """Return recent git commits that touched a file."""
+    try:
+        result = subprocess.run(
+            ["git", "log", f"--max-count={limit}", "--oneline", "--", file_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return f"(git log failed: {result.stderr.strip()})"
+        output = result.stdout.strip()
+        return output if output else "(no commits found for this file)"
+    except Exception as exc:
+        return f"(get_git_log error: {exc})"
 
 
-# ── Agent ─────────────────────────────────────────────────────────────────────
+# ── Brain-file fallbacks when Neo4j is unavailable ─────────────────────────────
+
+def _neighbors_from_brain(urn: str, brain_root: str, rel_type: str, limit: int) -> str:
+    root = Path(brain_root)
+    found: list[str] = []
+    for json_file in root.rglob("*.json"):
+        if json_file.parent.name in (".bm25",) or json_file.name in ("index.json", "manifest.json"):
+            continue
+        try:
+            data = json.loads(json_file.read_text())
+            edges = data.get("edges", []) or data.get("metadata", {}).get("edges", [])
+            for edge in edges:
+                if edge.get("source") == urn or edge.get("from") == urn:
+                    if rel_type and edge.get("type", edge.get("rel", "")) != rel_type:
+                        continue
+                    target = edge.get("target") or edge.get("to", "")
+                    found.append(f"[{edge.get('type', 'EDGE')}] {target}")
+                    if len(found) >= limit:
+                        return "\n".join(found)
+        except (json.JSONDecodeError, OSError):
+            continue
+    return "\n".join(found) if found else "(no neighbors found — Neo4j unavailable)"
+
+
+def _callers_from_brain(urn: str, brain_root: str, limit: int) -> str:
+    root = Path(brain_root)
+    found: list[str] = []
+    for json_file in root.rglob("*.json"):
+        if json_file.parent.name in (".bm25",) or json_file.name in ("index.json", "manifest.json"):
+            continue
+        try:
+            data = json.loads(json_file.read_text())
+            edges = data.get("edges", []) or data.get("metadata", {}).get("edges", [])
+            for edge in edges:
+                if edge.get("type", edge.get("rel", "")) == "CALLS" and edge.get("target") == urn:
+                    caller_urn = edge.get("source") or edge.get("from", "")
+                    found.append(caller_urn)
+                    if len(found) >= limit:
+                        return "\n".join(found)
+        except (json.JSONDecodeError, OSError):
+            continue
+    return "\n".join(found) if found else "(no callers found — Neo4j unavailable)"
+
+
+# ── Tool schema definitions ────────────────────────────────────────────────────
+
+_EXPLORATION_TOOLS: list[ToolDefinition] = [
+    ToolDefinition(
+        name="read_file",
+        description=(
+            "Read the source code of a file. Use when you need to understand "
+            "what a class, module, or function does in detail."
+        ),
+        parameters=[
+            ToolParameter("path", "string", "Absolute path to the file to read"),
+            ToolParameter("max_chars", "integer",
+                          f"Max characters to return (default {MAX_FILE_CHARS})", required=False),
+        ],
+    ),
+    ToolDefinition(
+        name="search_entities",
+        description=(
+            "Hybrid BM25 + semantic search over .brain/ entities. "
+            "Returns URNs, names, and summaries. "
+            "Use to find relevant entities when you have a keyword or concept."
+        ),
+        parameters=[
+            ToolParameter("query", "string", "Natural-language or keyword search query"),
+            ToolParameter("top_k", "integer", "Maximum results (default 8)", required=False),
+        ],
+    ),
+    ToolDefinition(
+        name="get_neighbors",
+        description=(
+            "Get entities directly connected to a URN in the knowledge graph. "
+            "Use to explore what a component depends on or exposes."
+        ),
+        parameters=[
+            ToolParameter("urn", "string", "URN of the entity to expand"),
+            ToolParameter("rel_type", "string",
+                          "Optional edge type filter (e.g. CALLS, IMPLEMENTS)", required=False),
+            ToolParameter("limit", "integer", "Max neighbors to return (default 10)", required=False),
+        ],
+    ),
+    ToolDefinition(
+        name="get_callers",
+        description=(
+            "Find all methods or components that call the given URN. "
+            "Use to understand who depends on a function or API."
+        ),
+        parameters=[
+            ToolParameter("urn", "string", "URN of the entity to find callers for"),
+            ToolParameter("limit", "integer", "Max callers to return (default 10)", required=False),
+        ],
+    ),
+    ToolDefinition(
+        name="get_schema",
+        description=(
+            "Retrieve the full brain entity JSON for a URN from .brain/. "
+            "Includes code snippet, summary, edges, and metadata."
+        ),
+        parameters=[
+            ToolParameter("urn", "string", "URN of the entity"),
+        ],
+    ),
+    ToolDefinition(
+        name="get_git_log",
+        description=(
+            "Get recent git commits that touched a file. "
+            "Use to understand change history and contributor intent."
+        ),
+        parameters=[
+            ToolParameter("file_path", "string", "Absolute or repo-relative path to the file"),
+            ToolParameter("limit", "integer", "Max commits (default 10)", required=False),
+        ],
+    ),
+]
+
+_SYSTEM_PROMPT = """\
+You are an exploration agent. Your job is to gather evidence that will help \
+answer a user question that received a low-confidence initial answer.
+
+You have tools to read files, search entities, traverse the knowledge graph, \
+and inspect git history. Use them strategically — each tool call costs tokens.
+
+After gathering evidence, output a JSON object:
+{
+  "findings": "<concise summary of what you found — 200-400 words>",
+  "key_entities": ["urn:cb:...", ...],
+  "confidence_boost": "<why the new context should improve the answer>"
+}
+
+Return ONLY the JSON — no prose before or after.\
+"""
+
+
+# ── Main agent ─────────────────────────────────────────────────────────────────
 
 class ExplorationAgent:
-    """Tool-using sub-agent invoked by /query on hard questions.
-
-    Usage:
-        agent = ExplorationAgent(workspace_id="...", repo_path="/abs/path")
-        result = await agent.run("which 4 places use a literal 'lob'?")
     """
+    Iterative exploration sub-agent for hard queries (ADR-0061 E1).
 
-    ROLE: TaskRole = TaskRole.BALANCED          # Sonnet — needs reasoning quality.
+    Call .explore(question, initial_summary) to get an ExplorationResult
+    whose .context field can be prepended to a second LLM call.
+    """
 
     def __init__(
         self,
-        *,
-        workspace_id: str,
-        repo_path: Optional[str] = None,
-        max_steps: int = MAX_STEPS,
-    ) -> None:
-        self.workspace_id = workspace_id
-        self.repo_root = self._resolve_repo_root(repo_path)
-        self.max_steps = max_steps
-        self._provider = get_provider()
-        self._tools = _tool_defs()
-        self._dispatch: dict[str, Callable] = {
-            "glob_files":      self._t_glob,
-            "grep_code":       self._t_grep,
-            "read_file":       self._t_read,
-            "query_brain":     self._t_query_brain,
-            "list_callers":    self._t_list_callers,
-            "read_git_blame":  self._t_blame,
-        }
-
-    async def run(self, question: str) -> ExplorationResult:
-        """Drive the ReAct loop. Returns the final text and call telemetry."""
-        system = _SYSTEM_PROMPT.format(
-            max_steps=self.max_steps,
-            repo_root=self.repo_root or "(unknown)",
-            workspace_id=self.workspace_id,
+        repo_path: str | None = None,
+        workspace_id: str = "",
+        brain_root: str | None = None,
+    ):
+        self.repo_path   = repo_path or os.environ.get("BRAIN_REPO_ROOT", "")
+        self.workspace_id = workspace_id or os.environ.get("BRAIN_WORKSPACE_ID", "")
+        self.brain_root  = brain_root or (
+            str(Path(self.repo_path) / ".brain") if self.repo_path else ""
         )
-        messages: list[ChatMessage] = [
-            ChatMessage(role="system", content=system),
-            ChatMessage(role="user", content=question),
-        ]
-        result = ExplorationResult()
+        self._provider = get_provider()
 
-        for step in range(1, self.max_steps + 1):
-            result.steps = step
-            try:
-                response = await self._provider.chat_with_tools(
-                    messages=messages,
-                    tools=self._tools,
-                    role=self.ROLE,
-                    max_tokens=1500,
-                )
-            except Exception as e:
-                log.warning("exploration_agent.chat_failed",
-                            step=step, error=str(e))
-                result.error = str(e)
-                break
+    # ── Public interface ───────────────────────────────────────────────────────
+
+    async def explore(self, question: str, initial_summary: str) -> ExplorationResult:
+        """
+        Run up to MAX_ROUNDS exploration rounds.
+        Returns gathered context + cited URNs.
+        """
+        user_msg = (
+            f"ORIGINAL QUESTION:\n{question}\n\n"
+            f"INITIAL ANSWER (low confidence):\n{initial_summary}\n\n"
+            "Use your tools to gather additional evidence. "
+            "Focus on entities, files, or relationships that the initial answer missed."
+        )
+
+        messages: list[ChatMessage] = [
+            ChatMessage(role="system", content=_SYSTEM_PROMPT),
+            ChatMessage(role="user",   content=user_msg),
+        ]
+
+        tool_calls_made = 0
+        rounds_done = 0
+
+        for round_num in range(MAX_ROUNDS):
+            rounds_done = round_num + 1
+
+            response = await self._provider.chat_with_tools(
+                messages=messages,
+                tools=_EXPLORATION_TOOLS,
+                role=TaskRole.BALANCED,
+                max_tokens=2048,
+            )
+
+            log.debug(
+                "[exploration] round",
+                round=round_num + 1,
+                wants_tool_call=response.wants_tool_call,
+                tool_calls=[tc.name for tc in response.tool_calls],
+            )
 
             if not response.wants_tool_call:
-                result.text = (response.content or "").strip()
-                log.info("exploration_agent.done",
-                         steps=step, output_len=len(result.text))
-                return result
+                # Agent produced its final synthesis
+                return self._parse_result(
+                    response.content,
+                    rounds_taken=rounds_done,
+                    tool_calls_made=tool_calls_made,
+                )
 
+            # Append assistant turn
             messages.append(ChatMessage(
                 role="assistant",
                 content=response.content or "",
                 tool_calls=response.tool_calls,
             ))
 
+            # Execute tool calls (cap per round)
+            calls_this_round = 0
             for tc in response.tool_calls:
-                tool_text = await self._execute(tc)
-                result.tool_calls.append({
-                    "step": step,
-                    "tool": tc.name,
-                    "args": tc.arguments,
-                    "preview": tool_text[:160],
-                })
+                if calls_this_round >= MAX_TOOL_CALLS_PER_ROUND:
+                    break
+                result_text = await asyncio.get_event_loop().run_in_executor(
+                    None, self._execute_tool, tc
+                )
+                log.debug(
+                    "[exploration] tool result",
+                    tool=tc.name,
+                    result_len=len(result_text),
+                    preview=result_text[:100],
+                )
                 messages.append(ChatMessage(
                     role="tool",
-                    content=tool_text,
+                    content=result_text,
                     tool_call_id=tc.call_id,
                 ))
+                tool_calls_made += 1
+                calls_this_round += 1
 
-        # Step cap hit — salvage the last assistant text we saw.
-        result.capped = True
-        last = next(
-            (m.content for m in reversed(messages)
-             if m.role == "assistant" and m.content),
-            "",
+        # Max rounds reached — ask for synthesis
+        messages.append(ChatMessage(
+            role="user",
+            content="Summarise your findings now. Return the JSON result.",
+        ))
+        final = await self._provider.chat_with_tools(
+            messages=messages,
+            tools=_EXPLORATION_TOOLS,
+            role=TaskRole.BALANCED,
+            max_tokens=1024,
         )
-        result.text = last.strip()
-        log.info("exploration_agent.capped",
-                 steps=result.steps, salvaged_len=len(result.text))
-        return result
+        return self._parse_result(
+            final.content,
+            rounds_taken=rounds_done,
+            tool_calls_made=tool_calls_made,
+        )
 
-    # ── tool dispatch (sync wrappers serialise to text for the LLM) ────────
+    # ── Tool dispatch ──────────────────────────────────────────────────────────
 
-    async def _execute(self, tc: ToolCall) -> str:
-        fn = self._dispatch.get(tc.name)
-        if fn is None:
-            return json.dumps({"error": f"unknown tool: {tc.name}"})
+    def _execute_tool(self, tc: ToolCall) -> str:
+        args: dict[str, Any] = tc.arguments or {}
         try:
-            output = await fn(**(tc.arguments or {}))
-        except TypeError as e:
-            return json.dumps({"error": f"bad arguments: {e}"})
-        except Exception as e:
-            log.warning("exploration_agent.tool_failed",
-                        tool=tc.name, error=str(e))
-            return json.dumps({"error": str(e)})
-        if isinstance(output, str):
-            return output
-        return json.dumps(output, ensure_ascii=False, default=str)
+            if tc.name == "read_file":
+                return _tool_read_file(
+                    path=str(args.get("path", "")),
+                    max_chars=int(args.get("max_chars", MAX_FILE_CHARS)),
+                )
+            if tc.name == "search_entities":
+                return _tool_search_entities(
+                    query=str(args.get("query", "")),
+                    brain_root=self.brain_root,
+                    workspace_id=self.workspace_id,
+                    top_k=int(args.get("top_k", 8)),
+                )
+            if tc.name == "get_neighbors":
+                return _tool_get_neighbors(
+                    urn=str(args.get("urn", "")),
+                    brain_root=self.brain_root,
+                    rel_type=str(args.get("rel_type", "")),
+                    limit=int(args.get("limit", 10)),
+                )
+            if tc.name == "get_callers":
+                return _tool_get_callers(
+                    urn=str(args.get("urn", "")),
+                    brain_root=self.brain_root,
+                    limit=int(args.get("limit", 10)),
+                )
+            if tc.name == "get_schema":
+                return _tool_get_schema(
+                    urn=str(args.get("urn", "")),
+                    brain_root=self.brain_root,
+                )
+            if tc.name == "get_git_log":
+                return _tool_get_git_log(
+                    file_path=str(args.get("file_path", "")),
+                    limit=int(args.get("limit", 10)),
+                )
+            return json.dumps({"error": f"Unknown tool: {tc.name}"})
+        except Exception as exc:
+            log.warning("[exploration] tool error", tool=tc.name, error=str(exc))
+            return json.dumps({"error": str(exc)})
 
-    async def _t_glob(self, pattern: str, limit: int = MAX_GLOB_RESULTS) -> list[str]:
-        if not self.repo_root:
-            return []
-        return _glob_files(self.repo_root, pattern, limit=limit)
-
-    async def _t_grep(self, pattern: str, glob: str = "") -> list[dict]:
-        if not self.repo_root:
-            return []
-        return _grep_code(self.repo_root, pattern, glob=glob)
-
-    async def _t_read(self, path: str, start_line: int = 1, end_line: int = 0) -> str:
-        return _read_file(path, self.repo_root or "",
-                          max_chars=DEFAULT_FILE_CAP,
-                          start_line=start_line, end_line=end_line)
-
-    async def _t_query_brain(self, sub_question: str) -> str:
-        return await _query_brain(self.workspace_id, self.repo_root, sub_question)
-
-    async def _t_list_callers(self, urn: str) -> list[dict]:
-        return await _list_callers(self.workspace_id, urn)
-
-    async def _t_blame(self, file_path: str) -> list[dict]:
-        if not self.repo_root:
-            return []
-        return _read_git_blame(self.repo_root, file_path)
-
-    # ── helpers ────────────────────────────────────────────────────────────
+    # ── Output parsing ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _resolve_repo_root(repo_path: Optional[str]) -> Optional[str]:
-        if repo_path and Path(repo_path).is_dir():
-            return str(Path(repo_path).resolve())
-        env = os.environ.get("BRAIN_REPO_ROOT") or os.environ.get("BRAIN_ROOT")
-        if env and Path(env).is_dir():
-            return str(Path(env).resolve())
-        return None
+    def _parse_result(text: str, rounds_taken: int, tool_calls_made: int) -> ExplorationResult:
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
-
-def _rel(path: str, root: str) -> str:
-    """Best-effort: render absolute path relative to root for readability."""
-    try:
-        return str(Path(path).resolve().relative_to(Path(root).resolve()))
-    except (ValueError, OSError):
-        return path
-
-
-# ── Public helper for /query ──────────────────────────────────────────────────
-
-def should_fire(initial_confidence: float, zone_tokens_used: int,
-                low_confidence_threshold: float = LOW_CONFIDENCE_THRESHOLD) -> bool:
-    """Decision rule for whether /query should invoke the agent.
-
-    Fires when:
-      - initial Sonnet confidence < threshold, OR
-      - the smart-zone produced essentially no context (< 200 tokens).
-    """
-    if zone_tokens_used < 200:
-        return True
-    return initial_confidence < low_confidence_threshold
+        try:
+            data = json.loads(text.strip())
+            findings  = data.get("findings", text)
+            key_urns  = data.get("key_entities", [])
+            boost     = data.get("confidence_boost", "")
+            context   = f"## Exploration Findings\n\n{findings}"
+            if boost:
+                context += f"\n\n**Why this helps:** {boost}"
+            return ExplorationResult(
+                context=context,
+                citations=[u for u in key_urns if isinstance(u, str)],
+                rounds_taken=rounds_taken,
+                tool_calls_made=tool_calls_made,
+            )
+        except json.JSONDecodeError:
+            # Agent returned prose — still useful as context
+            return ExplorationResult(
+                context=f"## Exploration Findings\n\n{text}",
+                rounds_taken=rounds_taken,
+                tool_calls_made=tool_calls_made,
+            )

@@ -42,10 +42,17 @@ MAX_FILE_CHARS = 6_000
 
 @dataclass
 class ExplorationResult:
-    context: str               # additional context gathered; inject before re-query
+    # E1 fields (used by ExplorationAgent.explore() and query.py)
+    context: str = ""          # additional context gathered; inject before re-query
     citations: list[str] = field(default_factory=list)  # URNs found
     rounds_taken: int = 0
     tool_calls_made: int = 0
+    # P1 compat fields (used by test_iterative_patterns.py / PR #69 tests)
+    text: str = ""
+    steps: int = 0
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    capped: bool = False
+    error: str | None = None
 
 
 # ── Tool implementations ───────────────────────────────────────────────────────
@@ -518,3 +525,65 @@ class ExplorationAgent:
                 rounds_taken=rounds_taken,
                 tool_calls_made=tool_calls_made,
             )
+
+
+# ── ADR-0061 P1 compatibility shims ─────────────────────────────────────────
+# test_iterative_patterns.py (merged via PR #69) uses the P1 synchronous API.
+# Expose thin wrappers so both test files coexist on the same module.
+
+LOW_CONFIDENCE_THRESHOLD = 0.6
+MAX_STEPS = MAX_ROUNDS * MAX_TOOL_CALLS_PER_ROUND
+
+_SKIP_DIRS = {".git", ".brain", "node_modules", "target", "build", "dist",
+              ".idea", ".gradle", "__pycache__", ".venv", "venv"}
+
+
+def _glob_files(repo_root: str, pattern: str, limit: int = 40) -> list[str]:
+    root = Path(repo_root)
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    try:
+        for p in root.glob(pattern):
+            if any(skip in p.parts for skip in _SKIP_DIRS):
+                continue
+            out.append(str(p.relative_to(root)))
+            if len(out) >= limit:
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _grep_code(repo_root: str, pattern: str, glob: str = "",
+               limit: int = 60) -> list[str]:
+    cmd = ["grep", "-rn", "--include", glob or "*", pattern, "."]
+    try:
+        result = subprocess.run(
+            cmd, cwd=repo_root, capture_output=True, text=True, timeout=10
+        )
+        lines = result.stdout.splitlines()
+        return lines[:limit]
+    except Exception:
+        return []
+
+
+def _read_file(path: str, repo_root: str = "", max_chars: int = 8000,
+               **_kwargs) -> str:
+    full = Path(repo_root) / path if repo_root else Path(path)
+    try:
+        text = full.read_text(errors="replace")
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n... [truncated at {max_chars} chars]"
+        return text
+    except OSError as exc:
+        return f"(error reading {path}: {exc})"
+
+
+def should_fire(initial_confidence: float, zone_tokens_used: int,
+                sparse_threshold: int = 500) -> bool:
+    if initial_confidence < LOW_CONFIDENCE_THRESHOLD:
+        return True
+    if zone_tokens_used < sparse_threshold:
+        return True
+    return False

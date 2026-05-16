@@ -30,7 +30,7 @@ from typing import Any
 EXAMPLES: list[dict[str, Any]] = [
     # 1 — Simple GET handler behind auth filter
     {
-        "i": "GET /payers/{id}; getPayer(Long id)",
+        "i": "GET /payers/{id}",
         "o": {
             "is_idempotent": True,
             "null_handling": {"id": "throws"},
@@ -41,7 +41,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 2 — Repository SELECT with filters
     {
-        "i": "Repo List<X> findByLob(String lob)",
+        "i": "Repo findByLob(String lob)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"lob": "unchecked"},
@@ -51,7 +51,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 3 — Repository UPSERT
     {
-        "i": "Repo upsertPayer(Payer p); ON CONFLICT DO UPDATE",
+        "i": "Repo upsertPayer(Payer); ON CONFLICT DO UPDATE",
         "o": {
             "is_idempotent": True,
             "null_handling": {"p": "throws"},
@@ -61,7 +61,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 4 — Complex CTE method (network-iq motivating example)
     {
-        "i": "getPayerCompetitors(base, req); LATERAL unnest + asMaterialized",
+        "i": "getPayerCompetitors; LATERAL unnest+asMaterialized",
         "o": {
             "is_idempotent": True,
             "null_handling": {"base": "throws", "req": "tolerates"},
@@ -75,7 +75,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 5 — DTO setter
     {
-        "i": "DTO setter void setLob(String lob)",
+        "i": "DTO setLob(String lob)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"lob": "tolerates"},
@@ -85,7 +85,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 6 — @PreAuthorize controller
     {
-        "i": "Controller @PreAuthorize(\"hasRole('ADMIN')\") deletePayer(Long id)",
+        "i": "Ctrl @PreAuthorize(\"hasRole('ADMIN')\") deletePayer(id)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"id": "throws"},
@@ -96,7 +96,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 7 — Method with no null check (NPE risk)
     {
-        "i": "Service computeScore(Payer p) { return p.getName().length(); }",
+        "i": "computeScore(Payer p){p.getName().length()}",
         "o": {
             "is_idempotent": True,
             "null_handling": {"p": "unchecked"},
@@ -106,7 +106,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 8 — @Transactional(readOnly=true)
     {
-        "i": "@Transactional(readOnly=true) List<X> listAll()",
+        "i": "@Transactional(readOnly) listAll()",
         "o": {
             "is_idempotent": True,
             "transaction_mode": "read_only",
@@ -115,7 +115,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 9 — Loop-with-DB-call (N+1)
     {
-        "i": "for (Id id : ids) repo.findById(id); — no batch fetch",
+        "i": "for(id:ids) repo.findById(id); no batch",
         "o": {
             "is_idempotent": True,
             "null_handling": {"ids": "unchecked"},
@@ -126,7 +126,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 10 — Literal-instead-of-constant
     {
-        "i": "filter.put(\"lob\", value); // should be JsonKeyMapping.LOB",
+        "i": "filter.put(\"lob\",v); use JsonKeyMapping.LOB",
         "o": {
             "is_idempotent": True,
             "performance_class": "O(1)",
@@ -135,7 +135,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 11 — Async DB write
     {
-        "i": "CompletableFuture<Void> enqueueAudit(Event e); persists then publishes",
+        "i": "Future<Void> enqueueAudit(Event); persist+publish",
         "o": {
             "is_idempotent": False,
             "null_handling": {"e": "throws"},
@@ -145,7 +145,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 12 — Error handler @ExceptionHandler
     {
-        "i": "@ExceptionHandler(NotFound.class) ResponseEntity handle(NotFound ex)",
+        "i": "@ExceptionHandler(NotFound) handle(ex)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"ex": "checked"},
@@ -156,7 +156,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 13 — Public health endpoint
     {
-        "i": "Controller @GetMapping(\"/health\") @PermitAll healthCheck()",
+        "i": "Ctrl @GetMapping('/health') @PermitAll",
         "o": {
             "is_idempotent": True,
             "transaction_mode": "no_transaction",
@@ -176,7 +176,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 15 — Mutation DELETE
     {
-        "i": "Repository void deleteByPayerId(Long id)",
+        "i": "Repo deleteByPayerId(Long id)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"id": "throws"},
@@ -186,7 +186,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 16 — INSERT (not idempotent)
     {
-        "i": "Repository Long createClaim(Claim c); INSERT INTO claims...",
+        "i": "Repo createClaim(Claim); INSERT",
         "o": {
             "is_idempotent": False,
             "null_handling": {"c": "throws"},
@@ -196,7 +196,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 17 — Pure mapper (function)
     {
-        "i": "static PayerDto toDto(Payer p) { return new PayerDto(p.id, p.name); }",
+        "i": "static toDto(Payer)->PayerDto(p.id,p.name)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"p": "unchecked"},
@@ -207,7 +207,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 18 — Method with @NotNull params (checked at boundary)
     {
-        "i": "void track(@NotNull String event, @NotNull Map<String,String> props)",
+        "i": "track(@NotNull event, @NotNull Map props)",
         "o": {
             "is_idempotent": False,
             "null_handling": {"event": "throws", "props": "throws"},
@@ -217,7 +217,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 19 — Unbounded recursion / traversal
     {
-        "i": "List<Node> walk(Node n) { /* recurses without depth cap */ }",
+        "i": "walk(Node n); unbounded recursion",
         "o": {
             "is_idempotent": True,
             "null_handling": {"n": "throws"},
@@ -227,7 +227,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 20 — Binary-search style
     {
-        "i": "int findIndex(int[] sorted, int target)",
+        "i": "findIndex(int[] sorted, int target)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"sorted": "unchecked", "target": "tolerates"},
@@ -237,7 +237,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 21 — Sort-then-iterate
     {
-        "i": "List<X> rank(List<X> xs) { xs.sort(...); return xs; }",
+        "i": "rank(List<X>){xs.sort(...);return xs}",
         "o": {
             "is_idempotent": True,
             "null_handling": {"xs": "throws"},
@@ -248,7 +248,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 22 — Nested loop matrix op
     {
-        "i": "double[][] mul(double[][] a, double[][] b)",
+        "i": "mul(double[][] a, double[][] b)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"a": "unchecked", "b": "unchecked"},
@@ -257,7 +257,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 23 — @RolesAllowed("PAYER_ADMIN")
     {
-        "i": "Controller @RolesAllowed(\"PAYER_ADMIN\") rebuildIndex()",
+        "i": "Ctrl @RolesAllowed(\"PAYER_ADMIN\") rebuildIndex()",
         "o": {
             "is_idempotent": True,
             "transaction_mode": "read_write",
@@ -267,7 +267,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 24 — Broad exception catch
     {
-        "i": "try { svc.call(); } catch (Exception e) { log.warn(...); }",
+        "i": "try{svc.call();}catch(Exception e){log.warn();}",
         "o": {
             "is_idempotent": True,
             "performance_class": "O(1)",
@@ -276,7 +276,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 25 — SELECT FOR UPDATE
     {
-        "i": "Repository @Query(\"SELECT ... FOR UPDATE\") lockRow(Long id)",
+        "i": "Repo @Query(\"SELECT...FOR UPDATE\") lockRow(id)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"id": "throws"},
@@ -287,7 +287,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 26 — Scheduled job
     {
-        "i": "@Scheduled(cron=\"0 */5 * * *\") void rollupMetrics()",
+        "i": "@Scheduled(cron) rollupMetrics()",
         "o": {
             "is_idempotent": True,
             "transaction_mode": "read_write",
@@ -297,7 +297,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 27 — Webhook signature verifier
     {
-        "i": "boolean verifySig(byte[] payload, String sig, String secret)",
+        "i": "verifySig(payload, sig, secret)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"payload": "throws", "sig": "throws", "secret": "throws"},
@@ -308,7 +308,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 28 — Cache-aside read
     {
-        "i": "X getX(Long id); cache.get(id, k -> repo.findById(k))",
+        "i": "getX(id); cache.get(id,k->repo.findById(k))",
         "o": {
             "is_idempotent": True,
             "null_handling": {"id": "throws"},
@@ -319,7 +319,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 29 — Fan-out HTTP calls
     {
-        "i": "List<R> fanOut(List<Url> urls) { for (u : urls) http.get(u); }",
+        "i": "fanOut(List<Url>); serial http.get per url",
         "o": {
             "is_idempotent": True,
             "null_handling": {"urls": "throws"},
@@ -329,7 +329,7 @@ EXAMPLES: list[dict[str, Any]] = [
     },
     # 30 — Builder/fluent setter
     {
-        "i": "Builder withLob(String lob) { this.lob = lob; return this; }",
+        "i": "Builder withLob(String lob)",
         "o": {
             "is_idempotent": True,
             "null_handling": {"lob": "tolerates"},

@@ -54,7 +54,12 @@ def _all_branches(repo_path: str) -> list[str]:
         return ["main"]
 
 
-def _repo_from_path(repo_id: str, repo_path: str, last_synced_at: str | None = None) -> Repo:
+def _repo_from_path(
+    repo_id: str,
+    repo_path: str,
+    last_synced_at: str | None = None,
+    entity_count: int = 0,
+) -> Repo:
     path_obj = Path(repo_path)
     exists = path_obj.exists()
     current = _current_branch(repo_path) if exists else "main"
@@ -65,7 +70,7 @@ def _repo_from_path(repo_id: str, repo_path: str, last_synced_at: str | None = N
         default_branch=current,
         current_branch=current,
         last_synced_at=last_synced_at,
-        entity_count=0,
+        entity_count=entity_count,
         sync_status="ok" if exists else "error",
     )
 
@@ -120,6 +125,7 @@ async def list_repos(workspace_id: str) -> list[Repo]:
                     r.get("id", f"repo-{i}"),
                     r["repo_path"],
                     r.get("last_synced_at"),
+                    r.get("entity_count", 0),
                 )
                 for i, r in enumerate(repos)
                 if "repo_path" in r

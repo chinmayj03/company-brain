@@ -24,4 +24,15 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code worktrees and session artifacts
 .claude/worktrees/
+.e2e-session/
+
+# Python build artifacts
+*.egg-info/
+
+# Local implementation prompts and planning docs (not for repo)
+docs/adrs/SONNET-IMPLEMENTATION-PROMPT-*.md
+docs/adrs/IMPLEMENTATION-ORDER-V3.md
+docs/adrs/PARALLEL-EXECUTION-PLAN-DEMO-SPRINT.md

@@ -90,6 +90,10 @@ doctor:
 	@echo "  target repo: $(TARGET_REPO)"
 	@echo "  workspace:   $(WORKSPACE_ID) ($(WORKSPACE_SLUG))"
 	@echo "  cost cap:    \$$$(COST_CAP)"
+	@echo ""
+	@AI_PORT=$(AI_PORT) JAVA_PORT=$(JAVA_PORT) \
+	  WORKSPACE_ID=$(WORKSPACE_ID) TARGET_REPO=$(TARGET_REPO) \
+	  python3 scripts/demo_gate.py
 
 # ── Cost / config guards ──────────────────────────────────────────────────────
 .PHONY: guard

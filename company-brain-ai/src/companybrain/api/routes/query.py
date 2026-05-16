@@ -34,6 +34,7 @@ import httpx
 
 from companybrain.llm import get_provider, TaskRole, ChatMessage
 from companybrain.models.entities import QueryRequest
+from companybrain.agents.exploration_agent import ExplorationAgent
 from companybrain.models.query_response import (
     Confidence,
     QueryResponse,
@@ -211,6 +212,20 @@ async def query_graph(request: QueryRequest):
     # ── Step 4: Parse structured response ────────────────────────────────────
     query_response = _parse_llm_response(response.content, assembled_context)
 
+    # ── Step 4a: ADR-0061 E1 — Exploration Agent on low-confidence answers ───
+    # When the initial answer has low confidence, spawn ExplorationAgent to
+    # gather additional context, then re-run the LLM with the enriched prompt.
+    # This is a transparent post-processor: the caller always gets one response.
+    if query_response.confidence.level == "low":
+        query_response = await _run_exploration_agent(
+            request=request,
+            initial_response=query_response,
+            assembled_context=assembled_context,
+            user_content=user_content,
+            intent=intent,
+            provider=provider,
+        )
+
     # ── Step 4b: Surface per-entity sticky notes (ADR-0052 P6) ───────────────
     await _attach_notes(query_response, str(request.workspace_id))
 
@@ -304,6 +319,98 @@ async def query_graph_stream(request: QueryRequest):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
+# ── ADR-0061 E1: Exploration Agent post-processor ─────────────────────────────
+
+async def _run_exploration_agent(
+    request,
+    initial_response: QueryResponse,
+    assembled_context: str | None,
+    user_content: str,
+    intent: str,
+    provider=None,
+) -> QueryResponse:
+    """
+    Fire ExplorationAgent when the initial answer has low confidence.
+
+    1. Run ExplorationAgent to gather additional context (max 3 rounds / $0.10).
+    2. Re-run the LLM with original context + exploration findings prepended.
+    3. Return the enriched QueryResponse with telemetry fields set.
+
+    Falls back to the initial_response on any error so /query stays available.
+    """
+    try:
+        repo_path    = getattr(request, "repo_path", None)
+        workspace_id = str(request.workspace_id)
+
+        agent = ExplorationAgent(
+            repo_path=repo_path,
+            workspace_id=workspace_id,
+        )
+
+        log.info(
+            "[query/exploration] Low confidence — starting exploration",
+            workspace_id=workspace_id,
+            question=request.question[:100],
+        )
+
+        result = await agent.explore(
+            question=request.question,
+            initial_summary=initial_response.summary,
+        )
+
+        log.info(
+            "[query/exploration] Exploration complete",
+            rounds=result.rounds_taken,
+            tool_calls=result.tool_calls_made,
+            context_len=len(result.context),
+        )
+
+        if not result.context.strip():
+            # Nothing found — return original with telemetry flag
+            initial_response.telemetry = {
+                "exploration_agent_invoked": True,
+                "exploration_rounds": result.rounds_taken,
+                "exploration_tool_calls": result.tool_calls_made,
+                "exploration_context_empty": True,
+            }
+            return initial_response
+
+        # Re-run LLM with enriched context
+        enriched_content = (
+            f"{result.context}\n\n"
+            f"---\n\n"
+            f"{user_content}"
+        )
+
+        _provider = provider or get_provider()
+        enriched_response = await _provider.chat(
+            messages=[
+                ChatMessage(role="system", content=QUERY_SYSTEM_PROMPT),
+                ChatMessage(role="user",   content=enriched_content),
+            ],
+            role=TaskRole.QUERY,
+            max_tokens=4096,
+        )
+
+        new_response = _parse_llm_response(enriched_response.content, assembled_context)
+        new_response.telemetry = {
+            "exploration_agent_invoked": True,
+            "exploration_rounds": result.rounds_taken,
+            "exploration_tool_calls": result.tool_calls_made,
+            "exploration_citations": result.citations,
+        }
+        return new_response
+
+    except Exception as exc:
+        log.warning("[query/exploration] Exploration failed (returning initial answer)",
+                    error=str(exc))
+        initial_response.telemetry = {
+            "exploration_agent_invoked": False,
+            "exploration_error": str(exc),
+        }
+        return initial_response
 
 
 # ── LLM response parsing ──────────────────────────────────────────────────────

@@ -112,6 +112,13 @@ class QueryResponse(BaseModel):
     domain_entities: list[dict] = []
     onboarding_paths: list[dict] = []
 
+    # ── ADR-0061 E1: exploration telemetry ───────────────────────────────
+    # Set by query.py when ExplorationAgent fires. Clients can inspect:
+    #   exploration_agent_invoked: bool
+    #   exploration_rounds: int
+    #   exploration_tool_calls: int
+    telemetry: dict = {}
+
     # ── Computed / serialised convenience fields ──────────────────────────────
 
     @computed_field  # type: ignore[misc]

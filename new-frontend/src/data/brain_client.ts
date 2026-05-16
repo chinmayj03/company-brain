@@ -223,6 +223,54 @@ export interface Suggestion {
   question: string;
 }
 
+// ── ADR-0073: Repo / branch / me / workspace / owners types ──────────────────
+
+export interface Repo {
+  id: string;
+  display_name: string;
+  repo_path: string;
+  default_branch: string;
+  current_branch: string;
+  last_synced_at?: string;
+  entity_count: number;
+  sync_status: 'ok' | 'syncing' | 'error' | 'pending';
+}
+
+export interface BranchList {
+  current: string;
+  branches: string[];
+}
+
+export interface EntityOwner {
+  email: string;
+  name: string;
+  commit_count: number;
+  last_commit_at: string;
+  pct: number;
+}
+
+export interface OwnersResponse {
+  urn: string;
+  owners: EntityOwner[];
+  bus_factor: number;
+}
+
+export interface MeResponse {
+  id: string;
+  display_name: string;
+  email: string;
+  workspace_id: string;
+  workspace_name: string;
+}
+
+export interface WorkspaceMeta {
+  id: string;
+  name: string;
+  slug: string;
+  repo_count: number;
+  source_count: number;
+}
+
 // ── New API functions ─────────────────────────────────────────────────────────
 
 export async function getConversations(workspaceId: string, saved?: boolean): Promise<ConversationSummary[]> {
@@ -270,6 +318,23 @@ export async function getSuggestions(workspaceId: string, repoPath?: string): Pr
   if (repoPath) params.set('repo_path', repoPath);
   return get<Suggestion[]>(`/ai/suggestions?${params}`);
 }
+
+// ── ADR-0073: new API functions ───────────────────────────────────────────────
+
+export const getMe = (): Promise<MeResponse> =>
+  get<MeResponse>('/ai/me');
+
+export const getWorkspace = (id: string): Promise<WorkspaceMeta> =>
+  get<WorkspaceMeta>(`/ai/workspaces/${id}`);
+
+export const getRepos = (workspaceId: string): Promise<Repo[]> =>
+  get<Repo[]>(`/ai/workspaces/${workspaceId}/repos`);
+
+export const getBranches = (workspaceId: string, repoId: string): Promise<BranchList> =>
+  get<BranchList>(`/ai/workspaces/${workspaceId}/repos/${repoId}/branches`);
+
+export const getEntityOwners = (urn: string): Promise<OwnersResponse> =>
+  get<OwnersResponse>(`/ai/entities/${encodeURIComponent(urn)}/owners`);
 
 // ── Mapping helpers: QueryResponse → component props ─────────────────────────
 

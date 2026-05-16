@@ -16,6 +16,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from companybrain.api.routes import pipeline, query, health, repo, feedback, stream, conversations, mcp_agents, sources, suggestions
+from companybrain.api.routes import me as me_route, workspace as workspace_route
+from companybrain.api.routes import repos as repos_route, owners as owners_route
 from companybrain.config import settings
 from companybrain.db import init_db_pool, close_db_pool
 
@@ -55,6 +57,11 @@ app.include_router(repo.router, prefix="/repo", tags=["repo"])
 app.include_router(feedback.router, prefix="/feedback", tags=["feedback"])
 # ADR-0072 A1+A2+A5 — Conversation history, saved queries, audit log.
 app.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
+# ADR-0073 — frontend live-up routes
+app.include_router(me_route.router, tags=["me"])
+app.include_router(workspace_route.router, prefix="/workspaces", tags=["workspaces"])
+app.include_router(repos_route.router, prefix="/workspaces", tags=["repos"])
+app.include_router(owners_route.router, prefix="/entities", tags=["owners"])
 # ADR-0051 P4 — SSE feed of harness TodoList progress for /pipeline/jobs/{id}.
 # Path is fully embedded in the route so no prefix is set here.
 app.include_router(stream.router, tags=["stream"])

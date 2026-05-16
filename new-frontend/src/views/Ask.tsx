@@ -7,23 +7,29 @@ import CitationList from '../components/CitationList';
 import TimeTravel from '../components/TimeTravel';
 import Compare from '../components/Compare';
 import MCP from '../components/MCP';
+import RepoPicker from '../components/RepoPicker';
 import { useFlags } from '../data/feature_flags';
 import {
   queryBrain,
   queryBrainStream,
   entitiesToGraphNodes,
   riskToStats,
+  getEntityOwners,
   type QueryResponse,
   type AffectedEntity,
   type RiskAssessment,
+  type EntityOwner,
 } from '../data/brain_client';
 import {
   timeTravelStates,
-  owners,
+  owners as MOCK_OWNERS,
   graph as MOCK_GRAPH,
+  events,
   type GraphNode,
   type TimeTravelState,
 } from '../data/mock_fallback';
+import { useRepoStore } from '../store/repo_store';
+import { useWorkspaceStore } from '../store/workspace_store';
 
 // ── Shared answer shape (union of mock + live data) ───────────────────────────
 
@@ -49,11 +55,6 @@ const IconGit2 = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ width: 13, height: 13 }}>
     <circle cx="12" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="18" r="2"/>
     <path d="M12 8v6"/><path d="M12 14a6 6 0 0 0-6 4M12 14a6 6 0 0 1 6 4"/>
-  </svg>
-);
-const IconChevronDown = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ width: 11, height: 11, transform: 'rotate(90deg)' }}>
-    <polyline points="9 18 15 12 9 6"/>
   </svg>
 );
 const IconCopy = () => (
@@ -95,22 +96,6 @@ const IconADR = () => (
     <path d="M14 2v6h6"/><path d="M9 14l2 2 4-4"/>
   </svg>
 );
-const IconFile = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ width: 14, height: 14 }}>
-    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>
-  </svg>
-);
-const IconHistory = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ width: 14, height: 14 }}>
-    <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>
-  </svg>
-);
-const IconNotion = () => (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" style={{ width: 14, height: 14 }}>
-    <path d="M4 4h12l4 4v12H4z"/><path d="M8 9h8M8 13h8M8 17h5"/>
-  </svg>
-);
-
 const OWNER_COLORS: Record<string, string> = { JM: '#2E5C8A', PA: '#C8553D', SK: '#588B6F' };
 
 // ── Main component ────────────────────────────────────────────────────────────
@@ -118,12 +103,19 @@ const OWNER_COLORS: Record<string, string> = { JM: '#2E5C8A', PA: '#C8553D', SK:
 export default function Ask() {
   const f = useFlags();
 
+  const { selectedRepo } = useRepoStore();
+  const workspaceId = useWorkspaceStore((s) => s.workspaceId);
+
   const [query, setQuery]         = useState('If I rename the customer_id column, what breaks?');
   const [submitted, setSubmitted] = useState(false);
   const [position, setPosition]   = useState(1.0);
   const [answer, setAnswer]       = useState<AnswerState | null>(null);
   const [liveResp, setLiveResp]   = useState<QueryResponse | null>(null);
   const streamCleanupRef          = useRef<(() => void) | null>(null);
+
+  // Live owners state (Phase 7)
+  const [liveOwners, setLiveOwners]   = useState<EntityOwner[] | null>(null);
+  const [liveBusFactor, setLiveBusFactor] = useState<number | null>(null);
 
   // Mock time-travel state (used when LIVE_QUERY is off, or as fallback label)
   const mockState = useMemo<TimeTravelState>(() => {
@@ -174,6 +166,8 @@ export default function Ask() {
     setQuery(q);
     setSubmitted(true);
     setLiveResp(null);
+    setLiveOwners(null);
+    setLiveBusFactor(null);
 
     if (!f.LIVE_QUERY) {
       // Pure mock — instant fake "streaming"
@@ -182,8 +176,25 @@ export default function Ask() {
       return () => clearTimeout(t);
     }
 
-    // Live path
-    const asOfDate = mockState.atFrac < 1.0 ? undefined : undefined; // time-travel TBD Phase C
+    // Resolve as_of_date from timeline position (Phase 9)
+    const asOfDate: string | undefined = (() => {
+      if (position >= 1.0) return undefined;
+      const nearest = events.reduce((acc, e) =>
+        Math.abs(e.at - position) < Math.abs(acc.at - position) ? e : acc
+      );
+      try {
+        return new Date(nearest.date.replace("'", '20')).toISOString().slice(0, 10);
+      } catch {
+        return undefined;
+      }
+    })();
+
+    const reqBase = {
+      question: q,
+      workspace_id: workspaceId,
+      repo_path: selectedRepo?.repo_path,
+      as_of_date: asOfDate,
+    };
 
     if (f.LIVE_STREAM) {
       // SSE streaming
@@ -191,14 +202,14 @@ export default function Ask() {
       setAnswer({ summary: '', isStreaming: true });
 
       const cleanup = queryBrainStream(
-        { question: q, as_of_date: asOfDate },
+        reqBase,
         (delta) => {
           accumulated += delta;
           setAnswer(prev => prev ? { ...prev, summary: accumulated, isStreaming: true } : prev);
         },
         (_full) => {
           // Stream complete — fetch full structured response for verdict/citations
-          queryBrain({ question: q })
+          queryBrain(reqBase)
             .then(resp => {
               setLiveResp(resp);
               setAnswer(buildLiveAnswer(resp, false));
@@ -217,7 +228,7 @@ export default function Ask() {
       // Non-streaming live call
       setAnswer({ summary: '…', isStreaming: true });
       try {
-        const resp = await queryBrain({ question: q, as_of_date: asOfDate });
+        const resp = await queryBrain(reqBase);
         setLiveResp(resp);
         setAnswer(buildLiveAnswer(resp, false));
       } catch (err) {
@@ -228,7 +239,7 @@ export default function Ask() {
         });
       }
     }
-  }, [f.LIVE_QUERY, f.LIVE_STREAM, buildMockAnswer, buildLiveAnswer, mockState.atFrac]);
+  }, [f.LIVE_QUERY, f.LIVE_STREAM, buildMockAnswer, buildLiveAnswer, position, workspaceId, selectedRepo]);
 
   // When time-travel position changes and we're in mock mode, refresh answer
   useEffect(() => {
@@ -239,6 +250,20 @@ export default function Ask() {
 
   // Cleanup stream on unmount
   useEffect(() => () => { streamCleanupRef.current?.(); }, []);
+
+  // Fetch live owners when a live response arrives (Phase 7)
+  useEffect(() => {
+    if (!liveResp) return;
+    const urn = liveResp.cited_entity_urns?.[0]
+      ?? (liveResp.affected_entities?.[0] as AffectedEntity | undefined)?.id;
+    if (!urn) return;
+    getEntityOwners(urn)
+      .then((res) => {
+        setLiveOwners(res.owners);
+        setLiveBusFactor(res.bus_factor);
+      })
+      .catch(() => {}); // fall back to mock silently
+  }, [liveResp]);
 
   // Effective verdict label
   const verdictLabel = f.LIVE_QUERY
@@ -268,9 +293,7 @@ export default function Ask() {
                 onKeyDown={(e) => e.key === 'Enter' && ask(query)}
                 placeholder="What would break if…"
               />
-              <span className="scope">
-                <IconGit2 /> stripe-node@main <IconChevronDown />
-              </span>
+              <RepoPicker />
               <button className="send" onClick={() => ask(query)} disabled={answer?.isStreaming}>
                 <IconBolt /> Ask
               </button>
@@ -391,9 +414,27 @@ export default function Ask() {
                 {/* Right rail */}
                 <div className="right">
                   <div className="rail">
-                    <h4><IconGit2 /> Owners (git blame)</h4>
+                    <h4>
+                      <IconGit2 /> Owners (git blame)
+                      {f.LIVE_QUERY && !liveOwners && <span style={{ fontSize: 10, color: 'var(--text-muted)', marginLeft: 6, fontWeight: 400 }}>(estimated)</span>}
+                    </h4>
                     <div className="owners">
-                      {owners.map((o) => (
+                      {(f.LIVE_QUERY && liveOwners ? liveOwners.map((o) => {
+                        const initials = o.name.split(' ').map((p) => p[0]).join('').slice(0, 2).toUpperCase();
+                        return (
+                          <div key={o.email} className="owner">
+                            <div className="av" style={{ background: '#2E5C8A' }}>{initials}</div>
+                            <div className="col">
+                              <span className="nm">{o.name}</span>
+                              <span className="sub">{o.email}</span>
+                              <div className="owner-bar">
+                                <div className="fill" style={{ width: `${o.pct}%`, background: '#2E5C8A' }} />
+                              </div>
+                            </div>
+                            <span className="pct">{o.pct}%</span>
+                          </div>
+                        );
+                      }) : MOCK_OWNERS.map((o) => (
                         <div key={o.initials} className="owner">
                           <div className="av" style={{ background: OWNER_COLORS[o.initials] ?? '#888' }}>{o.initials}</div>
                           <div className="col">
@@ -405,30 +446,44 @@ export default function Ask() {
                           </div>
                           <span className="pct">{o.pct}%</span>
                         </div>
-                      ))}
+                      )))}
                     </div>
                   </div>
 
                   <div className="rail">
                     <h4><IconRisk /> Bus factor</h4>
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
-                      <span className="metric-lg" style={{ color: 'var(--warning)' }}>2</span>
-                      <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>knowledge concentrated in 2 engineers</span>
-                    </div>
-                    <div style={{ marginTop: 10, padding: '8px 10px', background: 'var(--warning-soft)', border: '1px solid var(--warning-border)', borderRadius: 4, fontSize: 12, color: 'var(--text-secondary)' }}>
-                      Jordan M. on PTO Jun 12–24. Consider parallel reviewer.
+                      <span className="metric-lg" style={{ color: 'var(--warning)' }}>
+                        {f.LIVE_QUERY && liveBusFactor !== null ? liveBusFactor : 2}
+                      </span>
+                      <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
+                        knowledge concentrated in {f.LIVE_QUERY && liveBusFactor !== null ? liveBusFactor : 2} engineer{(f.LIVE_QUERY && liveBusFactor !== null ? liveBusFactor : 2) !== 1 ? 's' : ''}
+                      </span>
                     </div>
                   </div>
 
-                  <div className="rail">
-                    <h4><IconADR /> Related docs</h4>
-                    <div className="related">
-                      <a href="#"><IconADR /> ADR-0042 · jOOQ wrapper <span className="arr">→</span></a>
-                      <a href="#"><IconNotion /> DB naming convention <span className="arr">→</span></a>
-                      <a href="#"><IconFile /> OpenAPI v3 spec <span className="arr">→</span></a>
-                      <a href="#"><IconHistory /> Jan 9 P1 post-mortem <span className="arr">→</span></a>
-                    </div>
-                  </div>
+                  {/* Related docs (Phase 8) — only shown when live data has notes */}
+                  {(() => {
+                    interface NoteEntry { urn?: string; label?: string; kind?: string; }
+                    const relatedDocs = f.LIVE_QUERY
+                      ? ((liveResp?.notes ?? []) as NoteEntry[])
+                          .filter((n) => ['adr', 'doc', 'notion'].includes(n.kind ?? ''))
+                          .slice(0, 4)
+                      : [];
+                    if (!f.LIVE_QUERY || relatedDocs.length === 0) return null;
+                    return (
+                      <div className="rail">
+                        <h4><IconADR /> Related docs</h4>
+                        <div className="related">
+                          {relatedDocs.map((n, i) => (
+                            <a key={i} href={n.urn ?? '#'} target="_blank" rel="noreferrer">
+                              <IconADR /> {n.label ?? n.urn} <span className="arr">→</span>
+                            </a>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   {/* Live confidence badge when brain is on */}
                   {f.LIVE_QUERY && answer.confidence && !answer.isStreaming && (

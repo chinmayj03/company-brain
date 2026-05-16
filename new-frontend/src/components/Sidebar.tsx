@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { getSources, type WorkspaceSource } from '../data/brain_client';
-import { recents } from '../data/mock_fallback';
+import { getSources, getConversations, type WorkspaceSource, type ConversationSummary } from '../data/brain_client';
+import { useWorkspaceStore } from '../store/workspace_store';
 
 // ── Inline SVG helpers ────────────────────────────────────────────────────────
 
@@ -55,17 +55,28 @@ function sourceDotStyle(status: WorkspaceSource['sync_status']): React.CSSProper
 
 export default function Sidebar() {
   const location = useLocation();
-  const workspaceId = (window as unknown as { __WORKSPACE_ID__?: string }).__WORKSPACE_ID__ ?? 'default';
+  const me = useWorkspaceStore((s) => s.me);
+  const workspaceId = useWorkspaceStore((s) => s.workspaceId);
 
   const [sources, setSources]       = useState<WorkspaceSource[]>([]);
   const [sourcesLoading, setSourcesLoading] = useState(true);
   const [sourcesError, setSourcesError]     = useState(false);
+
+  const [recents, setRecents] = useState<ConversationSummary[]>([]);
 
   useEffect(() => {
     let cancelled = false;
     getSources(workspaceId)
       .then((data) => { if (!cancelled) { setSources(data); setSourcesLoading(false); } })
       .catch(() => { if (!cancelled) { setSourcesError(true); setSourcesLoading(false); } });
+    return () => { cancelled = true; };
+  }, [workspaceId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getConversations(workspaceId)
+      .then((data) => { if (!cancelled) setRecents(data.slice(0, 5)); })
+      .catch(() => {});
     return () => { cancelled = true; };
   }, [workspaceId]);
 
@@ -84,7 +95,7 @@ export default function Sidebar() {
         </div>
         <div className="col">
           <span className="name">Company Brain</span>
-          <span className="ws">acme · payments</span>
+          <span className="ws">{me?.workspace_name ?? '…'}</span>
         </div>
       </div>
 
@@ -158,27 +169,33 @@ export default function Sidebar() {
       </div>
 
       {/* Recent queries */}
-      <div className="sb__section">
-        <div className="sb__label">Recent</div>
-        {recents.map((r, i) => (
-          <Link key={i} to="/history" className="sb__item" style={{ alignItems: 'flex-start', textDecoration: 'none' }}>
-            <IconClock />
-            <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0, lineHeight: 1.35 }}>
-              <span style={{ fontSize: 12, color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 180 }}>
-                {r.q}
-              </span>
-              <span style={{ fontSize: 10.5, color: 'var(--text-muted)', marginTop: 1 }}>{r.when}</span>
-            </div>
-          </Link>
-        ))}
-      </div>
+      {recents.length > 0 && (
+        <div className="sb__section">
+          <div className="sb__label">Recent</div>
+          {recents.map((r) => (
+            <Link key={r.id} to="/history" className="sb__item" style={{ alignItems: 'flex-start', textDecoration: 'none' }}>
+              <IconClock />
+              <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0, lineHeight: 1.35 }}>
+                <span style={{ fontSize: 12, color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 180 }}>
+                  {r.title ?? r.question}
+                </span>
+                <span style={{ fontSize: 10.5, color: 'var(--text-muted)', marginTop: 1 }}>
+                  {new Date(r.asked_at).toLocaleDateString()}
+                </span>
+              </div>
+            </Link>
+          ))}
+        </div>
+      )}
 
       {/* User */}
       <div className="sb__user">
-        <div className="av">TB</div>
+        <div className="av">
+          {(me?.display_name ?? 'You').slice(0, 2).toUpperCase()}
+        </div>
         <div className="col">
-          <span className="nm">Tom Blomfield</span>
-          <span className="role">Owner · acme</span>
+          <span className="nm">{me?.display_name ?? 'You'}</span>
+          <span className="role">{me?.email ?? ''}</span>
         </div>
         <span style={{ color: 'var(--text-tertiary)', marginLeft: 'auto' }}><IconChevron /></span>
       </div>

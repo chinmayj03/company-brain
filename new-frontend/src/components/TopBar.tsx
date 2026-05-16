@@ -1,6 +1,7 @@
+import { useRepoStore } from '../store/repo_store';
+
 interface TopBarProps {
   crumb: string;
-  repoLabel?: string;
 }
 
 const IconGitBranch = () => (
@@ -26,7 +27,12 @@ const IconHome = () => (
   </svg>
 );
 
-export default function TopBar({ crumb, repoLabel = 'stripe-node · main · abc1234' }: TopBarProps) {
+export default function TopBar({ crumb }: TopBarProps) {
+  const { selectedRepo, selectedBranch } = useRepoStore();
+  const repoLabel = selectedRepo
+    ? `${selectedRepo.display_name} · ${selectedBranch}`
+    : 'No repo connected';
+
   return (
     <div className="topbar">
       <div className="crumb">

@@ -6,10 +6,13 @@ import AgentsMCP from './views/AgentsMCP';
 import AuditLog from './views/AuditLog';
 import Sources from './views/Sources';
 import FlagOverlay from './components/FlagOverlay';
+import LiveModeChip from './components/LiveModeChip';
+import { useWorkspaceBootstrap } from './hooks/useWorkspace';
 
-export default function App() {
+function AppInner() {
+  useWorkspaceBootstrap();
   return (
-    <BrowserRouter>
+    <>
       <Routes>
         <Route path="/"        element={<Navigate to="/ask" replace />} />
         <Route path="/ask"     element={<Ask />} />
@@ -21,6 +24,15 @@ export default function App() {
         <Route path="*"        element={<Navigate to="/ask" replace />} />
       </Routes>
       <FlagOverlay />
+      <LiveModeChip />
+    </>
+  );
+}
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <AppInner />
     </BrowserRouter>
   );
 }

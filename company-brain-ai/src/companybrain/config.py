@@ -16,6 +16,7 @@ LLM provider switch:
 from __future__ import annotations
 
 from typing import Optional
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -407,6 +408,16 @@ class Settings(BaseSettings):
     confidence_weight_verifier:         float = 0.20
     confidence_weight_chain:            float = 0.10
     confidence_weight_freshness:        float = 0.05
+
+    # ── A1.5: Streaming ───────────────────────────────────────────────────────
+    streaming_enabled: bool = Field(default=True, env="STREAMING_ENABLED")
+
+    # ── A1.7: Few-shot bank ────────────────────────────────────────────────────
+    few_shot_enabled: bool = Field(default=True, env="FEW_SHOT_ENABLED")
+    few_shot_bank_path: str = Field(default=".brain/few_shot", env="FEW_SHOT_BANK_PATH")
+    few_shot_max_per_bucket: int = Field(default=200, env="FEW_SHOT_MAX_PER_BUCKET")
+    few_shot_min_confidence: float = Field(default=0.6, env="FEW_SHOT_MIN_CONFIDENCE")
+    few_shot_top_k: int = Field(default=3, env="FEW_SHOT_TOP_K")
 
 
 settings = Settings()

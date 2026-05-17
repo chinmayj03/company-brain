@@ -1,0 +1,304 @@
+# VP Engineering persona seed templates — ADR-0079 M6
+# 5 shapes covering the highest-frequency VP of Engineering questions.
+
+shapes:
+
+  - id: vp.drift_trend
+    persona: vp_eng
+    intent: "Show where the codebase is drifting from architectural intent (ADRs) and how the trend is changing."
+    intent_examples:
+      - "where are we drifting"
+      - "how is our drift from the architecture trending"
+      - "which areas are diverging from the ADRs"
+      - "where is the Payer area drifting"
+      - "drift trend for the eligibility service"
+      - "where is our architecture decaying"
+      - "show me drift in the claim processing area"
+      - "architectural drift over the last quarter"
+    required_signals:
+      - name: adr_records
+        source_views: [adr_store, decision_records]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: generic_retrieval
+          message: "No ADR store configured; scanning for code/comment divergence from conventions."
+      - name: code_conventions
+        source_views: [code_index, convention_data]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: use_partial
+    optional_signals:
+      - name: drift_snapshots
+        source_views: [drift_entity_store]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+          message: "ADR-0082 drift entity not available; showing point-in-time check."
+    retrieval_recipe:
+      strategy: drift_check
+      hints:
+        include_trend: "true"
+        per_domain: "true"
+      qdrant_index: default
+      evidence_budget_tokens: 5000
+    answer_format:
+      sections:
+        - name: drift_summary
+          required: true
+          description: "Top areas drifting from architectural intent"
+        - name: worst_offenders
+          required: false
+          description: "Specific files or modules with highest drift score"
+        - name: trend_direction
+          required: false
+          description: "Is drift improving or worsening over time"
+        - name: recommended_actions
+          required: false
+          description: "Priority areas for architectural remediation"
+        - name: citations
+          required: true
+      citation_min: 2
+      citation_max: 4
+      citation_style: aggregate
+      chart_types: [trend_lines, drift_gauges]
+    evidence_budget_tokens: 5000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.2
+
+  - id: vp.debt_hotspots
+    persona: vp_eng
+    intent: "Identify where technical debt is concentrated and what the highest-priority remediation targets are."
+    intent_examples:
+      - "where's our worst tech debt"
+      - "debt hotspots in the codebase"
+      - "where are we accumulating the most technical debt"
+      - "which areas have the highest debt burden"
+      - "worst debt in the payer integration code"
+      - "where should we invest to reduce debt"
+      - "technical debt concentration"
+      - "show me the debt situation"
+    required_signals:
+      - name: debt_signals
+        source_views: [code_index, antipattern_data, todo_data]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: incident_correlation
+        source_views: [incident_data, event_stream]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+      - name: velocity_impact
+        source_views: [pr_history, deploy_history]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+    retrieval_recipe:
+      strategy: tech_debt_scan
+      hints:
+        include_severity: "true"
+        group_by_area: "true"
+      qdrant_index: code
+      evidence_budget_tokens: 5000
+    answer_format:
+      sections:
+        - name: debt_hotspots
+          required: true
+          description: "Top 5-10 debt concentrations ranked by severity"
+        - name: debt_categories
+          required: false
+          description: "Breakdown by type: architectural, code quality, test coverage, etc."
+        - name: velocity_impact
+          required: false
+          description: "How debt is affecting team velocity if measurable"
+        - name: priority_queue
+          required: false
+          description: "Recommended order for remediation"
+        - name: citations
+          required: true
+      citation_min: 2
+      citation_max: 4
+      citation_style: aggregate
+      chart_types: [debt_treemap]
+    evidence_budget_tokens: 5000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.3
+
+  - id: vp.area_health_summary
+    persona: vp_eng
+    intent: "Provide a health summary for a given code area or domain: stability, test coverage, debt, recent activity."
+    intent_examples:
+      - "how is the claims area doing"
+      - "health of the eligibility service"
+      - "area health for the payer integration"
+      - "how healthy is the prior auth module"
+      - "engineering health of the billing area"
+      - "what's the state of the payment service"
+      - "health check on the provider portal"
+      - "overall health of the claims processing area"
+    required_signals:
+      - name: area_code
+        source_views: [code_index, entity_index]
+        required_confidence: 0.5
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: test_coverage
+        source_views: [test_coverage_data, ci_data]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+      - name: recent_incidents
+        source_views: [incident_data, event_stream]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+      - name: pr_velocity
+        source_views: [pr_history, git_history]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: use_partial
+    retrieval_recipe:
+      strategy: hybrid_search
+      hints:
+        multi_signal: "drift,debt,tests,incidents"
+        area_scoped: "true"
+      qdrant_index: default
+      evidence_budget_tokens: 4500
+    answer_format:
+      sections:
+        - name: health_score
+          required: true
+          description: "Overall health signal: green/yellow/red with rationale"
+        - name: strengths
+          required: false
+          description: "What's working well in this area"
+        - name: concerns
+          required: true
+          description: "Key risks, debt, or gaps in this area"
+        - name: recent_activity
+          required: false
+          description: "PR velocity and incident rate in the last 30 days"
+        - name: citations
+          required: true
+      citation_min: 2
+      citation_max: 4
+      citation_style: aggregate
+    evidence_budget_tokens: 4500
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.3
+
+  - id: vp.bus_factor_per_area
+    persona: vp_eng
+    intent: "Identify single-points-of-knowledge risk: where only one or two engineers know a critical area."
+    intent_examples:
+      - "where's our bus factor risk"
+      - "bus factor analysis"
+      - "which areas have only one person who knows the code"
+      - "single point of knowledge risks"
+      - "where would we be stuck if someone left"
+      - "knowledge concentration risks"
+      - "which domains have low bus factor"
+      - "where do we need to distribute knowledge"
+    required_signals:
+      - name: git_authorship
+        source_views: [git_blame, git_history, team_signals]
+        required_confidence: 0.5
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: review_patterns
+        source_views: [pr_history, code_review_data]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+    retrieval_recipe:
+      strategy: git_provenance
+      hints:
+        aggregate_by_area: "true"
+        bus_factor_analysis: "true"
+        min_bus_factor_threshold: "2"
+      qdrant_index: default
+      evidence_budget_tokens: 4000
+    answer_format:
+      sections:
+        - name: bus_factor_risks
+          required: true
+          description: "Areas with bus factor = 1 (critical single points of knowledge)"
+        - name: medium_risk_areas
+          required: false
+          description: "Areas with bus factor = 2 (manageable but worth watching)"
+        - name: recommended_actions
+          required: false
+          description: "Knowledge-transfer or pairing recommendations"
+        - name: citations
+          required: true
+      citation_min: 1
+      citation_max: 3
+      citation_style: aggregate
+    evidence_budget_tokens: 4000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.3
+
+  - id: vp.recent_changes_to_area
+    persona: vp_eng
+    intent: "Summarize what has changed recently in a code area: what was modified, merged, and deployed."
+    intent_examples:
+      - "what's changed in the claims area recently"
+      - "recent changes to the eligibility service"
+      - "what was deployed to the payer integration last week"
+      - "changes to the prior auth workflow this month"
+      - "recent activity in the billing module"
+      - "what's been merged into the provider portal area"
+      - "what changed in claims processing in the last 30 days"
+      - "recent code changes to the payment service"
+    required_signals:
+      - name: recent_commits
+        source_views: [git_history, pr_history, deploy_history]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: deploy_events
+        source_views: [event_stream, deploy_history]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: use_partial
+    retrieval_recipe:
+      strategy: timeline_view
+      hints:
+        range_days: "30"
+        area_scoped: "true"
+        include_deploy_events: "true"
+      qdrant_index: default
+      evidence_budget_tokens: 4000
+    answer_format:
+      sections:
+        - name: recent_changes_summary
+          required: true
+          description: "Summary of what changed, who made the changes, when deployed"
+        - name: significant_changes
+          required: false
+          description: "PRs or commits with high impact or large scope"
+        - name: risk_signals
+          required: false
+          description: "Any changes that look risky or lack test coverage"
+        - name: citations
+          required: true
+      citation_min: 2
+      citation_max: 4
+      citation_style: section_level
+    evidence_budget_tokens: 4000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.3

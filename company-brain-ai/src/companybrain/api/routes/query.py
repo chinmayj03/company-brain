@@ -86,7 +86,17 @@ def _get_neo4j_driver() -> Any:
 # ── Main handler ──────────────────────────────────────────────────────────────
 
 @router.post("", response_model=QueryResponse)
-async def query_graph(request: QueryRequest):
+async def query_graph(
+    request: QueryRequest,
+    persona: str | None = Query(
+        default=None,
+        description=(
+            "ADR-0079 P1 — Persona hint for shaped answer formatting. "
+            "One of: dev | pm | vp_eng | cs | cfo | ceo. "
+            "When omitted the router infers from query text or workspace config."
+        ),
+    ),
+):
     """
     POST /query
 
@@ -100,7 +110,8 @@ async def query_graph(request: QueryRequest):
     4d. ADR-0061 E1 — fire ExplorationAgent on low-confidence answers.
     4e. ADR-0061 E2 — re-read source for shaky citations.
     4f. ADR-0061 E6 — surface cross-repo similarity insights.
-    5. Return structured response
+    5. ADR-0079 P1 — Persona routing + shaped answer formatting.
+    6. Return structured response
     """
     from companybrain.config import settings
 
@@ -251,12 +262,21 @@ async def query_graph(request: QueryRequest):
              context_available=bool(assembled_context))
 
     if settings.iterative_exploration_enabled:
+        # ADR-0079 P1: infer persona early so the iterative loop can use it.
+        _inferred_persona = persona or settings.persona_default
+        if settings.persona_templates_enabled:
+            try:
+                from companybrain.personas.router import infer_persona
+                _inferred_persona, _ = infer_persona(request.question, persona)
+            except Exception:
+                pass
         query_response, _iter_telemetry = await _iterative_answer(
             question=request.question,
             context=assembled_context,
             workspace_id=str(request.workspace_id),
             repo_path=getattr(request, "repo_path", None),
             qdrant_index=qdrant_index,
+            persona=_inferred_persona,
         )
     else:
         response = await provider.chat(
@@ -327,6 +347,17 @@ async def query_graph(request: QueryRequest):
     # ADR-0049 O5a-5: expose raw markdown without double-encoding.
     if query_response.summary_md is None:
         query_response.summary_md = query_response.raw_markdown or query_response.summary
+
+    # ── Step 5b: ADR-0079 P1 — Persona routing + shaped answer formatting ───────
+    # Best-effort: persona formatting is purely additive (attaches answer_blocks
+    # and persona telemetry to the response). If it fails, the response is
+    # returned without persona enrichment and the existing answer is unchanged.
+    if settings.persona_templates_enabled:
+        query_response = _apply_persona_formatting(
+            question=request.question,
+            persona_param=persona,
+            query_response=query_response,
+        )
 
     # ── Step 6: Persist conversation (ADR-0072 A1/A2/A5) ─────────────────────
     await _persist_conversation(
@@ -981,6 +1012,7 @@ async def _iterative_answer(
     workspace_id: str,
     repo_path: str | None,
     qdrant_index: str,
+    persona: str = "dev",
 ) -> tuple[QueryResponse, dict]:
     """
     Run the iterative exploration loop and return (QueryResponse, telemetry_dict).
@@ -988,6 +1020,9 @@ async def _iterative_answer(
     The retrieve_fn closure captures the request-scoped parameters so
     ExplorationLoop can call back into hybrid_retrieve during iterations.
     Falls back to single-pass on import error or loop exception.
+
+    ADR-0079 P1: persona is now forwarded to orchestrate_query so the
+    iterative loop can use persona context when deciding what to retrieve.
     """
     async def _retrieve(sub_query: str) -> str | None:
         return await _hybrid_retrieve(
@@ -1000,7 +1035,7 @@ async def _iterative_answer(
             question=question,
             context=context,
             retrieve_fn=_retrieve,
-            persona="dev",
+            persona=persona,
         )
         telemetry = {
             "iterations_taken": result.iterations_taken,
@@ -1083,6 +1118,65 @@ async def _persist_conversation(
 
     except Exception as exc:
         log.debug("[query] Conversation persistence skipped (non-fatal)", error=str(exc))
+
+
+# ── ADR-0079 P1: Persona formatting ──────────────────────────────────────────
+
+
+def _apply_persona_formatting(
+    question: str,
+    persona_param: str | None,
+    query_response: QueryResponse,
+) -> QueryResponse:
+    """
+    ADR-0079 P1 — Route the question to a persona + shape, then reformat the
+    response into persona-specific AnswerBlocks.
+
+    Attaches to response.telemetry (never replaces summary — backward-compat).
+    Best-effort: any error returns the unmodified response.
+    """
+    try:
+        from companybrain.personas import route_query, get_formatter, load_bindings
+        from companybrain.config import settings as _s
+
+        result = route_query(question, persona_param=persona_param)
+
+        # Load vertical bindings (best-effort)
+        bindings = load_bindings(vertical=_s.persona_vertical)
+
+        formatter = get_formatter(result.persona)
+        raw = query_response.summary or ""
+        formatted = formatter.format(
+            raw_answer=raw,
+            shape=result.shape,
+            bindings=bindings,
+            match_confidence=result.match_confidence,
+            fell_through_to_generic=result.fell_through_to_generic,
+        )
+
+        # Attach persona metadata to telemetry without clobbering existing fields
+        persona_telemetry: dict = {
+            "persona": formatted.persona,
+            "matched_shape_id": formatted.shape_id,
+            "match_confidence": round(formatted.match_confidence, 3),
+            "fell_through_to_generic": formatted.fell_through_to_generic,
+            "persona_source": result.persona_source,
+            "answer_blocks": formatted.to_dict()["answer_blocks"],
+        }
+        query_response.telemetry = dict(query_response.telemetry or {})
+        query_response.telemetry.update(persona_telemetry)
+
+        log.info(
+            "[query/persona] Formatted",
+            persona=result.persona,
+            shape=result.shape.id if result.shape else None,
+            confidence=round(result.match_confidence, 3),
+            fell_through=result.fell_through_to_generic,
+        )
+    except Exception as exc:
+        log.debug("[query/persona] Persona formatting failed (non-fatal)", error=str(exc))
+
+    return query_response
 
 
 def _load_brain_subdir(brain_root: Path, subdir: str, *, limit: int) -> list[dict]:

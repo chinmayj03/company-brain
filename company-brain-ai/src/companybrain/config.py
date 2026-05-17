@@ -359,5 +359,11 @@ class Settings(BaseSettings):
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
 
+    # ── ADR-0079 P1: Persona-Aware Query Template Framework ───────────────────
+    persona_templates_enabled: bool = True
+    persona_vertical: str = "healthcare-rcm"
+    persona_default: str = "dev"
+    persona_match_threshold: float = 0.5
+
 
 settings = Settings()

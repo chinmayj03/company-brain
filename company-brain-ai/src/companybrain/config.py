@@ -16,6 +16,7 @@ LLM provider switch:
 from __future__ import annotations
 
 from typing import Optional
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -134,6 +135,10 @@ class Settings(BaseSettings):
     dense_top_k:       int  = 50                    # dense vector candidates
     rerank_top_k:      int  = 10                    # final reranked results
     hybrid_search_enabled: bool = True             # feature flag
+
+    # ── ADR-0015 A1.2: Retrieval pipeline tunables ───────────────────────────
+    retrieval_rerank_enabled: bool = True           # master toggle for BGE reranking
+    retrieval_rerank_top_candidates: int = 50       # RRF candidates fed into reranker
 
     # ── Observability ──────────────────────────────────────────────────────
     langfuse_public_key:  str  = ""                # LANGFUSE_PUBLIC_KEY env var
@@ -358,6 +363,68 @@ class Settings(BaseSettings):
     # Minimum verifier score to consider an answer verified.
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
+
+    # ── ADR-0064: Privacy + Audit layer ──────────────────────────────────────
+    privacy_enabled: bool = True
+    privacy_llm_judge_enabled: bool = False
+    audit_log_path: str = "./audit/audit.jsonl"
+    audit_enabled: bool = True
+    audit_default_actor: str = "pipeline"
+
+    # ── ADR-0090 P1: Event-stream memory substrate ────────────────────────────
+    event_store_enabled: bool = True
+    event_freshness_seconds: int = 60
+
+    # ── ADR-0082 P1: Drift entity tunables ───────────────────────────────────
+    drift_snapshot_cron: str = "0 2 * * *"
+    drift_warning_threshold: int = 5
+    drift_critical_threshold: int = 1
+    drift_age_inflection_days: float = 90.0
+    drift_default_waive_days: int = 90
+
+    # ── ADR-0093: Cross-Source Entity Resolution ──────────────────────────────
+    resolution_store_path: str = ".resolution"
+    resolution_embed_threshold: float = 0.80
+    resolution_embed_model: str = "all-MiniLM-L6-v2"
+    resolution_auto_resolve_threshold: float = 0.80
+    resolution_suggest_threshold: float = 0.60
+
+    # ── ADR-0079 P1: Persona-Aware Query Template Framework ───────────────────
+    persona_templates_enabled: bool = True
+    persona_vertical: str = "healthcare-rcm"
+    persona_default: str = "dev"
+    persona_match_threshold: float = 0.5
+
+    # ── A1.3: Prompt + query cache ────────────────────────────────────────────
+    anthropic_cache_enabled: bool = True
+    query_cache_enabled: bool = True
+    query_cache_ttl_seconds: int = 300
+    query_cache_maxsize: int = 256
+
+    # ── A1.4: Verbalized Confidence weights ──────────────────────────────────
+    confidence_weight_retrieval:        float = 0.30
+    confidence_weight_entity_match:     float = 0.20
+    confidence_weight_source_diversity: float = 0.15
+    confidence_weight_verifier:         float = 0.20
+    confidence_weight_chain:            float = 0.10
+    confidence_weight_freshness:        float = 0.05
+
+    # ── A1.5: Streaming ───────────────────────────────────────────────────────
+    streaming_enabled: bool = Field(default=True, env="STREAMING_ENABLED")
+
+    # ── A1.6: Glossary auto-discovery ─────────────────────────────────────────
+    glossary_enabled: bool = True
+    glossary_tuning_store_path: str = ".brain/tuning"
+    glossary_min_occurrences: int = 20
+    glossary_min_source_types: int = 2
+    glossary_max_terms_in_prompt: int = 20
+
+    # ── A1.7: Few-shot bank ────────────────────────────────────────────────────
+    few_shot_enabled: bool = Field(default=True, env="FEW_SHOT_ENABLED")
+    few_shot_bank_path: str = Field(default=".brain/few_shot", env="FEW_SHOT_BANK_PATH")
+    few_shot_max_per_bucket: int = Field(default=200, env="FEW_SHOT_MAX_PER_BUCKET")
+    few_shot_min_confidence: float = Field(default=0.6, env="FEW_SHOT_MIN_CONFIDENCE")
+    few_shot_top_k: int = Field(default=3, env="FEW_SHOT_TOP_K")
 
 
 settings = Settings()

@@ -1,0 +1,295 @@
+# Developer persona seed templates — ADR-0079 M6
+# 5 shapes covering the highest-frequency developer questions.
+# Each shape is vertical-agnostic; entity bindings live in bindings/healthcare-rcm.yaml.
+
+shapes:
+
+  - id: dev.blast_radius
+    persona: dev
+    intent: "Determine what code breaks or is affected if a given function, class, or entity is changed."
+    intent_examples:
+      - "what breaks if I change the eligibility service"
+      - "blast radius of modifying the ClaimSubmitter"
+      - "what's affected if I refactor the PayerClient"
+      - "impact of changing the prior auth service"
+      - "what depends on this function"
+      - "blast radius of the payment module"
+      - "what will break when I change this"
+      - "downstream dependencies of the eligibility check"
+    required_signals:
+      - name: target_entity
+        source_views: [code_graph, entity_index]
+        required_confidence: 0.6
+        sparse_fallback:
+          strategy: generic_retrieval
+          message: "Searching across all indexed code for similar entities."
+      - name: call_graph
+        source_views: [call_graph_edges, dependency_graph]
+        required_confidence: 0.5
+        sparse_fallback:
+          strategy: use_partial
+          message: "Partial call graph available; results may be incomplete."
+    optional_signals:
+      - name: test_coverage
+        source_views: [test_coverage_data]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: skip_section
+    retrieval_recipe:
+      strategy: blast_radius
+      hints:
+        max_hops: "3"
+        include_tests: "true"
+      qdrant_index: default
+      evidence_budget_tokens: 5000
+    answer_format:
+      sections:
+        - name: blast_radius
+          required: true
+          description: "Direct and indirect dependents of the changed entity"
+        - name: risk_overlay
+          required: true
+          description: "Estimate of change risk based on dependent count + test coverage"
+        - name: similar_patterns
+          required: false
+          description: "Similar change patterns seen in the codebase"
+        - name: citations
+          required: true
+          description: "Source URNs for every claim"
+      citation_min: 1
+      citation_max: 3
+      citation_style: line_anchored
+      chart_types: [dependency_arrows]
+    evidence_budget_tokens: 5000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.3
+
+  - id: dev.similar_implementations
+    persona: dev
+    intent: "Find existing implementation patterns in the codebase that are similar to what the developer wants to build."
+    intent_examples:
+      - "how do we usually implement authentication"
+      - "show me similar implementations of claim processing"
+      - "what's the existing pattern for API clients"
+      - "how does the team usually handle retries"
+      - "existing pattern for database transactions"
+      - "how is pagination implemented elsewhere"
+      - "find similar code to what I'm writing"
+      - "what pattern should I follow for this"
+      - "how do we implement event handlers"
+      - "existing implementations of the repository pattern"
+    required_signals:
+      - name: code_patterns
+        source_views: [code_index, business_context]
+        required_confidence: 0.5
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: adr_references
+        source_views: [adr_store, decision_records]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: skip_section
+      - name: incident_history
+        source_views: [incident_data, event_stream]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+    retrieval_recipe:
+      strategy: hybrid_search
+      hints:
+        boost_code_patterns: "true"
+      qdrant_index: code
+      evidence_budget_tokens: 4000
+    answer_format:
+      sections:
+        - name: similar_implementations
+          required: true
+          description: "Top 3-5 code examples implementing the same pattern"
+        - name: recommended_pattern
+          required: true
+          description: "The preferred pattern based on frequency and quality"
+        - name: risk_notes
+          required: false
+          description: "Any patterns that were rolled back or caused incidents"
+        - name: citations
+          required: true
+      citation_min: 1
+      citation_max: 3
+      citation_style: line_anchored
+    evidence_budget_tokens: 4000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.3
+
+  - id: dev.domain_meaning_of_entity
+    persona: dev
+    intent: "Explain the business and domain meaning of a technical entity (class, table, service) in this specific codebase."
+    intent_examples:
+      - "what does Payer mean in this codebase"
+      - "what is EligibilityCheck used for"
+      - "explain the Provider entity"
+      - "what does ClaimSubmitter do in our domain"
+      - "what is the business meaning of the Plan model"
+      - "explain what Member represents"
+      - "what does ServiceCode mean here"
+      - "what is the domain concept behind Encounter"
+    required_signals:
+      - name: entity_definition
+        source_views: [entity_index, domain_inference, business_context]
+        required_confidence: 0.5
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: prd_references
+        source_views: [prd_store, confluence_docs]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+      - name: usage_contexts
+        source_views: [code_index, call_graph_edges]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: use_partial
+    retrieval_recipe:
+      strategy: entity_lookup
+      hints:
+        include_aliases: "true"
+        include_prd_context: "true"
+      qdrant_index: business
+      evidence_budget_tokens: 3500
+    answer_format:
+      sections:
+        - name: domain_definition
+          required: true
+          description: "What this entity represents in the business domain"
+        - name: technical_role
+          required: true
+          description: "How it's used technically (class/table/service role)"
+        - name: related_entities
+          required: false
+          description: "Key related entities and how they interact"
+        - name: citations
+          required: true
+      citation_min: 1
+      citation_max: 3
+      citation_style: line_anchored
+    evidence_budget_tokens: 3500
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.2
+
+  - id: dev.why_was_this_decided
+    persona: dev
+    intent: "Explain why a particular architectural or implementation decision was made."
+    intent_examples:
+      - "why did we build it this way"
+      - "why was this architecture chosen"
+      - "what's the rationale behind using REST here instead of gRPC"
+      - "why do we use separate databases per payer"
+      - "why was the monolith split this way"
+      - "what's the reasoning behind this design"
+      - "why is the service structured like this"
+      - "what motivated this technical decision"
+    required_signals:
+      - name: decision_records
+        source_views: [adr_store, decision_records, confluence_docs]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: generic_retrieval
+          message: "Looking for decision context in commit messages and PRDs."
+    optional_signals:
+      - name: pr_context
+        source_views: [git_history, pr_descriptions]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: use_partial
+      - name: causal_chain
+        source_views: [event_stream, causal_chain_view]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+    retrieval_recipe:
+      strategy: causal_chain
+      hints:
+        trace_decision_to_code: "true"
+      qdrant_index: default
+      evidence_budget_tokens: 4000
+    answer_format:
+      sections:
+        - name: decision_summary
+          required: true
+          description: "The decision and its stated rationale"
+        - name: alternatives_considered
+          required: false
+          description: "What alternatives were considered and why rejected"
+        - name: constraints
+          required: false
+          description: "Technical or business constraints that drove the decision"
+        - name: citations
+          required: true
+      citation_min: 1
+      citation_max: 3
+      citation_style: line_anchored
+    evidence_budget_tokens: 4000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.2
+
+  - id: dev.who_owns_this_area
+    persona: dev
+    intent: "Identify who owns or has expertise in a particular code area, module, or domain."
+    intent_examples:
+      - "who owns the eligibility module"
+      - "who should I ask about the claims service"
+      - "who has the most commits in the payer integration code"
+      - "who's the expert on the prior auth workflow"
+      - "who owns the payment processing area"
+      - "who wrote most of this service"
+      - "who's responsible for the billing module"
+      - "who knows the most about this code area"
+    required_signals:
+      - name: git_authorship
+        source_views: [git_blame, git_history, team_signals]
+        required_confidence: 0.5
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: recent_activity
+        source_views: [git_history, pr_history]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: use_partial
+    retrieval_recipe:
+      strategy: git_provenance
+      hints:
+        aggregate_by_area: "true"
+        include_recent_activity: "true"
+      qdrant_index: default
+      evidence_budget_tokens: 3000
+    answer_format:
+      sections:
+        - name: ownership_summary
+          required: true
+          description: "Primary owner(s) with commit percentages"
+        - name: recent_contributors
+          required: false
+          description: "Active contributors in the last 90 days"
+        - name: bus_factor_warning
+          required: false
+          description: "Warning if only 1 person knows this area"
+        - name: citations
+          required: true
+      citation_min: 1
+      citation_max: 2
+      citation_style: line_anchored
+    evidence_budget_tokens: 3000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.3

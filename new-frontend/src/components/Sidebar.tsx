@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { getSources, getConversations, type WorkspaceSource, type ConversationSummary } from '../data/brain_client';
 import { useWorkspaceStore } from '../store/workspace_store';

@@ -168,7 +168,11 @@ class TestOrchestrateQuery:
             retrieve_fn = AsyncMock(return_value=None)
             result = await orchestrate_query("q", "ctx", retrieve_fn=retrieve_fn)
 
-        assert result.response is expected_resp
+        # A1.4: orchestrate_query now calls model_copy() on the response to
+        # attach aggregated confidence, so identity check is replaced with a
+        # content equivalence check (same summary, same entity URNs).
+        assert result.response.summary == expected_resp.summary
+        assert result.response.cited_entity_urns == expected_resp.cited_entity_urns
 
     @pytest.mark.asyncio
     async def test_falls_back_on_loop_exception(self):
@@ -188,5 +192,8 @@ class TestOrchestrateQuery:
             retrieve_fn = AsyncMock(return_value=None)
             result = await orchestrate_query("q", "ctx", retrieve_fn=retrieve_fn)
 
-        assert result.response is fallback_resp
+        # A1.4: confidence aggregation replaces the response via model_copy();
+        # check content equivalence rather than object identity.
+        assert result.response.summary == fallback_resp.summary
+        assert result.response.cited_entity_urns == fallback_resp.cited_entity_urns
         assert result.iterations_taken == 0

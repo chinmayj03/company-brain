@@ -50,6 +50,21 @@ log = structlog.get_logger(__name__)
 BACKEND_URL  = os.environ.get("BACKEND_URL", "http://localhost:8080")
 INTERNAL_KEY = os.environ.get("AI_INTERNAL_KEY", "dev-internal-key")
 
+# ── A1.3: LRU query result cache ──────────────────────────────────────────────
+# Module-level singleton; lazily initialised on first request so config.py
+# values (including env-var overrides) are available at that point.
+# Import is deferred to avoid a circular-import at module load time.
+_query_result_cache = None
+
+
+def _get_query_cache():
+    """Return the process-level QueryResultCache singleton (lazy init)."""
+    global _query_result_cache
+    if _query_result_cache is None:
+        from companybrain.cache.query_cache import get_query_cache
+        _query_result_cache = get_query_cache()
+    return _query_result_cache
+
 # Intent → Qdrant index mapping for intent-aware retrieval (ADR-0043 WS2)
 _INTENT_TO_INDEX: dict[str, str] = {
     "call_chain":  "default",   # per-entity BM25+dense RRF; needs full graph
@@ -86,7 +101,17 @@ def _get_neo4j_driver() -> Any:
 # ── Main handler ──────────────────────────────────────────────────────────────
 
 @router.post("", response_model=QueryResponse)
-async def query_graph(request: QueryRequest):
+async def query_graph(
+    request: QueryRequest,
+    persona: str | None = Query(
+        default=None,
+        description=(
+            "ADR-0079 P1 — Persona hint for shaped answer formatting. "
+            "One of: dev | pm | vp_eng | cs | cfo | ceo. "
+            "When omitted the router infers from query text or workspace config."
+        ),
+    ),
+):
     """
     POST /query
 
@@ -100,7 +125,8 @@ async def query_graph(request: QueryRequest):
     4d. ADR-0061 E1 — fire ExplorationAgent on low-confidence answers.
     4e. ADR-0061 E2 — re-read source for shaky citations.
     4f. ADR-0061 E6 — surface cross-repo similarity insights.
-    5. Return structured response
+    5. ADR-0079 P1 — Persona routing + shaped answer formatting.
+    6. Return structured response
     """
     from companybrain.config import settings
 
@@ -136,6 +162,15 @@ async def query_graph(request: QueryRequest):
         except Exception as exc:
             log.debug("[query] Ambiguity detector failed (non-fatal)",
                       error=str(exc))
+
+    # ── A1.3: LRU query result cache lookup ───────────────────────────────────
+    # Check before t0 so cache hits don't appear in latency telemetry.
+    if settings.query_cache_enabled:
+        _cached = _get_query_cache().get(request.question, str(request.workspace_id))
+        if _cached is not None:
+            log.info("[query] Cache hit — returning cached result",
+                     workspace_id=str(request.workspace_id))
+            return _cached
 
     t0 = time.monotonic()
     provider = get_provider()
@@ -204,18 +239,29 @@ async def query_graph(request: QueryRequest):
                 max_hops=request.max_hops,
             )
 
-    # ── Step 1c: Hybrid retrieval fallback (ADR-0015) ─────────────────────────
+    # ── Step 1c: Hybrid retrieval fallback (ADR-0015 / A1.2 pipeline) ──────────
+    retrieval_score: float = 0.0
     if not assembled_context:
-        assembled_context = await _hybrid_retrieve(
+        # ADR-0015 A1.2: try the full BM25+dense+RRF+BGE pipeline first.
+        assembled_context, retrieval_score = await _hybrid_retrieve_v2(
             request.question,
-            request.workspace_id,
+            str(request.workspace_id),
             getattr(request, "repo_path", None),
             index=qdrant_index,
             include_unverified=getattr(request, "include_unverified", False),
         )
+        if not assembled_context:
+            # Fall back to legacy path when v2 pipeline is unavailable.
+            assembled_context = await _hybrid_retrieve(
+                request.question,
+                request.workspace_id,
+                getattr(request, "repo_path", None),
+                index=qdrant_index,
+                include_unverified=getattr(request, "include_unverified", False),
+            )
         if assembled_context:
             log.info("[query] Using hybrid retrieval context (SmartZone + Java unavailable)",
-                     intent=intent, index=qdrant_index)
+                     intent=intent, index=qdrant_index, retrieval_score=round(retrieval_score, 4))
 
     # ── Step 2: Build per-intent user message (ADR-0043 WS2) ─────────────────
     try:
@@ -251,12 +297,21 @@ async def query_graph(request: QueryRequest):
              context_available=bool(assembled_context))
 
     if settings.iterative_exploration_enabled:
+        # ADR-0079 P1: infer persona early so the iterative loop can use it.
+        _inferred_persona = persona or settings.persona_default
+        if settings.persona_templates_enabled:
+            try:
+                from companybrain.personas.router import infer_persona
+                _inferred_persona, _ = infer_persona(request.question, persona)
+            except Exception:
+                pass
         query_response, _iter_telemetry = await _iterative_answer(
             question=request.question,
             context=assembled_context,
             workspace_id=str(request.workspace_id),
             repo_path=getattr(request, "repo_path", None),
             qdrant_index=qdrant_index,
+            persona=_inferred_persona,
         )
     else:
         response = await provider.chat(
@@ -269,8 +324,28 @@ async def query_graph(request: QueryRequest):
         )
         query_response = _parse_llm_response(response.content, assembled_context)
         _iter_telemetry = {}
+        # ── A1.4: attach deterministic multi-signal confidence (non-iterative path)
+        try:
+            from companybrain.confidence.helpers import build_confidence_from_query_result
+            query_response = query_response.model_copy(update={
+                "confidence": build_confidence_from_query_result(
+                    query_response,
+                    retrieval_score=0.0,  # not available on non-iterative path
+                    source_paths=None,
+                    verifier_score=None,  # verifier not run on single-pass
+                )
+            })
+        except Exception as _conf_exc:
+            log.debug("[query] confidence aggregation skipped (non-fatal)", error=str(_conf_exc))
 
     llm_dur = int((time.monotonic() - t1) * 1000)
+
+    # ── Step 3b: propagate retrieval_score into telemetry (ADR-0015 A1.2) ────
+    # Downstream systems (dashboards, evaluation harness) can read this from
+    # the telemetry dict without needing to re-run retrieval.
+    if retrieval_score > 0.0:
+        query_response.telemetry = dict(query_response.telemetry or {})
+        query_response.telemetry["retrieval_score"] = round(retrieval_score, 4)
 
     # ── Step 4: (response already typed) ─────────────────────────────────────
 
@@ -327,6 +402,22 @@ async def query_graph(request: QueryRequest):
     # ADR-0049 O5a-5: expose raw markdown without double-encoding.
     if query_response.summary_md is None:
         query_response.summary_md = query_response.raw_markdown or query_response.summary
+
+    # ── Step 5b: ADR-0079 P1 — Persona routing + shaped answer formatting ───────
+    if settings.persona_templates_enabled:
+        query_response = _apply_persona_formatting(
+            question=request.question,
+            persona_param=persona,
+            query_response=query_response,
+        )
+
+    # ── A1.3: Store result in LRU cache ───────────────────────────────────────
+    if settings.query_cache_enabled:
+        _conf_level = getattr(query_response.confidence, "level", "low")
+        if _conf_level in ("high", "medium"):
+            _get_query_cache().put(
+                request.question, str(request.workspace_id), query_response
+            )
 
     # ── Step 6: Persist conversation (ADR-0072 A1/A2/A5) ─────────────────────
     await _persist_conversation(
@@ -415,6 +506,128 @@ async def query_graph_stream(request: QueryRequest):
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+
+# ── A1.5: enriched SSE endpoint (token + done events) ────────────────────────
+
+@router.post("/stream/v2")
+async def query_graph_stream_v2(
+    request: QueryRequest,
+    stream: bool = Query(default=True),
+):
+    """
+    POST /query/stream/v2 — A1.5 enriched SSE streaming endpoint.
+
+    Emits a richer event set than the legacy /query/stream:
+
+        data: {"type": "token", "text": "<chunk>"}\n\n
+        ...
+        data: {"type": "done", "citations": [...], "confidence": {...},
+               "matched_shape_id": null, "from_cache": false}\n\n
+
+    When ``STREAMING_ENABLED=false`` (or ``?stream=false``), falls back
+    to returning a full JSON QueryResponse identical to POST /query.
+
+    Parallel retrieval
+    ------------------
+    Intent classification and SmartZone assembly run concurrently via
+    ``asyncio.gather``.  BM25 + dense retrieval in HybridSearcher are
+    already parallel (asyncio.to_thread wrappers in HybridSearcher);
+    the orchestrator wires them through ``retrieve_fn``.
+    """
+    from companybrain.config import settings as _s
+
+    # ── STREAMING_ENABLED flag bypass ─────────────────────────────────────────
+    if not _s.streaming_enabled or not stream:
+        # Delegate to the full non-streaming handler unchanged.
+        return await query_graph(request)
+
+    provider = get_provider()
+
+    # ── Parallel: intent classification + SmartZone assembly ─────────────────
+    async def _classify() -> str:
+        if _s.skip_intent_router:
+            return "concept"
+        try:
+            from companybrain.api.intent_router import classify_intent
+            return await classify_intent(
+                request.question,
+                workspace_id=str(request.workspace_id),
+                ttl_sec=_s.brain_query_cache_ttl_sec,
+            )
+        except Exception as exc:
+            log.warning("[stream/v2] Intent router failed (using 'concept')", error=str(exc))
+            return "concept"
+
+    intent, (assembled_context, _meta) = await asyncio.gather(
+        _classify(),
+        _smart_zone_assemble(
+            task=request.question,
+            workspace_id=str(request.workspace_id),
+            repo_path=getattr(request, "repo_path", None),
+            qdrant_index="default",
+        ),
+    )
+
+    qdrant_index = _INTENT_TO_INDEX.get(intent, "default")
+
+    # Hybrid retrieve fallback if SmartZone returned nothing — wrap sync
+    # HybridSearcher in asyncio.to_thread for parallel-safe execution.
+    if not assembled_context:
+        assembled_context = await asyncio.to_thread(
+            _hybrid_retrieve_sync,
+            request.question,
+            str(request.workspace_id),
+            getattr(request, "repo_path", None),
+            qdrant_index,
+        )
+
+    # ── Stream via SSE emitter ────────────────────────────────────────────────
+    from companybrain.streaming.sse_emitter import stream_query_response
+
+    return StreamingResponse(
+        stream_query_response(
+            question=request.question,
+            context=assembled_context,
+            system_prompt=None,
+            provider=provider,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _hybrid_retrieve_sync(
+    question: str,
+    workspace_id: str,
+    repo_path: str | None,
+    index: str,
+) -> str | None:
+    """
+    Synchronous wrapper around _hybrid_retrieve for use with asyncio.to_thread.
+
+    asyncio.to_thread runs this in a thread-pool executor so it does not
+    block the event loop.  Returns None if the retriever is unavailable.
+    """
+    import asyncio as _asyncio
+
+    async def _run():
+        return await _hybrid_retrieve(question, workspace_id, repo_path, index=index)
+
+    try:
+        # If already in an event loop (normal FastAPI path) we cannot call
+        # asyncio.run() — use a new loop in the thread instead.
+        loop = _asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
+    except Exception as exc:
+        log.debug("[stream/v2] _hybrid_retrieve_sync failed", error=str(exc))
+        return None
 
 
 # ── ADR-0061 E1: Exploration Agent post-processor ─────────────────────────────
@@ -981,6 +1194,7 @@ async def _iterative_answer(
     workspace_id: str,
     repo_path: str | None,
     qdrant_index: str,
+    persona: str = "dev",
 ) -> tuple[QueryResponse, dict]:
     """
     Run the iterative exploration loop and return (QueryResponse, telemetry_dict).
@@ -988,6 +1202,9 @@ async def _iterative_answer(
     The retrieve_fn closure captures the request-scoped parameters so
     ExplorationLoop can call back into hybrid_retrieve during iterations.
     Falls back to single-pass on import error or loop exception.
+
+    ADR-0079 P1: persona is now forwarded to orchestrate_query so the
+    iterative loop can use persona context when deciding what to retrieve.
     """
     async def _retrieve(sub_query: str) -> str | None:
         return await _hybrid_retrieve(
@@ -1000,7 +1217,7 @@ async def _iterative_answer(
             question=question,
             context=context,
             retrieve_fn=_retrieve,
-            persona="dev",
+            persona=persona,
         )
         telemetry = {
             "iterations_taken": result.iterations_taken,
@@ -1083,6 +1300,143 @@ async def _persist_conversation(
 
     except Exception as exc:
         log.debug("[query] Conversation persistence skipped (non-fatal)", error=str(exc))
+
+
+# ── ADR-0079 P1: Persona formatting ──────────────────────────────────────────
+
+
+def _apply_persona_formatting(
+    question: str,
+    persona_param: str | None,
+    query_response: QueryResponse,
+) -> QueryResponse:
+    """
+    ADR-0079 P1 — Route the question to a persona + shape, then reformat the
+    response into persona-specific AnswerBlocks.
+
+    Attaches to response.telemetry (never replaces summary — backward-compat).
+    Best-effort: any error returns the unmodified response.
+    """
+    try:
+        from companybrain.personas import route_query, get_formatter, load_bindings
+        from companybrain.config import settings as _s
+
+        result = route_query(question, persona_param=persona_param)
+
+        # Load vertical bindings (best-effort)
+        bindings = load_bindings(vertical=_s.persona_vertical)
+
+        formatter = get_formatter(result.persona)
+        raw = query_response.summary or ""
+        formatted = formatter.format(
+            raw_answer=raw,
+            shape=result.shape,
+            bindings=bindings,
+            match_confidence=result.match_confidence,
+            fell_through_to_generic=result.fell_through_to_generic,
+        )
+
+        # Attach persona metadata to telemetry without clobbering existing fields
+        persona_telemetry: dict = {
+            "persona": formatted.persona,
+            "matched_shape_id": formatted.shape_id,
+            "match_confidence": round(formatted.match_confidence, 3),
+            "fell_through_to_generic": formatted.fell_through_to_generic,
+            "persona_source": result.persona_source,
+            "answer_blocks": formatted.to_dict()["answer_blocks"],
+        }
+        query_response.telemetry = dict(query_response.telemetry or {})
+        query_response.telemetry.update(persona_telemetry)
+
+        log.info(
+            "[query/persona] Formatted",
+            persona=result.persona,
+            shape=result.shape.id if result.shape else None,
+            confidence=round(result.match_confidence, 3),
+            fell_through=result.fell_through_to_generic,
+        )
+    except Exception as exc:
+        log.debug("[query/persona] Persona formatting failed (non-fatal)", error=str(exc))
+
+    return query_response
+
+
+# ── ADR-0015 A1.2: RetrievalPipeline wrapper ─────────────────────────────────
+
+async def _hybrid_retrieve_v2(
+    question: str,
+    workspace_id: str,
+    repo_path: str | None = None,
+    index: str = "default",
+    include_unverified: bool = False,
+    top_k: int = 10,
+) -> tuple[str | None, float]:
+    """Retrieve entities via RetrievalPipeline (BM25+dense+RRF+BGE reranker).
+
+    Extends ``_hybrid_retrieve()`` with full A1.2 pipeline support and returns
+    a ``(context_str, top_score)`` tuple so callers can propagate the retrieval
+    score into confidence aggregation.
+
+    The ``top_score`` can be used by the confidence aggregator to determine
+    whether the retrieval was strong enough to boost confidence from "low" to
+    "medium" without needing an extra LLM call.
+
+    Returns (None, 0.0) on any failure — callers fall through to the existing
+    non-v2 hybrid path automatically.
+    """
+    try:
+        from companybrain.retrieval.factory import make_retrieval_pipeline
+        from companybrain.store.identity import workspace_slug_for
+        from companybrain.config import settings as _s
+
+        effective_root = repo_path or os.environ.get("BRAIN_ROOT", "")
+        if not effective_root:
+            return None, 0.0
+
+        workspace_slug = workspace_slug_for(workspace_id)
+        pipeline = make_retrieval_pipeline(
+            _s,
+            brain_root=Path(effective_root),
+            workspace_slug=workspace_slug,
+        )
+
+        result = await pipeline.retrieve(
+            question,
+            workspace_id=workspace_slug,
+            top_k=top_k,
+            index=index,
+        )
+
+        if not result.hits:
+            return None, 0.0
+
+        filtered = _filter_verified(result.hits, include_unverified=include_unverified)
+        if not filtered:
+            return None, 0.0
+
+        lines = ["## Hybrid Retrieval Results\n"]
+        for hit in filtered:
+            payload = hit.payload
+            name = payload.get("qualified_name") or hit.urn.split(":")[-1]
+            summary = payload.get("t1_summary", "")
+            lines.append(
+                f"- **{name}** ({payload.get('entity_type', '')}): {summary}"
+            )
+
+        log.info(
+            "[query] hybrid_retrieve_v2 OK",
+            hits=len(filtered),
+            reranked=result.reranked,
+            top_score=round(result.top_score, 4),
+            reranker_model=result.reranker_model,
+            index=index,
+        )
+
+        return "\n".join(lines), result.top_score
+
+    except Exception as exc:
+        log.debug("[query] hybrid_retrieve_v2 failed (non-fatal)", error=str(exc))
+        return None, 0.0
 
 
 def _load_brain_subdir(brain_root: Path, subdir: str, *, limit: int) -> list[dict]:

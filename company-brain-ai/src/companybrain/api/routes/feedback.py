@@ -10,12 +10,24 @@ POST /feedback/resynthesise
 POST /feedback/resynthesise-sync  [dev/test only]
     Same as above but waits for synthesis to complete and returns the result.
     Use for integration tests and local development — not production.
+
+POST /feedback/thumbs                                         (A1.7 few-shot bank)
+    Record a thumbs-up or thumbs-down signal for a completed Q&A pair.
+    thumbs="up"  → record as few-shot exemplar (quality boosted to >= 0.9)
+    thumbs="down" -> suppress / do not record
+
+POST /feedback/edit                                           (A1.7 few-shot bank)
+    Record an implicit positive signal when the user edits an answer.
+    Edited answers are treated as thumbs-up with a quality floor of 0.85.
+
+GET /feedback/stats                                           (A1.7 few-shot bank)
+    Return per-persona example counts and recent-addition stats for a workspace.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Query
 from pydantic import BaseModel
 
 import structlog
@@ -128,3 +140,181 @@ def _to_feedback(request: ResynthesiseRequest) -> AnnotationFeedback:
         callback_url=request.callback_url,
         callback_key=request.callback_key,
     )
+
+
+# ── A1.7: Few-shot bank endpoints ─────────────────────────────────────────────
+
+def _get_capture():
+    """Lazy-initialise the FewShotCapture (bank + retriever) using config."""
+    from pathlib import Path
+    from companybrain.config import settings
+    from companybrain.workspace.few_shot.bank import FewShotBank
+    from companybrain.workspace.few_shot.retriever import FewShotRetriever
+    from companybrain.workspace.few_shot.capture import FewShotCapture
+
+    bank = FewShotBank(
+        storage_path=Path(settings.few_shot_bank_path),
+        max_per_bucket=settings.few_shot_max_per_bucket,
+    )
+    retriever = FewShotRetriever(bank)
+    return FewShotCapture(bank, retriever)
+
+
+def _get_bank():
+    """Return a FewShotBank pointed at the configured storage path."""
+    from pathlib import Path
+    from companybrain.config import settings
+    from companybrain.workspace.few_shot.bank import FewShotBank
+
+    return FewShotBank(
+        storage_path=Path(settings.few_shot_bank_path),
+        max_per_bucket=settings.few_shot_max_per_bucket,
+    )
+
+
+class ThumbsRequest(BaseModel):
+    workspace_id: str
+    question: str
+    answer: str
+    persona: str = "generic"
+    citations: List[str] = []
+    confidence_score: float = 0.5
+    thumbs: str  # "up" | "down"
+
+
+class ThumbsResponse(BaseModel):
+    recorded: bool
+    message: str
+
+
+class EditRequest(BaseModel):
+    workspace_id: str
+    question: str
+    original_answer: str
+    edited_answer: str
+    persona: str = "generic"
+    citations: List[str] = []
+    confidence_score: float = 0.75  # implicit positive signal floor
+
+
+class EditResponse(BaseModel):
+    recorded: bool
+    message: str
+
+
+class StatsResponse(BaseModel):
+    workspace_id: str
+    total_examples: Dict[str, int]
+    recent_additions: int
+
+
+@router.post("/thumbs", response_model=ThumbsResponse)
+async def record_thumbs(request: ThumbsRequest):
+    """
+    Record a thumbs-up or thumbs-down signal for a completed Q&A pair.
+
+    thumbs="up"  -> qualifies the pair as a few-shot exemplar
+    thumbs="down" -> explicitly blocks the pair from being recorded
+    """
+    if request.thumbs not in ("up", "down"):
+        return ThumbsResponse(
+            recorded=False,
+            message=f"Invalid thumbs value '{request.thumbs}'; must be 'up' or 'down'.",
+        )
+
+    try:
+        capture = _get_capture()
+        recorded = await capture.record_if_successful(
+            workspace_id=request.workspace_id,
+            persona=request.persona,
+            question=request.question,
+            answer=request.answer,
+            citations=request.citations,
+            confidence_score=request.confidence_score,
+            thumbs_feedback=request.thumbs,
+        )
+        msg = "Example recorded." if recorded else "Example not recorded (below quality threshold)."
+        log.info(
+            "feedback.thumbs",
+            workspace_id=request.workspace_id,
+            persona=request.persona,
+            thumbs=request.thumbs,
+            recorded=recorded,
+        )
+        return ThumbsResponse(recorded=recorded, message=msg)
+    except Exception as exc:
+        log.error("feedback.thumbs.error", error=str(exc))
+        return ThumbsResponse(recorded=False, message=f"Error: {exc}")
+
+
+@router.post("/edit", response_model=EditResponse)
+async def record_edit(request: EditRequest):
+    """
+    Record an implicit positive signal when a user edits an answer.
+
+    An edited answer is treated as implicit thumbs-up with quality floor 0.85.
+    The *edited* answer is stored (not the original) so future queries get the
+    human-refined version as the exemplar.
+    """
+    try:
+        # Use edited_answer as the stored answer; boost confidence floor
+        effective_confidence = max(request.confidence_score, 0.85)
+
+        capture = _get_capture()
+        recorded = await capture.record_if_successful(
+            workspace_id=request.workspace_id,
+            persona=request.persona,
+            question=request.question,
+            answer=request.edited_answer,
+            citations=request.citations,
+            confidence_score=effective_confidence,
+            thumbs_feedback="up",   # edit is implicit positive signal
+        )
+        msg = "Edited example recorded." if recorded else "Example not recorded."
+        log.info(
+            "feedback.edit",
+            workspace_id=request.workspace_id,
+            persona=request.persona,
+            recorded=recorded,
+        )
+        return EditResponse(recorded=recorded, message=msg)
+    except Exception as exc:
+        log.error("feedback.edit.error", error=str(exc))
+        return EditResponse(recorded=False, message=f"Error: {exc}")
+
+
+_KNOWN_PERSONAS = ("developer", "pm", "vp_eng", "generic")
+
+
+@router.get("/stats", response_model=StatsResponse)
+async def get_stats(workspace_id: str = Query(..., description="Workspace UUID")):
+    """
+    Return per-persona example counts and recent-addition stats.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    try:
+        bank = _get_bank()
+        total_examples: Dict[str, int] = {}
+        recent_additions = 0
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+
+        for persona in _KNOWN_PERSONAS:
+            examples = bank.get_all(workspace_id, persona)
+            total_examples[persona] = len(examples)
+            recent_additions += sum(
+                1 for ex in examples if ex.created_at >= cutoff
+            )
+
+        return StatsResponse(
+            workspace_id=workspace_id,
+            total_examples=total_examples,
+            recent_additions=recent_additions,
+        )
+    except Exception as exc:
+        log.error("feedback.stats.error", error=str(exc))
+        return StatsResponse(
+            workspace_id=workspace_id,
+            total_examples={},
+            recent_additions=0,
+        )

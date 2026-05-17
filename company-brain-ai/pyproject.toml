@@ -129,6 +129,11 @@ dependencies = [
     #              hand-rolled (deterministic) so no new proto-parser dep.
     "sqlparse>=0.5.0",
     "graphql-core>=3.2.0",
+
+    # A1.1 SQL Deep Extractor — sqlglot multi-dialect AST parser + lineage engine.
+    # Replaces the DDL-only path in schema_sql.py for DML/DQL coverage.
+    # Keep sqlparse as legacy path (behind SQL_DEEP_EXTRACTOR_ENABLED=false).
+    "sqlglot>=25.0.0",
 ]
 
 [project.optional-dependencies]

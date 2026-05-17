@@ -1,0 +1,67 @@
+{
+  "version": "1.0",
+  "baseline": 1.0,
+  "description": "Citation rate: every answer to a factual Q&A pair must include at least min_citations cited entities. Baseline 1.0 means 100% of answers must have at least one citation — no uncited answers allowed.",
+  "examples": [
+    {
+      "id": "cite-001",
+      "question": "How does a claim move from PENDING to PAID status?",
+      "min_citations": 2,
+      "tags": ["claim", "workflow", "state-machine"]
+    },
+    {
+      "id": "cite-002",
+      "question": "Which repository class handles prior authorization lookups?",
+      "min_citations": 1,
+      "tags": ["repository", "prior-auth", "lookup"]
+    },
+    {
+      "id": "cite-003",
+      "question": "What SQL query fetches active network providers for a given plan?",
+      "min_citations": 1,
+      "tags": ["sql", "network-provider", "plan"]
+    },
+    {
+      "id": "cite-004",
+      "question": "How is member eligibility verified before a claim is adjudicated?",
+      "min_citations": 2,
+      "tags": ["eligibility", "claim", "adjudication"]
+    },
+    {
+      "id": "cite-005",
+      "question": "What service is responsible for calculating network gap scores?",
+      "min_citations": 1,
+      "tags": ["network-gap", "service"]
+    },
+    {
+      "id": "cite-006",
+      "question": "Which classes are involved in processing an 835 EDI remittance file?",
+      "min_citations": 2,
+      "tags": ["edi", "835", "remittance"]
+    },
+    {
+      "id": "cite-007",
+      "question": "How does the enrollment service handle mid-year plan changes?",
+      "min_citations": 2,
+      "tags": ["enrollment", "plan-change"]
+    },
+    {
+      "id": "cite-008",
+      "question": "What database tables are written to when a provider is onboarded?",
+      "min_citations": 1,
+      "tags": ["provider", "onboarding", "database"]
+    },
+    {
+      "id": "cite-009",
+      "question": "How are duplicate claims detected and rejected?",
+      "min_citations": 2,
+      "tags": ["claim", "duplicate", "detection"]
+    },
+    {
+      "id": "cite-010",
+      "question": "Which component owns the benefits accumulator logic for deductibles?",
+      "min_citations": 1,
+      "tags": ["benefits", "accumulator", "deductible"]
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+{
+  "version": "1.0",
+  "baseline": 0.75,
+  "description": "SQL extraction coverage: verifies the A1.1 SQL deep extractor identifies SQL patterns across DDL, DML, JPA, PreparedStatement, stored procedures, and JPQL in the network-iq-backend-java codebase.",
+  "examples": [
+    {
+      "id": "sql-ddl-001",
+      "input": "CREATE TABLE network_provider (\n    provider_id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,\n    npi_number VARCHAR(10) NOT NULL UNIQUE,\n    provider_name VARCHAR(255) NOT NULL,\n    specialty_code VARCHAR(20),\n    network_tier VARCHAR(10) CHECK (network_tier IN ('TIER1','TIER2','TIER3')),\n    effective_date DATE NOT NULL,\n    termination_date DATE,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT now()\n);",
+      "expected": "DDL extracted with table name, all column names, types, and constraints",
+      "tags": ["ddl", "create-table", "healthcare"]
+    },
+    {
+      "id": "sql-ddl-002",
+      "input": "CREATE TABLE claim_line (\n    claim_line_id BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,\n    claim_id BIGINT NOT NULL REFERENCES claim(claim_id),\n    procedure_code VARCHAR(10) NOT NULL,\n    diagnosis_code VARCHAR(10),\n    billed_amount NUMERIC(12,2) NOT NULL,\n    allowed_amount NUMERIC(12,2),\n    paid_amount NUMERIC(12,2),\n    service_date DATE NOT NULL\n);",
+      "expected": "DDL with FK reference extracted",
+      "tags": ["ddl", "create-table", "insurance", "foreign-key"]
+    },
+    {
+      "id": "sql-dml-select-001",
+      "input": "SELECT p.provider_id, p.npi_number, p.provider_name, n.network_name, COUNT(c.claim_id) AS claim_count\nFROM network_provider p\nINNER JOIN network n ON p.network_id = n.network_id\nLEFT JOIN claim c ON c.rendering_provider_id = p.provider_id\nWHERE p.effective_date <= :effectiveDate\n  AND (p.termination_date IS NULL OR p.termination_date > :asOfDate)\n  AND n.plan_id = :planId\nGROUP BY p.provider_id, p.npi_number, p.provider_name, n.network_name\nHAVING COUNT(c.claim_id) > 0\nORDER BY claim_count DESC;",
+      "expected": "DML SELECT with JOIN, WHERE, GROUP BY, HAVING extracted",
+      "tags": ["dml", "select", "join", "healthcare", "insurance"]
+    },
+    {
+      "id": "sql-dml-select-002",
+      "input": "SELECT m.member_id, m.member_name, m.date_of_birth,\n       e.group_number, e.plan_code, e.benefit_start_date\nFROM member m\nINNER JOIN enrollment e ON e.member_id = m.member_id\nINNER JOIN plan_benefit pb ON pb.plan_code = e.plan_code\nWHERE m.ssn_hash = :ssnHash\n  AND e.benefit_start_date <= CURRENT_DATE\n  AND (e.benefit_end_date IS NULL OR e.benefit_end_date >= CURRENT_DATE)\n  AND pb.is_active = true;",
+      "expected": "DML SELECT with multiple JOINs and date range WHERE clause",
+      "tags": ["dml", "select", "join", "member", "enrollment"]
+    },
+    {
+      "id": "sql-jpa-query-001",
+      "input": "@Repository\npublic interface NetworkProviderRepository extends JpaRepository<NetworkProvider, Long> {\n    @Query(\"SELECT p FROM NetworkProvider p \" +\n           \"JOIN FETCH p.network n \" +\n           \"WHERE p.npiNumber = :npiNumber \" +\n           \"AND p.effectiveDate <= :asOfDate \" +\n           \"AND (p.terminationDate IS NULL OR p.terminationDate > :asOfDate)\")\n    Optional<NetworkProvider> findActiveByNpi(\n        @Param(\"npiNumber\") String npiNumber,\n        @Param(\"asOfDate\") LocalDate asOfDate\n    );\n}",
+      "expected": "JPA @Query annotation string extracted with JPQL",
+      "tags": ["jpa", "query-annotation", "jpql", "repository"]
+    },
+    {
+      "id": "sql-jpa-query-002",
+      "input": "@Query(value = \"SELECT c.claim_id, c.member_id, c.total_billed, c.paid_amount, \" +\n       \"c.claim_status, c.service_from_date \" +\n       \"FROM claim c \" +\n       \"WHERE c.rendering_provider_id = :providerId \" +\n       \"AND c.service_from_date BETWEEN :startDate AND :endDate \" +\n       \"AND c.claim_status NOT IN ('VOID','DUPLICATE') \" +\n       \"ORDER BY c.service_from_date DESC\", nativeQuery = true)\nList<ClaimSummary> findClaimsByProviderAndDateRange(\n    @Param(\"providerId\") Long providerId,\n    @Param(\"startDate\") LocalDate startDate,\n    @Param(\"endDate\") LocalDate endDate\n);",
+      "expected": "JPA native @Query with BETWEEN and NOT IN extracted",
+      "tags": ["jpa", "native-query", "claim", "insurance"]
+    },
+    {
+      "id": "sql-prepared-stmt-001",
+      "input": "String sql = \"SELECT a.auth_id, a.auth_status, a.approved_units, \" +\n    \"a.expiration_date, a.procedure_code \" +\n    \"FROM prior_auth a \" +\n    \"WHERE a.member_id = ? \" +\n    \"AND a.procedure_code = ? \" +\n    \"AND a.auth_status = 'APPROVED' \" +\n    \"AND a.expiration_date >= CURRENT_DATE\";\nPreparedStatement ps = conn.prepareStatement(sql);\nps.setLong(1, memberId);\nps.setString(2, procedureCode);",
+      "expected": "PreparedStatement with positional placeholders extracted",
+      "tags": ["prepared-statement", "prior-auth", "insurance"]
+    },
+    {
+      "id": "sql-prepared-stmt-002",
+      "input": "String upsertSql = \"INSERT INTO eligibility_snapshot \" +\n    \"(member_id, plan_code, group_number, as_of_date, benefit_data, created_at) \" +\n    \"VALUES (?, ?, ?, ?, ?::jsonb, now()) \" +\n    \"ON CONFLICT (member_id, as_of_date) \" +\n    \"DO UPDATE SET benefit_data = EXCLUDED.benefit_data, \" +\n    \"updated_at = now()\";\nPreparedStatement ps = conn.prepareStatement(upsertSql);",
+      "expected": "PreparedStatement upsert (INSERT ON CONFLICT) extracted",
+      "tags": ["prepared-statement", "upsert", "eligibility"]
+    },
+    {
+      "id": "sql-stored-proc-001",
+      "input": "CallableStatement cs = conn.prepareCall(\n    \"{call sp_calculate_network_gap_score(?, ?, ?, ?)}\"\n);\ncs.setLong(1, planId);\ncs.setString(2, countyFips);\ncs.setString(3, specialtyCode);\ncs.registerOutParameter(4, Types.NUMERIC);\ncs.execute();\ndouble gapScore = cs.getDouble(4);",
+      "expected": "Stored procedure call with OUT parameter extracted",
+      "tags": ["stored-procedure", "callable-statement", "network-gap"]
+    },
+    {
+      "id": "sql-dml-update-001",
+      "input": "UPDATE claim\nSET claim_status = :newStatus,\n    adjudication_date = :adjudicationDate,\n    paid_amount = :paidAmount,\n    eob_sent = true,\n    updated_at = now()\nWHERE claim_id = :claimId\n  AND claim_status IN ('PENDING', 'IN_REVIEW')\n  AND assigned_adjudicator_id = :adjudicatorId;",
+      "expected": "DML UPDATE with SET and conditional WHERE extracted",
+      "tags": ["dml", "update", "claim", "adjudication"]
+    }
+  ]
+}

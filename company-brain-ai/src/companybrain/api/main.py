@@ -16,9 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from companybrain.api.routes import pipeline, query, health, repo, feedback, stream, conversations, mcp_agents, suggestions
+from companybrain.api.routes import resolution as resolution_route
 from companybrain.api.routes import me as me_route, workspace as workspace_route
 from companybrain.api.routes import repos as repos_route, owners as owners_route
 from companybrain.api.routes import brain as brain_route
+from companybrain.api.routes import drift as drift_route  # ADR-0082 P1
+from companybrain.api.routes import sources as sources_route
 from companybrain.config import settings
 from companybrain.db import init_db_pool, close_db_pool
 
@@ -49,6 +52,12 @@ async def lifespan(app: FastAPI):
     log.info("Starting Company Brain AI service", version="0.1.0")
     await init_db_pool()
     await _ensure_dev_workspace()
+    # ADR-0082 P1 — start nightly drift snapshot scheduler
+    from companybrain.drift.scheduler import start_nightly_scheduler
+    start_nightly_scheduler(
+        cron_expression=settings.drift_snapshot_cron,
+        workspace="default",
+    )
     yield
     await close_db_pool()
     log.info("Company Brain AI service stopped")
@@ -83,6 +92,7 @@ app.include_router(brain_route.router, prefix="/brain", tags=["brain"])
 app.include_router(me_route.router, tags=["me"])
 app.include_router(workspace_route.router, prefix="/workspaces", tags=["workspaces"])
 app.include_router(repos_route.router, prefix="/workspaces", tags=["repos"])
+app.include_router(sources_route.router, prefix="/workspaces", tags=["sources"])
 app.include_router(owners_route.router, prefix="/entities", tags=["owners"])
 # ADR-0051 P4 — SSE feed of harness TodoList progress for /pipeline/jobs/{id}.
 # Path is fully embedded in the route so no prefix is set here.
@@ -91,6 +101,10 @@ app.include_router(stream.router, tags=["stream"])
 # Source registry moved to Java backend (SourceController /v1/workspaces/.../sources)
 app.include_router(mcp_agents.router, prefix="/mcp", tags=["mcp-agents"])
 app.include_router(suggestions.router, tags=["suggestions"])
+# ADR-0082 P1 — Drift as a First-Class Entity
+app.include_router(drift_route.router, prefix="/drift", tags=["drift"])
+# ADR-0093 — Cross-Source Entity Resolution
+app.include_router(resolution_route.router, tags=["resolution"])
 
 # ── ADR-0052 P5: brain-as-MCP route ──────────────────────────────────────
 # Exposes the harness MCP surface (query_brain, read_entity, find_callers, ...)

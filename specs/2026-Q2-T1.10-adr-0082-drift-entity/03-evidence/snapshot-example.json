@@ -1,0 +1,30 @@
+{
+  "snapshot_id": "a01ad041-47e8-49e3-9d90-c2e61a059d4c",
+  "snapshot_at": "2026-05-17T13:39:38.068633+00:00",
+  "workspace": "network-iq-backend-java",
+  "items_open": 4,
+  "items_acknowledged": 0,
+  "items_in_flight": 0,
+  "items_by_domain": {
+    "unattributed": 4
+  },
+  "items_by_severity": {
+    "critical": 2,
+    "high": 1,
+    "low": 1
+  },
+  "new_since_last": [
+    "0c6b663f3d8e93b9",
+    "14954e49b271ea10",
+    "6ca97bfe60117af2",
+    "26a2b4c1b860a283"
+  ],
+  "resolved_since_last": [],
+  "delta_score": 21.0,
+  "all_item_ids": [
+    "0c6b663f3d8e93b9",
+    "14954e49b271ea10",
+    "26a2b4c1b860a283",
+    "6ca97bfe60117af2"
+  ]
+}

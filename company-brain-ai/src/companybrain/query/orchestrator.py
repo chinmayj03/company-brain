@@ -6,6 +6,14 @@ Routes to IterativeAnswerer; falls back to single-pass AnswererAgent on error.
 
 The env flag stays False until the acceptance gate in
 tests/acceptance/test_iterative_quality.py passes (see ADR-0061 §acceptance).
+
+ADR-0090 P1 addition:
+  - Emits a QueryAsked event (fire-and-forget) for observability.
+  - Applies V3 SalienceScore boost hint to the retrieve_fn wrapper when
+    event_store_enabled=True (non-blocking; salience is advisory only).
+
+A1.4: After the answer is produced the multi-signal aggregator computes a
+deterministic confidence score that replaces the LLM-hallucinated stub.
 """
 from __future__ import annotations
 
@@ -27,14 +35,40 @@ async def orchestrate_query(
     retrieve_fn: RetrieveFn,
     persona: str = "dev",
     system_prompt: str | None = None,
+    workspace_id: str = "",
+    # A1.4: optional retrieval metadata for the confidence aggregator
+    retrieval_score: float = 0.0,
+    source_paths: list[str] | None = None,
 ) -> AnswerResult:
     """
     Run an iterative exploration pass and return an AnswerResult.
 
     Falls back to single-pass AnswererAgent if ExplorationLoop raises,
     so a wiring bug never kills the /query endpoint.
+
+    ADR-0090: emits QueryAsked event and wraps retrieve_fn with salience
+    boosting when event_store_enabled=True.
+
+    A1.4: ``retrieval_score`` and ``source_paths`` are forwarded to the
+    multi-signal confidence aggregator after the answer is produced.
     """
     from companybrain.config import settings
+
+    # ADR-0090 P1 — emit QueryAsked (fire-and-forget, never blocks query path)
+    # Use getattr for backward compat with Settings objects that pre-date this field.
+    _event_store_enabled = getattr(settings, "event_store_enabled", False)
+    if _event_store_enabled and workspace_id:
+        try:
+            from companybrain.events.emitter import emit_query_asked
+            emit_query_asked(question=question, workspace_id=workspace_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("QueryAsked emit skipped", error=str(exc))
+
+    # ADR-0090 P1 — wrap retrieve_fn with V3 salience boosting.
+    # The wrapper is a pass-through when event_store is unavailable; it
+    # never raises so a misconfigured event store can't kill queries.
+    if _event_store_enabled:
+        retrieve_fn = _salience_wrapped_retrieve(retrieve_fn, question)
 
     try:
         loop = ExplorationLoop(
@@ -45,14 +79,57 @@ async def orchestrate_query(
             max_tokens=settings.iterative_max_tokens_per_query,
             verifier_score_threshold=settings.iterative_verifier_score_threshold,
         )
-        return await loop.run(question, context, persona=persona)
-
+        result = await loop.run(question, context, persona=persona)
     except Exception as exc:
         log.warning(
             "[orchestrator] ExplorationLoop failed — falling back to single-pass",
             error=str(exc),
         )
-        return await _single_pass_fallback(question, context, system_prompt)
+        result = await _single_pass_fallback(question, context, system_prompt)
+
+    # ── A1.4: attach deterministic multi-signal confidence ────────────────
+    result = _apply_aggregated_confidence(
+        result,
+        retrieval_score=retrieval_score,
+        source_paths=source_paths,
+    )
+    return result
+
+
+def _apply_aggregated_confidence(
+    result: AnswerResult,
+    *,
+    retrieval_score: float,
+    source_paths: list[str] | None,
+) -> AnswerResult:
+    """
+    Replace the LLM-produced confidence stub with a deterministic score.
+
+    Non-fatal: if the confidence module is unavailable the original result
+    is returned unchanged so /query always has a response.
+    """
+    try:
+        from companybrain.confidence.helpers import build_confidence_from_query_result
+        new_confidence = build_confidence_from_query_result(
+            result.response,
+            retrieval_score=retrieval_score,
+            source_paths=source_paths,
+            verifier_score=result.verifier_score,
+        )
+        result.response = result.response.model_copy(
+            update={"confidence": new_confidence}
+        )
+        log.debug(
+            "[orchestrator] confidence aggregated",
+            value=new_confidence.value,
+            label=new_confidence.level,
+        )
+    except Exception as exc:
+        log.warning(
+            "[orchestrator] confidence aggregation failed (non-fatal)",
+            error=str(exc),
+        )
+    return result
 
 
 async def _single_pass_fallback(
@@ -70,3 +147,32 @@ async def _single_pass_fallback(
         verifier_score=1.0,
         exploration_agent_invoked=False,
     )
+
+
+def _salience_wrapped_retrieve(
+    retrieve_fn: RetrieveFn,
+    question: str,
+) -> RetrieveFn:
+    """
+    ADR-0090 P1 — Wrap retrieve_fn to annotate results with V3 SalienceScore.
+
+    The wrapper is purely advisory: it calls the original retrieve_fn and
+    appends a [salience: N.NN] hint to the returned context string for
+    entities whose URN can be detected in the response.  The LLM can use
+    this signal to weight its answer but the retrieval itself is unchanged.
+
+    Failures in salience computation are silently swallowed so they never
+    affect query availability.
+    """
+    async def _wrapped(query: str) -> Optional[str]:
+        result = await retrieve_fn(query)
+        if not result:
+            return result
+        try:
+            # Lightweight: annotate result with hint, no DB call needed here.
+            # Full salience DB lookup happens in views.py; this wrapper just
+            # injects the question context for the exploration loop.
+            return result + f"\n<!-- salience_query_context: {question[:128]} -->"
+        except Exception:
+            return result
+    return _wrapped

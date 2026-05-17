@@ -1,3 +1,4 @@
+import React from 'react';
 import Sidebar from '../components/Sidebar';
 import TopBar from '../components/TopBar';
 import { useFlags, useFlagToggle, type FlagName } from '../data/feature_flags';

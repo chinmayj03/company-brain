@@ -56,9 +56,11 @@ def test_repos_returns_list_from_env(client, tmp_git_repo):
     assert "current_branch" in repo
 
 
-def test_repos_returns_empty_when_no_source(client):
-    with _mock_no_db(), patch.dict(os.environ, {}, clear=True):
-        # also clear CB_REPO_PATH if set in test env
+def test_repos_returns_empty_when_no_source(client, tmp_path):
+    # Use a manifest path that doesn't exist so the manifest fallback also misses
+    with _mock_no_db(), \
+         patch.dict(os.environ, {}, clear=True), \
+         patch("companybrain.api.routes.repos.Path.home", return_value=tmp_path):
         os.environ.pop("CB_REPO_PATH", None)
         resp = client.get(f"/{WS_ID}/repos")
     assert resp.status_code == 200

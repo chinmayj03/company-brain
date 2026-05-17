@@ -1,0 +1,298 @@
+# PM persona seed templates — ADR-0079 M6
+# 5 shapes covering the highest-frequency product manager questions.
+
+shapes:
+
+  - id: pm.feature_progress
+    persona: pm
+    intent: "Report on the current status and progress of a feature through its development lifecycle."
+    intent_examples:
+      - "where is the prior auth feature"
+      - "what's the status of the eligibility check feature"
+      - "how far along is the claim submission feature"
+      - "progress on the provider portal feature"
+      - "is the payment feature shipped"
+      - "where are we with the member portal"
+      - "status of the new payer integration"
+      - "how is the prior authorization workflow progressing"
+    required_signals:
+      - name: feature_entity
+        source_views: [entity_index, prd_store, linear_data]
+        required_confidence: 0.5
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: deploy_events
+        source_views: [event_stream, deploy_history]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: use_partial
+      - name: pr_history
+        source_views: [git_history, pr_data]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: use_partial
+    retrieval_recipe:
+      strategy: timeline_view
+      hints:
+        range_days: "90"
+        include_prd_status: "true"
+      qdrant_index: default
+      evidence_budget_tokens: 4500
+    answer_format:
+      sections:
+        - name: status_summary
+          required: true
+          description: "Current status: in-progress / shipped / blocked / planned"
+        - name: milestones_hit
+          required: false
+          description: "What's been completed (PRD signed off, first PR merged, deployed)"
+        - name: milestones_missed
+          required: false
+          description: "What was planned but hasn't happened yet"
+        - name: blocking_items
+          required: false
+          description: "Current blockers and who owns them"
+        - name: citations
+          required: true
+      citation_min: 2
+      citation_max: 4
+      citation_style: section_level
+      chart_types: [timeline]
+    evidence_budget_tokens: 4500
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.3
+
+  - id: pm.entities_affected_by_feature
+    persona: pm
+    intent: "Identify which domain entities, services, and external integrations a feature touches."
+    intent_examples:
+      - "what does the prior auth feature touch"
+      - "which entities are affected by the claim submission feature"
+      - "what services does the eligibility check change"
+      - "what's the scope of the provider portal feature"
+      - "which payers are affected by this feature"
+      - "what domain entities does feature F interact with"
+      - "scope of changes for the member portal"
+      - "what does this feature depend on"
+    required_signals:
+      - name: feature_entity
+        source_views: [entity_index, prd_store]
+        required_confidence: 0.5
+        sparse_fallback:
+          strategy: generic_retrieval
+      - name: entity_relationships
+        source_views: [entity_graph, code_graph]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: use_partial
+    optional_signals:
+      - name: external_integrations
+        source_views: [api_contracts, integration_data]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+    retrieval_recipe:
+      strategy: blast_radius
+      hints:
+        include_domain_entities: "true"
+        max_hops: "2"
+      qdrant_index: default
+      evidence_budget_tokens: 4000
+    answer_format:
+      sections:
+        - name: entity_map
+          required: true
+          description: "All domain entities this feature touches with relationship type"
+        - name: service_changes
+          required: false
+          description: "Backend services and APIs modified"
+        - name: payer_specific_impact
+          required: false
+          description: "Per-payer behavior differences if applicable"
+        - name: external_dependencies
+          required: false
+          description: "External system dependencies and integration points"
+        - name: citations
+          required: true
+      citation_min: 2
+      citation_max: 4
+      citation_style: section_level
+    evidence_budget_tokens: 4000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.3
+
+  - id: pm.open_decisions_for_feature
+    persona: pm
+    intent: "Surface open decisions, blockers, and unresolved questions for a feature."
+    intent_examples:
+      - "what's blocking the prior auth feature"
+      - "open decisions for the claim submission work"
+      - "what's unresolved about the eligibility check feature"
+      - "what decisions are pending for the provider portal"
+      - "blockers for the payment feature"
+      - "what's still unclear about this feature"
+      - "open questions blocking the sprint"
+      - "what decisions need to be made before we can ship"
+    required_signals:
+      - name: feature_entity
+        source_views: [entity_index, prd_store, linear_data]
+        required_confidence: 0.5
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: open_issues
+        source_views: [linear_data, jira_data, github_issues]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: use_partial
+      - name: adr_drafts
+        source_views: [adr_store, decision_records]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+    retrieval_recipe:
+      strategy: hybrid_search
+      hints:
+        query_expansion: "blockers decisions open questions"
+        prioritize_recent: "true"
+      qdrant_index: default
+      evidence_budget_tokens: 4000
+    answer_format:
+      sections:
+        - name: blocking_decisions
+          required: true
+          description: "Open decisions that must be made before the feature can proceed"
+        - name: open_questions
+          required: false
+          description: "Unresolved technical or product questions"
+        - name: pending_approvals
+          required: false
+          description: "Decisions awaiting sign-off from stakeholders"
+        - name: citations
+          required: true
+      citation_min: 2
+      citation_max: 4
+      citation_style: section_level
+    evidence_budget_tokens: 4000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.2
+
+  - id: pm.roadmap_status
+    persona: pm
+    intent: "Report on what has shipped and what is planned for the current period."
+    intent_examples:
+      - "what shipped this quarter"
+      - "what's been delivered in the last 30 days"
+      - "roadmap status for Q2"
+      - "what's on track for this sprint"
+      - "summary of recent releases"
+      - "what's shipped recently"
+      - "quarterly progress report"
+      - "what have we delivered in the last 90 days"
+    required_signals:
+      - name: deploy_history
+        source_views: [event_stream, deploy_history, git_history]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: prd_completion
+        source_views: [prd_store, linear_data]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+    retrieval_recipe:
+      strategy: timeline_view
+      hints:
+        range_days: "90"
+        group_by_feature: "true"
+      qdrant_index: default
+      evidence_budget_tokens: 4500
+    answer_format:
+      sections:
+        - name: shipped_items
+          required: true
+          description: "Features and improvements that were deployed"
+        - name: in_progress
+          required: false
+          description: "Work actively in development"
+        - name: planned
+          required: false
+          description: "Work committed for upcoming periods"
+        - name: citations
+          required: true
+      citation_min: 2
+      citation_max: 4
+      citation_style: section_level
+      chart_types: [timeline, burndown]
+    evidence_budget_tokens: 4500
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.3
+
+  - id: pm.customer_promise_lookup
+    persona: pm
+    intent: "Find what was promised to a specific customer about a feature, found in calls, emails, or sales materials."
+    intent_examples:
+      - "what did we tell Acme about the prior auth feature"
+      - "what did we promise the customer about claim submission"
+      - "customer commitments for the provider portal"
+      - "what did we commit to in the last sales call"
+      - "what was promised to the customer about our roadmap"
+      - "customer-facing commitments for this feature"
+      - "what did we say we'd deliver to this account"
+      - "commitments made in the demo last month"
+    required_signals:
+      - name: feature_entity
+        source_views: [entity_index, prd_store]
+        required_confidence: 0.4
+        sparse_fallback:
+          strategy: generic_retrieval
+    optional_signals:
+      - name: call_transcripts
+        source_views: [call_data, salesforce_data, intercom_data]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+          message: "No call transcript connector available; showing PRD-based commitments only."
+      - name: email_records
+        source_views: [email_data, crm_data]
+        required_confidence: 0.3
+        sparse_fallback:
+          strategy: skip_section
+    retrieval_recipe:
+      strategy: cross_source_search
+      hints:
+        source_types: "call,email,prd,crm"
+        commitment_signals: "true"
+      qdrant_index: default
+      evidence_budget_tokens: 4000
+    answer_format:
+      sections:
+        - name: commitments_summary
+          required: true
+          description: "Summary of commitments made, even if only from PRDs (call data may be absent)"
+        - name: source_details
+          required: false
+          description: "Specific calls or emails where commitments were stated"
+        - name: gaps_warning
+          required: false
+          description: "Warning if call connector is not available"
+        - name: citations
+          required: true
+      citation_min: 2
+      citation_max: 4
+      citation_style: section_level
+    evidence_budget_tokens: 4000
+    fallback_behavior:
+      on_no_match: generic_retrieval
+      on_sparse_signals: partial_answer
+      min_signal_coverage: 0.2

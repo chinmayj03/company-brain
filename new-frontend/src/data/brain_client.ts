@@ -219,6 +219,8 @@ export interface WorkspaceSource {
   last_synced_at?: string;
   sync_status: 'ok' | 'syncing' | 'error' | 'pending';
   error_message?: string;
+  entity_count?: number;
+  config?: Record<string, unknown>;
 }
 
 // ── Suggestion type ───────────────────────────────────────────────────────────
@@ -364,6 +366,43 @@ export function entitiesToGraphNodes(
     };
   });
 }
+
+// ── Source registration + job polling (ADR-0074) ─────────────────────────────
+
+export interface RegisterSourceRequest {
+  kind: string;
+  display_name: string;
+  config: Record<string, string>;
+  auto_index?: boolean;
+}
+
+export interface RegisterSourceResponse {
+  source: WorkspaceSource;
+  job_id?: string;
+}
+
+export const registerSource = (
+  workspaceId: string,
+  body: RegisterSourceRequest,
+): Promise<RegisterSourceResponse> =>
+  post<RegisterSourceResponse>(`/ai/workspaces/${workspaceId}/sources`, body);
+
+export const deleteSource = (workspaceId: string, sourceId: string): Promise<void> =>
+  fetch(`/ai/workspaces/${workspaceId}/sources/${sourceId}`, { method: 'DELETE' })
+    .then((r) => { if (!r.ok && r.status !== 204) throw new Error(`${r.status}`); });
+
+export interface JobStatus {
+  status: 'running' | 'completed' | 'failed';
+  job_id: string;
+  error?: string;
+  result?: { entity_count: number; edge_count: number; gap_count?: number };
+  progress?: { current_stage: string; logs: unknown[] };
+}
+
+export const getJobStatus = (jobId: string): Promise<JobStatus> =>
+  get<JobStatus>(`/ai/pipeline/jobs/${jobId}`);
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Map change_risk → verdict stats the Ask view displays.

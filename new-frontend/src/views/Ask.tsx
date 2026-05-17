@@ -98,6 +98,61 @@ const IconADR = () => (
 );
 const OWNER_COLORS: Record<string, string> = { JM: '#2E5C8A', PA: '#C8553D', SK: '#588B6F' };
 
+// ── ScopeChip — dropdown repo picker ─────────────────────────────────────────
+
+function ScopeChip() {
+  const repos       = useRepoStore((s) => s.repos);
+  const selectedRepo = useRepoStore((s) => s.selectedRepo);
+  const selectRepo  = useRepoStore((s) => s.selectRepo);
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div style={{ position: 'relative', display: 'inline-block' }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          display: 'flex', alignItems: 'center', gap: 5,
+          background: 'var(--bg-surface)', border: '1px solid var(--border-default)',
+          borderRadius: 20, padding: '3px 10px 3px 8px',
+          fontSize: 12, color: 'var(--text-secondary)', cursor: 'pointer',
+        }}
+      >
+        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>scope</span>
+        <span style={{ fontWeight: 500 }}>{selectedRepo?.display_name ?? 'All sources'}</span>
+        <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>▾</span>
+      </button>
+      {open && (
+        <div style={{
+          position: 'absolute', top: '110%', left: 0, zIndex: 20,
+          background: 'var(--warm-surface)', border: '1px solid var(--border-default)',
+          borderRadius: 8, minWidth: 200, boxShadow: '0 4px 16px rgba(0,0,0,0.18)',
+          overflow: 'hidden',
+        }}>
+          <div
+            style={{ padding: '8px 12px', fontSize: 12, cursor: 'pointer', color: 'var(--text-secondary)' }}
+            onClick={() => { useRepoStore.setState({ selectedRepo: null }); setOpen(false); }}
+          >
+            All sources
+          </div>
+          {repos.map((r) => (
+            <div
+              key={r.id}
+              style={{
+                padding: '8px 12px', fontSize: 12, cursor: 'pointer',
+                background: selectedRepo?.id === r.id ? 'var(--bg-surface)' : 'transparent',
+                color: 'var(--text-primary)',
+              }}
+              onClick={() => { selectRepo(r); setOpen(false); }}
+            >
+              {r.display_name}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function Ask() {
@@ -283,6 +338,11 @@ export default function Ask() {
         <TopBar crumb="Codebase impact" />
         <div className="qview">
           <div className="va-content">
+
+            {/* Scope chip — repo picker dropdown */}
+            <div style={{ marginBottom: 8 }}>
+              <ScopeChip />
+            </div>
 
             {/* Query bar */}
             <div className="qbar">

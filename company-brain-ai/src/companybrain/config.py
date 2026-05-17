@@ -366,5 +366,9 @@ class Settings(BaseSettings):
     audit_enabled: bool = True
     audit_default_actor: str = "pipeline"
 
+    # ── ADR-0090 P1: Event-stream memory substrate ────────────────────────────
+    event_store_enabled: bool = True
+    event_freshness_seconds: int = 60
+
 
 settings = Settings()

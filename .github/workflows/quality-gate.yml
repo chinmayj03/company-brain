@@ -1,0 +1,33 @@
+name: Quality Gate
+
+on:
+  pull_request:
+    branches:
+      - main
+      - release/v2-seed-window
+
+jobs:
+  quality-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: cd company-brain-ai && pip install -e ".[dev]" 2>/dev/null || pip install pytest
+
+      - name: Run quality gate
+        run: cd company-brain-ai && pytest tests/quality/ -v --tb=short
+        env:
+          # These are set by a real quality-run job; defaults to baseline (always passes).
+          # To run against a live brain, set QUALITY_RUN_LIVE=true and supply real scores:
+          #   QUALITY_SQL_COVERAGE_SCORE   — float [0, 1], e.g. 0.81
+          #   QUALITY_BLAST_RADIUS_SCORE   — float [0, 1], e.g. 0.68
+          #   QUALITY_CITATION_SCORE       — float [0, 1], e.g. 0.97
+          #   QUALITY_CONFIDENCE_SCORE     — float [0, 1], e.g. 0.75
+          #   QUALITY_LATENCY_P50_SCORE    — float seconds, e.g. 2.8
+          #   QUALITY_LATENCY_P90_SCORE    — float seconds, e.g. 7.5
+          QUALITY_RUN_LIVE: "false"

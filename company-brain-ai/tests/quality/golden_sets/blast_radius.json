@@ -1,0 +1,94 @@
+{
+  "version": "1.0",
+  "baseline": 0.65,
+  "description": "Blast radius recall: verifies that when a component changes, the query engine identifies all downstream dependents that would be affected. Measures recall — how many true dependents does the system surface?",
+  "examples": [
+    {
+      "id": "blast-001",
+      "input": "What services are affected if ClaimRepository.findByMemberId changes its return type?",
+      "expected_affected": [
+        "ClaimService",
+        "ClaimSearchController",
+        "EligibilityCheckService",
+        "ClaimSummaryProjection"
+      ],
+      "tags": ["repository", "return-type-change", "claim"]
+    },
+    {
+      "id": "blast-002",
+      "input": "Which components depend on the network_provider table's npi_number column?",
+      "expected_affected": [
+        "NetworkProviderRepository",
+        "ProviderLookupService",
+        "NetworkValidationService",
+        "ProviderDirectoryController"
+      ],
+      "tags": ["database-column", "healthcare", "provider"]
+    },
+    {
+      "id": "blast-003",
+      "input": "If MemberEligibilityService.checkEligibility is modified, what breaks?",
+      "expected_affected": [
+        "AuthorizationService",
+        "ClaimAdjudicationService",
+        "EligibilityController",
+        "BenefitVerificationTask"
+      ],
+      "tags": ["service-method", "eligibility", "insurance"]
+    },
+    {
+      "id": "blast-004",
+      "input": "What is affected if the enrollment table's benefit_start_date column is renamed?",
+      "expected_affected": [
+        "EnrollmentRepository",
+        "MemberEnrollmentService",
+        "EligibilitySnapshotJob",
+        "EnrollmentAuditListener"
+      ],
+      "tags": ["database-column", "rename", "enrollment"]
+    },
+    {
+      "id": "blast-005",
+      "input": "Which services call PriorAuthorizationRepository and would be broken by its removal?",
+      "expected_affected": [
+        "AuthorizationWorkflowService",
+        "ClaimPreCertService",
+        "PriorAuthController",
+        "AuthorizationExpiryJob"
+      ],
+      "tags": ["repository", "deletion", "prior-auth"]
+    },
+    {
+      "id": "blast-006",
+      "input": "If NetworkGapScoringService changes its scoring algorithm signature, what is the blast radius?",
+      "expected_affected": [
+        "NetworkAdequacyController",
+        "NetworkReportingService",
+        "GapScoreAggregationJob"
+      ],
+      "tags": ["service", "algorithm", "network-gap"]
+    },
+    {
+      "id": "blast-007",
+      "input": "What code paths are affected if the claim table adds a NOT NULL constraint on adjudicator_id?",
+      "expected_affected": [
+        "ClaimRepository",
+        "ClaimIngestionService",
+        "ClaimAdjudicationService",
+        "ClaimMigrationScript"
+      ],
+      "tags": ["schema-change", "constraint", "claim"]
+    },
+    {
+      "id": "blast-008",
+      "input": "If the ProviderContractService interface changes, which callers need updating?",
+      "expected_affected": [
+        "NetworkContractController",
+        "ContractRenewalJob",
+        "ProviderOnboardingService",
+        "ContractAuditService"
+      ],
+      "tags": ["interface-change", "contract", "provider"]
+    }
+  ]
+}

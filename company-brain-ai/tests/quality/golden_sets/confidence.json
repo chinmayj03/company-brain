@@ -1,0 +1,77 @@
+{
+  "version": "1.0",
+  "baseline": 0.70,
+  "description": "Confidence calibration: verifies that the system's reported confidence level (high/medium/low) matches the expected level for each query. 70% accuracy is the baseline — questions about well-indexed classes should yield high confidence; ambiguous or cross-cutting questions should yield medium or low.",
+  "examples": [
+    {
+      "id": "conf-001",
+      "question": "What is the exact SQL used by ClaimRepository.findByClaimId?",
+      "expected_level": "high",
+      "rationale": "Direct repository method lookup — well-indexed, single entity",
+      "tags": ["repository", "sql", "exact-lookup"]
+    },
+    {
+      "id": "conf-002",
+      "question": "How many microservices does the network-iq backend have?",
+      "expected_level": "low",
+      "rationale": "Architectural overview question — brain may have partial indexing",
+      "tags": ["architecture", "count", "microservices"]
+    },
+    {
+      "id": "conf-003",
+      "question": "Which class handles the PAID state transition in the claim lifecycle?",
+      "expected_level": "high",
+      "rationale": "Specific state machine entity — directly indexed",
+      "tags": ["state-machine", "claim", "specific"]
+    },
+    {
+      "id": "conf-004",
+      "question": "Is the codebase HIPAA compliant?",
+      "expected_level": "low",
+      "rationale": "Compliance judgment — requires external knowledge beyond code graph",
+      "tags": ["compliance", "hipaa", "judgment"]
+    },
+    {
+      "id": "conf-005",
+      "question": "What parameters does NetworkProviderRepository.findActiveByNpi accept?",
+      "expected_level": "high",
+      "rationale": "Method signature query — directly extractable from JPA repository",
+      "tags": ["repository", "method-signature", "provider"]
+    },
+    {
+      "id": "conf-006",
+      "question": "How long does the claim adjudication process take on average?",
+      "expected_level": "low",
+      "rationale": "Runtime/operational metric — not captured in static code graph",
+      "tags": ["runtime", "performance", "operational"]
+    },
+    {
+      "id": "conf-007",
+      "question": "What foreign keys reference the member table?",
+      "expected_level": "medium",
+      "rationale": "Schema-level question — depends on DDL extraction completeness",
+      "tags": ["schema", "foreign-key", "member"]
+    },
+    {
+      "id": "conf-008",
+      "question": "Which services call MemberEligibilityService?",
+      "expected_level": "medium",
+      "rationale": "Dependency query — depends on relationship extraction coverage",
+      "tags": ["dependency", "call-graph", "eligibility"]
+    },
+    {
+      "id": "conf-009",
+      "question": "What does the EligibilitySnapshotJob do?",
+      "expected_level": "high",
+      "rationale": "Named class description — context synthesis should capture this",
+      "tags": ["class-description", "job", "eligibility"]
+    },
+    {
+      "id": "conf-010",
+      "question": "Why was the claim adjudication algorithm redesigned in Q3 2024?",
+      "expected_level": "low",
+      "rationale": "Historical intent question — not in code graph, requires commit history context",
+      "tags": ["history", "intent", "design-decision"]
+    }
+  ]
+}

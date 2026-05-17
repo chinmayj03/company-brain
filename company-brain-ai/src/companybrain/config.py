@@ -412,6 +412,13 @@ class Settings(BaseSettings):
     # ── A1.5: Streaming ───────────────────────────────────────────────────────
     streaming_enabled: bool = Field(default=True, env="STREAMING_ENABLED")
 
+    # ── A1.6: Glossary auto-discovery ─────────────────────────────────────────
+    glossary_enabled: bool = True
+    glossary_tuning_store_path: str = ".brain/tuning"
+    glossary_min_occurrences: int = 20
+    glossary_min_source_types: int = 2
+    glossary_max_terms_in_prompt: int = 20
+
     # ── A1.7: Few-shot bank ────────────────────────────────────────────────────
     few_shot_enabled: bool = Field(default=True, env="FEW_SHOT_ENABLED")
     few_shot_bank_path: str = Field(default=".brain/few_shot", env="FEW_SHOT_BANK_PATH")

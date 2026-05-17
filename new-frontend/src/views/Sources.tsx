@@ -1,7 +1,10 @@
 import { useState, useEffect } from 'react';
 import Sidebar from '../components/Sidebar';
 import TopBar from '../components/TopBar';
+import AddSourceModal from '../components/AddSourceModal';
 import { getSources, triggerSync, type WorkspaceSource } from '../data/brain_client';
+import { useWorkspaceStore } from '../store/workspace_store';
+import { sourceKindLabel } from '../utils/sourceKind';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -18,54 +21,34 @@ function relativeTime(iso: string | undefined): string {
 }
 
 function HealthDot({ status }: { status: WorkspaceSource['sync_status'] }) {
-  const map: Record<WorkspaceSource['sync_status'], { color: string; shadow?: string; title: string }> = {
-    ok:      { color: 'var(--success)', shadow: '0 0 0 3px rgba(27,123,69,0.14)', title: 'OK' },
-    syncing: { color: 'var(--accent-primary)', title: 'Syncing' },
-    error:   { color: 'var(--danger)', shadow: '0 0 0 3px rgba(224,119,100,0.14)', title: 'Error' },
-    pending: { color: 'var(--text-muted)', title: 'Pending' },
+  const colors: Record<WorkspaceSource['sync_status'], string> = {
+    ok:      'var(--success)',
+    syncing: 'var(--accent-primary)',
+    error:   'var(--danger)',
+    pending: 'var(--text-muted)',
   };
-  const m = map[status];
   return (
-    <span
-      title={m.title}
-      style={{
-        display: 'inline-block',
-        width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
-        background: m.color,
-        boxShadow: m.shadow ?? 'none',
-        animation: status === 'syncing' ? 'pulse 1.6s ease-in-out infinite' : 'none',
-      }}
-    />
-  );
-}
-
-function KindBadge({ kind }: { kind: string }) {
-  return (
-    <span style={{
-      fontSize: 10, fontWeight: 600, letterSpacing: '0.06em',
-      textTransform: 'uppercase',
-      padding: '2px 7px', borderRadius: 3,
-      background: 'var(--bg-surface)', color: 'var(--text-secondary)',
-      border: '1px solid var(--border-default)',
-      flexShrink: 0,
-    }}>
-      {kind}
-    </span>
+    <span title={status} style={{
+      display: 'inline-block', width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
+      background: colors[status],
+      animation: status === 'syncing' ? 'pulse 1.6s ease-in-out infinite' : 'none',
+    }} />
   );
 }
 
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function Sources() {
-  const workspaceId = (window as unknown as { __WORKSPACE_ID__?: string }).__WORKSPACE_ID__ ?? 'default';
+  const workspaceId = useWorkspaceStore((s) => s.workspaceId);
 
-  const [sources, setSources]   = useState<WorkspaceSource[]>([]);
-  const [loading, setLoading]   = useState(true);
-  const [error, setError]       = useState<string | null>(null);
-  const [syncing, setSyncing]   = useState<Set<string>>(new Set());
-  const [syncErr, setSyncErr]   = useState<Record<string, string>>({});
+  const [sources, setSources] = useState<WorkspaceSource[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState<string | null>(null);
+  const [syncing, setSyncing] = useState<Set<string>>(new Set());
+  const [syncErr, setSyncErr] = useState<Record<string, string>>({});
+  const [modalOpen, setModalOpen] = useState(false);
 
-  useEffect(() => {
+  function fetchSources() {
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -78,14 +61,15 @@ export default function Sources() {
         }
       });
     return () => { cancelled = true; };
-  }, [workspaceId]);
+  }
+
+  useEffect(fetchSources, [workspaceId]);
 
   async function handleSync(sourceId: string) {
     setSyncing((prev) => new Set(prev).add(sourceId));
     setSyncErr((prev) => { const n = { ...prev }; delete n[sourceId]; return n; });
     try {
       await triggerSync(workspaceId, sourceId);
-      // Optimistically mark as syncing in local state
       setSources((prev) => prev.map((s) =>
         s.id === sourceId ? { ...s, sync_status: 'syncing' } : s
       ));
@@ -99,6 +83,12 @@ export default function Sources() {
     }
   }
 
+  // Entity count — present on live backend rows once ADR-0074 migration runs
+  function entityCount(s: WorkspaceSource): number | null {
+    const v = (s as WorkspaceSource & { entity_count?: number }).entity_count;
+    return typeof v === 'number' ? v : null;
+  }
+
   return (
     <div className="app">
       <Sidebar />
@@ -107,26 +97,35 @@ export default function Sources() {
         <div className="qview">
           <div className="va-content">
 
-            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 16 }}>
+            {/* Header + Add button */}
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 20 }}>
               <h2 style={{ margin: 0, fontSize: 14, fontWeight: 600, color: 'var(--text-primary)', flex: 1 }}>
-                Indexed sources
+                Sources
                 {!loading && sources.length > 0 && (
                   <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 400, color: 'var(--text-tertiary)' }}>
-                    · {sources.length} source{sources.length !== 1 ? 's' : ''}
+                    · {sources.length}
                   </span>
                 )}
               </h2>
+              <button
+                onClick={() => setModalOpen(true)}
+                style={{
+                  background: 'var(--accent-primary)', color: '#fff', border: 'none',
+                  borderRadius: 6, padding: '7px 14px', fontSize: 13, cursor: 'pointer',
+                }}
+              >
+                + Add source
+              </button>
             </div>
 
-            {/* Loading */}
+            {/* Loading skeletons */}
             {loading && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {[...Array(4)].map((_, i) => (
+                {[...Array(3)].map((_, i) => (
                   <div key={i} style={{
-                    height: 68, borderRadius: 8,
-                    background: 'var(--bg-surface)',
+                    height: 64, borderRadius: 8, background: 'var(--bg-surface)',
                     animation: 'pulse 1.6s ease-in-out infinite',
-                    opacity: 0.6 - i * 0.1,
+                    opacity: 0.6 - i * 0.12,
                   }} />
                 ))}
               </div>
@@ -135,106 +134,142 @@ export default function Sources() {
             {/* Error */}
             {!loading && error && (
               <div style={{
-                padding: 20, borderRadius: 8,
+                padding: 20, borderRadius: 8, fontSize: 13,
                 background: 'var(--danger-soft)', border: '1px solid var(--danger-border)',
-                color: 'var(--danger)', fontSize: 13,
+                color: 'var(--danger)',
               }}>
                 <strong>Failed to load sources</strong> — {error}
               </div>
             )}
 
-            {/* Empty state */}
+            {/* Onboarding empty state */}
             {!loading && !error && sources.length === 0 && (
               <div style={{
-                textAlign: 'center', padding: '80px 0',
-                color: 'var(--text-tertiary)', fontSize: 14,
+                border: '1px dashed var(--border-default)',
+                borderRadius: 10, padding: 40, textAlign: 'center',
               }}>
-                <div style={{ fontSize: 16, color: 'var(--text-secondary)', marginBottom: 8, fontWeight: 500 }}>
-                  No sources indexed yet.
+                <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 10 }}>
+                  Connect your first source
                 </div>
-                <div>Run the pipeline to populate.</div>
+                <div style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24, maxWidth: 380, margin: '0 auto 24px' }}>
+                  Company Brain indexes git repos, OpenAPI specs, Confluence spaces,
+                  DB migrations, and more.
+                </div>
+                <button
+                  onClick={() => setModalOpen(true)}
+                  style={{
+                    background: 'var(--accent-primary)', color: '#fff', border: 'none',
+                    borderRadius: 6, padding: '9px 22px', fontSize: 14, fontWeight: 600,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Add source →
+                </button>
               </div>
             )}
 
             {/* Source list */}
             {!loading && !error && sources.length > 0 && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {sources.map((s) => (
-                  <div key={s.id}>
-                    <div style={{
-                      display: 'flex', alignItems: 'center', gap: 14,
-                      padding: '14px 18px',
-                      background: 'var(--warm-surface)',
-                      border: `1px solid ${s.sync_status === 'error' ? 'var(--danger-border)' : 'var(--warm-line)'}`,
-                      borderRadius: 8,
-                    }}>
-                      {/* Icon */}
+                {sources.map((s) => {
+                  const count = entityCount(s);
+                  return (
+                    <div key={s.id}>
                       <div style={{
-                        width: 36, height: 36, borderRadius: 8, flexShrink: 0,
-                        background: 'var(--bg-surface)',
-                        display: 'grid', placeItems: 'center',
-                        fontSize: 11, fontWeight: 700,
-                        fontFamily: 'var(--font-mono)',
-                        color: 'var(--text-secondary)',
+                        display: 'flex', alignItems: 'center', gap: 14,
+                        padding: '14px 18px', borderRadius: 8,
+                        background: 'var(--warm-surface)',
+                        border: `1px solid ${s.sync_status === 'error' ? 'var(--danger-border)' : 'var(--warm-line)'}`,
                       }}>
-                        {s.id.toUpperCase().slice(0, 2)}
-                      </div>
-
-                      {/* Name + meta */}
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                          <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>
-                            {s.display_name}
-                          </span>
-                          <KindBadge kind={s.kind} />
-                        </div>
-                        <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 2, fontVariantNumeric: 'tabular-nums' }}>
-                          {s.url && <span style={{ marginRight: 8 }}>{s.url}</span>}
-                          Last synced: {relativeTime(s.last_synced_at)}
-                        </div>
-                      </div>
-
-                      {/* Health dot */}
-                      <HealthDot status={s.sync_status} />
-
-                      {/* Sync button */}
-                      <button
-                        onClick={() => handleSync(s.id)}
-                        disabled={syncing.has(s.id) || s.sync_status === 'syncing'}
-                        style={{
-                          height: 28, padding: '0 12px',
-                          background: 'transparent',
-                          border: '1px solid var(--border-default)',
-                          borderRadius: 4, fontSize: 12, fontWeight: 500,
+                        {/* Kind icon */}
+                        <div style={{
+                          width: 36, height: 36, borderRadius: 8, flexShrink: 0,
+                          background: 'var(--bg-surface)',
+                          display: 'grid', placeItems: 'center',
+                          fontSize: 10, fontWeight: 700, fontFamily: 'var(--font-mono)',
                           color: 'var(--text-secondary)',
-                          cursor: (syncing.has(s.id) || s.sync_status === 'syncing') ? 'not-allowed' : 'pointer',
-                          opacity: (syncing.has(s.id) || s.sync_status === 'syncing') ? 0.5 : 1,
-                          flexShrink: 0,
-                        }}
-                      >
-                        {syncing.has(s.id) || s.sync_status === 'syncing' ? 'Syncing…' : 'Sync'}
-                      </button>
-                    </div>
+                        }}>
+                          {sourceKindLabel(s.kind)}
+                        </div>
 
-                    {/* Error message */}
-                    {(s.sync_status === 'error' || syncErr[s.id]) && (
-                      <div style={{
-                        marginTop: 4, padding: '6px 14px',
-                        fontSize: 12, color: 'var(--danger)',
-                        background: 'var(--danger-soft)',
-                        border: '1px solid var(--danger-border)',
-                        borderRadius: '0 0 6px 6px',
-                      }}>
-                        {syncErr[s.id] ?? s.error_message ?? 'Sync error'}
+                        {/* Name + meta */}
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                            <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>
+                              {s.display_name}
+                            </span>
+                            <span style={{
+                              fontSize: 10, fontWeight: 600, letterSpacing: '0.06em',
+                              textTransform: 'uppercase', padding: '2px 6px', borderRadius: 3,
+                              background: 'var(--bg-surface)', color: 'var(--text-muted)',
+                              border: '1px solid var(--border-default)',
+                            }}>
+                              {s.kind}
+                            </span>
+                            {count !== null && count > 0 && (
+                              <span style={{
+                                fontSize: 11, color: 'var(--text-muted)',
+                                background: 'var(--bg-surface)',
+                                border: '1px solid var(--border-default)',
+                                padding: '1px 6px', borderRadius: 3,
+                                fontVariantNumeric: 'tabular-nums',
+                              }}>
+                                {count.toLocaleString()} entities
+                              </span>
+                            )}
+                          </div>
+                          <div style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 3 }}>
+                            {s.url && <span style={{ marginRight: 10 }}>{s.url}</span>}
+                            synced {relativeTime(s.last_synced_at)}
+                          </div>
+                        </div>
+
+                        <HealthDot status={s.sync_status} />
+
+                        <button
+                          onClick={() => handleSync(s.id)}
+                          disabled={syncing.has(s.id) || s.sync_status === 'syncing'}
+                          style={{
+                            height: 28, padding: '0 12px', borderRadius: 4, fontSize: 12,
+                            fontWeight: 500, color: 'var(--text-secondary)', flexShrink: 0,
+                            background: 'transparent', border: '1px solid var(--border-default)',
+                            cursor: syncing.has(s.id) || s.sync_status === 'syncing' ? 'not-allowed' : 'pointer',
+                            opacity: syncing.has(s.id) || s.sync_status === 'syncing' ? 0.5 : 1,
+                          }}
+                        >
+                          {syncing.has(s.id) || s.sync_status === 'syncing' ? 'Syncing…' : 'Sync'}
+                        </button>
                       </div>
-                    )}
-                  </div>
-                ))}
+
+                      {(s.sync_status === 'error' || syncErr[s.id]) && (
+                        <div style={{
+                          marginTop: 2, padding: '6px 14px', fontSize: 12,
+                          color: 'var(--danger)', background: 'var(--danger-soft)',
+                          border: '1px solid var(--danger-border)',
+                          borderRadius: '0 0 6px 6px',
+                        }}>
+                          {syncErr[s.id] ?? s.error_message ?? 'Sync error'}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
+
           </div>
         </div>
       </main>
+
+      <AddSourceModal
+        open={modalOpen}
+        workspaceId={workspaceId}
+        onClose={() => setModalOpen(false)}
+        onDone={() => {
+          setModalOpen(false);
+          getSources(workspaceId).then(setSources).catch(() => {});
+        }}
+      />
     </div>
   );
 }

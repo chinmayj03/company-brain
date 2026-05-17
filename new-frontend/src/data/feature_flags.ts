@@ -140,8 +140,15 @@ export function useFlags(): Flags {
   return state;
 }
 
-export function useFlagToggle(): { toggle: (name: FlagName) => void; toggleAll: () => void } {
-  const toggle   = useCallback((name: FlagName) => flags.toggle(name), []);
-  const toggleAll = useCallback(() => flags.toggleAll(), []);
-  return { toggle, toggleAll };
+export function useFlagToggle(): {
+  toggle: (name: FlagName) => void;
+  toggleFlag: (name: FlagName | string) => void;
+  toggleAll: () => void;
+  setAll: (value: boolean) => void;
+} {
+  const toggle    = useCallback((name: FlagName) => flags.toggle(name), []);
+  const toggleFlag = useCallback((name: FlagName | string) => flags.toggle(name as FlagName), []);
+  const toggleAll  = useCallback(() => flags.toggleAll(), []);
+  const setAll     = useCallback((value: boolean) => flags.setAll(value), []);
+  return { toggle, toggleFlag, toggleAll, setAll };
 }

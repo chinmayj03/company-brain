@@ -5,6 +5,7 @@ import Saved from './views/Saved';
 import AgentsMCP from './views/AgentsMCP';
 import AuditLog from './views/AuditLog';
 import Sources from './views/Sources';
+import Settings from './views/Settings';
 import FlagOverlay from './components/FlagOverlay';
 import LiveModeChip from './components/LiveModeChip';
 import { useWorkspaceBootstrap } from './hooks/useWorkspace';
@@ -20,8 +21,9 @@ function AppInner() {
         <Route path="/saved"   element={<Saved />} />
         <Route path="/agents"  element={<AgentsMCP />} />
         <Route path="/audit"   element={<AuditLog />} />
-        <Route path="/sources" element={<Sources />} />
-        <Route path="*"        element={<Navigate to="/ask" replace />} />
+        <Route path="/sources"  element={<Sources />} />
+        <Route path="/settings" element={<Settings />} />
+        <Route path="*"         element={<Navigate to="/ask" replace />} />
       </Routes>
       <FlagOverlay />
       <LiveModeChip />

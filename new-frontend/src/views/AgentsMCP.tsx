@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import Sidebar from '../components/Sidebar';
 import TopBar from '../components/TopBar';
 import { getMcpAgents, type McpAgent } from '../data/brain_client';
+import { useWorkspaceStore } from '../store/workspace_store';
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
@@ -55,7 +56,7 @@ type Filter = 'all' | 'live' | 'idle';
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function AgentsMCP() {
-  const workspaceId = (window as unknown as { __WORKSPACE_ID__?: string }).__WORKSPACE_ID__ ?? 'default';
+  const workspaceId = useWorkspaceStore((s) => s.workspaceId);
 
   const [agents, setAgents]   = useState<McpAgent[]>([]);
   const [loading, setLoading] = useState(true);

@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import Sidebar from '../components/Sidebar';
 import TopBar from '../components/TopBar';
 import { getConversations, type ConversationSummary } from '../data/brain_client';
+import { useWorkspaceStore } from '../store/workspace_store';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -58,7 +59,7 @@ const IconDownload = () => (
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function AuditLog() {
-  const workspaceId = (window as unknown as { __WORKSPACE_ID__?: string }).__WORKSPACE_ID__ ?? 'default';
+  const workspaceId = useWorkspaceStore((s) => s.workspaceId);
 
   const [rows, setRows]       = useState<ConversationSummary[]>([]);
   const [loading, setLoading] = useState(true);

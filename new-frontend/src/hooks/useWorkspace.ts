@@ -14,12 +14,13 @@ export function useWorkspaceBootstrap() {
       .then(() => flags.setAll(true))
       .catch(() => { /* stay in mock mode */ });
 
-    // Load current user + workspace
-    getMe().then(setMe).catch(() => {});
-
-    // Load repos once we know the workspace_id
+    // Load user → then repos (chained: one request, no race condition)
     getMe()
-      .then((me) => getRepos(me.workspace_id).then(setRepos))
+      .then((me) => {
+        setMe(me);
+        return getRepos(me.workspace_id);
+      })
+      .then(setRepos)
       .catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 }

@@ -359,5 +359,22 @@ class Settings(BaseSettings):
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
 
+    # ── ADR-0093: Cross-Source Entity Resolution ──────────────────────────────
+    # Path where ResolutionStore persists JSON decisions.
+    # Override via env var: RESOLUTION_STORE_PATH=.brain/resolution
+    resolution_store_path: str = ".resolution"
+    # Cosine similarity threshold for SEMANTIC_EMBED tier.
+    # Matches below this are not surfaced. Override: RESOLUTION_EMBED_THRESHOLD=0.75
+    resolution_embed_threshold: float = 0.80
+    # HuggingFace model used for embedding similarity.
+    # Override: RESOLUTION_EMBED_MODEL=all-mpnet-base-v2
+    resolution_embed_model: str = "all-MiniLM-L6-v2"
+    # Auto-resolve confidence threshold: matches at or above this are merged
+    # without human confirmation. Override: RESOLUTION_AUTO_RESOLVE_THRESHOLD=0.85
+    resolution_auto_resolve_threshold: float = 0.80
+    # Suggest threshold: matches in [suggest, auto_resolve) are surfaced for
+    # human review via GET /resolution/suggestions.
+    resolution_suggest_threshold: float = 0.60
+
 
 settings = Settings()

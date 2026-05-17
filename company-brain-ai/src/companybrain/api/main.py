@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from companybrain.api.routes import pipeline, query, health, repo, feedback, stream, conversations, mcp_agents, suggestions
+from companybrain.api.routes import resolution as resolution_route
 from companybrain.api.routes import me as me_route, workspace as workspace_route
 from companybrain.api.routes import repos as repos_route, owners as owners_route
 from companybrain.api.routes import brain as brain_route
@@ -91,6 +92,8 @@ app.include_router(stream.router, tags=["stream"])
 # Source registry moved to Java backend (SourceController /v1/workspaces/.../sources)
 app.include_router(mcp_agents.router, prefix="/mcp", tags=["mcp-agents"])
 app.include_router(suggestions.router, tags=["suggestions"])
+# ADR-0093 — Cross-Source Entity Resolution
+app.include_router(resolution_route.router, tags=["resolution"])
 
 # ── ADR-0052 P5: brain-as-MCP route ──────────────────────────────────────
 # Exposes the harness MCP surface (query_brain, read_entity, find_callers, ...)

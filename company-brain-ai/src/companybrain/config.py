@@ -359,5 +359,11 @@ class Settings(BaseSettings):
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
 
+    # ── A1.7: Few-shot bank ────────────────────────────────────────────────────
+    few_shot_enabled: bool = True
+    few_shot_bank_path: str = ".brain/few_shot"
+    few_shot_max_per_bucket: int = 200
+    few_shot_min_confidence: float = 0.6
+    few_shot_top_k: int = 3
 
 settings = Settings()

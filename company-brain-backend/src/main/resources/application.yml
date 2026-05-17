@@ -11,6 +11,9 @@ spring:
       minimum-idle: 5
       connection-timeout: 30000
 
+  jackson:
+    property-naming-strategy: SNAKE_CASE   # all Java DTOs serialize/deserialize as snake_case
+
   jpa:
     hibernate:
       ddl-auto: validate   # Flyway owns the schema; JPA only validates

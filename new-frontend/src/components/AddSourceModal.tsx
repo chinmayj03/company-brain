@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { registerSource, getJobStatus } from '../data/brain_client';
+import { registerSource, triggerSync, getJobStatus } from '../data/brain_client';
 import { sourceKindLabel, KIND_AVAILABLE } from '../utils/sourceKind';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -154,6 +154,24 @@ export default function AddSourceModal({ open, workspaceId, onClose, onDone }: P
     setConfig((prev) => ({ ...prev, [key]: val }));
   }
 
+  function startPolling(jobId: string) {
+    if (pollRef.current) clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const job = await getJobStatus(jobId);
+        setStage(job.progress?.current_stage ?? '');
+        if (job.status === 'completed') {
+          clearInterval(pollRef.current!);
+          setEntityCount(job.result?.entity_count ?? 0);
+          setDone(true);
+        } else if (job.status === 'failed') {
+          clearInterval(pollRef.current!);
+          setFailed(job.error ?? 'Indexing failed');
+        }
+      } catch { /* transient */ }
+    }, 1500);
+  }
+
   async function handleSubmit() {
     setFailed(null);
     try {
@@ -167,25 +185,29 @@ export default function AddSourceModal({ open, workspaceId, onClose, onDone }: P
       setStep(3);
 
       if (autoIndex && resp.job_id) {
-        pollRef.current = setInterval(async () => {
-          try {
-            const job = await getJobStatus(resp.job_id!);
-            setStage(job.progress?.current_stage ?? '');
-            if (job.status === 'completed') {
-              clearInterval(pollRef.current!);
-              setEntityCount(job.result?.entity_count ?? 0);
-              setDone(true);
-            } else if (job.status === 'failed') {
-              clearInterval(pollRef.current!);
-              setFailed(job.error ?? 'Indexing failed');
-            }
-          } catch { /* transient */ }
-        }, 1500);
+        startPolling(resp.job_id);
       } else {
         setDone(true);
       }
     } catch (e) {
       setFailed(e instanceof Error ? e.message : 'Failed to add source');
+    }
+  }
+
+  async function handleRetry() {
+    if (!registeredId) return;
+    setFailed(null);
+    setStage('');
+    setDone(false);
+    try {
+      const resp = await triggerSync(workspaceId, registeredId);
+      if (resp.job_id) {
+        startPolling(resp.job_id);
+      } else {
+        setDone(true);
+      }
+    } catch (e) {
+      setFailed(e instanceof Error ? e.message : 'Retry failed');
     }
   }
 
@@ -370,9 +392,14 @@ export default function AddSourceModal({ open, workspaceId, onClose, onDone }: P
                 <div style={{ fontSize: 12, color: 'var(--danger)', fontFamily: 'var(--font-mono)', marginBottom: 16 }}>
                   {failed}
                 </div>
-                <button onClick={() => { onDone(registeredId); onClose(); }} style={primaryBtn}>
-                  Close
-                </button>
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+                  <button onClick={handleRetry} style={primaryBtn}>
+                    Retry indexing
+                  </button>
+                  <button onClick={() => { onDone(registeredId); onClose(); }} style={secondaryBtn}>
+                    Close
+                  </button>
+                </div>
               </>
             )}
           </div>

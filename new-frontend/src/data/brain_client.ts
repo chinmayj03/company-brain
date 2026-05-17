@@ -309,7 +309,7 @@ export async function getSources(workspaceId: string): Promise<WorkspaceSource[]
   return get<WorkspaceSource[]>(`/ai/workspaces/${workspaceId}/sources`);
 }
 
-export async function triggerSync(workspaceId: string, sourceId: string): Promise<void> {
+export async function triggerSync(workspaceId: string, sourceId: string): Promise<{ job_id?: string }> {
   const res = await fetch(`/ai/workspaces/${workspaceId}/sources/${sourceId}/sync`, {
     method: 'POST',
   });
@@ -317,6 +317,7 @@ export async function triggerSync(workspaceId: string, sourceId: string): Promis
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status} POST sync: ${text}`);
   }
+  return res.json().catch(() => ({}));
 }
 
 export async function getSuggestions(workspaceId: string, repoPath?: string): Promise<Suggestion[]> {

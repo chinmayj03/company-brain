@@ -13,12 +13,20 @@ from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
+import redis.asyncio as aioredis
 import structlog
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from companybrain.config import settings
 from companybrain.db import get_session
+
+JOB_TTL = 7200
+
+
+def _redis():
+    return aioredis.from_url(settings.redis_url, decode_responses=True)
 
 log = structlog.get_logger(__name__)
 router = APIRouter()
@@ -138,14 +146,44 @@ async def register_source(workspace_id: UUID, body: RegisterSourceRequest) -> Re
         import uuid as _uuid2
         import asyncio
         job_id = str(_uuid2.uuid4())
-        asyncio.create_task(_index_source(source_id, str(workspace_id), body))
+        r = _redis()
+        try:
+            await r.setex(f"job:{job_id}", JOB_TTL, json.dumps({
+                "status": "running", "job_id": job_id,
+                "started_at": datetime.utcnow().isoformat(),
+                "progress": {"logs": [], "current_stage": "starting"},
+            }))
+        except Exception:
+            pass
+        asyncio.create_task(_index_source(source_id, str(workspace_id), body, job_id))
 
     log.info("Source registered", source_id=source_id, kind=body.kind, auto_index=body.auto_index)
     return RegisterSourceResponse(source=source, job_id=job_id)
 
 
-async def _index_source(source_id: str, workspace_id: str, body: RegisterSourceRequest) -> None:
+async def _index_source(source_id: str, workspace_id: str, body: RegisterSourceRequest, job_id: str | None = None) -> None:
     """Background task: run pipeline and update source status."""
+    started_at = datetime.utcnow().isoformat()
+    log_entries: list[dict] = []
+
+    async def on_progress(stage: str, emoji: str, message: str, data: dict):
+        entry = {
+            "stage": stage, "emoji": emoji, "message": message,
+            "ts": datetime.utcnow().isoformat(),
+            **{k: v for k, v in data.items() if isinstance(v, (str, int, float, bool, list, type(None)))},
+        }
+        log_entries.append(entry)
+        if job_id:
+            try:
+                r = _redis()
+                await r.setex(f"job:{job_id}", JOB_TTL, json.dumps({
+                    "status": "running", "job_id": job_id,
+                    "started_at": started_at,
+                    "progress": {"logs": log_entries, "current_stage": stage},
+                }))
+            except Exception:
+                pass
+
     try:
         from companybrain.db import get_session
         from sqlalchemy import text
@@ -174,7 +212,7 @@ async def _index_source(source_id: str, workspace_id: str, body: RegisterSourceR
             )],
             workspace_id=workspace_id,
         )
-        result = await run_pipeline(pipeline_req)
+        result = await run_pipeline(pipeline_req, on_progress=on_progress)
 
         async with get_session() as session:
             await session.execute(text("""
@@ -183,6 +221,24 @@ async def _index_source(source_id: str, workspace_id: str, body: RegisterSourceR
                 WHERE id=:id
             """), {"id": source_id, "count": getattr(result, "entity_count", 0)})
             await session.commit()
+
+        if job_id:
+            try:
+                r = _redis()
+                await r.setex(f"job:{job_id}", JOB_TTL, json.dumps({
+                    "status": result.status,
+                    "job_id": job_id,
+                    "started_at": started_at,
+                    "completed_at": datetime.utcnow().isoformat(),
+                    "result": {
+                        "entity_count": result.entity_count,
+                        "edge_count":   result.edge_count,
+                        "gap_count":    getattr(result, "gap_count", 0),
+                    },
+                    "progress": {"logs": log_entries, "current_stage": "done"},
+                }))
+            except Exception:
+                pass
 
     except Exception as exc:
         try:
@@ -197,6 +253,19 @@ async def _index_source(source_id: str, workspace_id: str, body: RegisterSourceR
                 await session.commit()
         except Exception:
             pass
+        if job_id:
+            try:
+                r = _redis()
+                await r.setex(f"job:{job_id}", JOB_TTL, json.dumps({
+                    "status": "failed",
+                    "job_id": job_id,
+                    "started_at": started_at,
+                    "completed_at": datetime.utcnow().isoformat(),
+                    "error": str(exc),
+                    "progress": {"logs": log_entries, "current_stage": "error"},
+                }))
+            except Exception:
+                pass
         log.error("Source indexing failed", source_id=source_id, error=str(exc))
 
 
@@ -221,17 +290,15 @@ async def delete_source(workspace_id: UUID, source_id: UUID) -> None:
 )
 async def trigger_sync(workspace_id: UUID, source_id: UUID) -> dict:
     """
-    Mark a source as syncing and return 202 Accepted.
-    The actual sync is handled by a background worker; this endpoint
-    only sets the sync_status flag so the UI can show a spinner.
+    Re-index a source. Creates a job, seeds Redis, and runs the pipeline
+    in the background. Returns a job_id the frontend can poll via
+    GET /pipeline/jobs/{job_id}.
     """
+    import uuid as _uuid
+    import asyncio
+
     sql_check = text("""
-        SELECT id FROM workspace_sources
-        WHERE id = :source_id AND workspace_id = :workspace_id
-    """)
-    sql_update = text("""
-        UPDATE workspace_sources
-        SET sync_status = 'syncing'
+        SELECT id, kind, config FROM workspace_sources
         WHERE id = :source_id AND workspace_id = :workspace_id
     """)
 
@@ -240,18 +307,37 @@ async def trigger_sync(workspace_id: UUID, source_id: UUID) -> dict:
             sql_check,
             {"source_id": str(source_id), "workspace_id": str(workspace_id)},
         )
-        if result.fetchone() is None:
+        row = result.fetchone()
+        if row is None:
             raise HTTPException(status_code=404, detail="Source not found")
+        kind = row[1]
+        raw_config = row[2]
 
-        await session.execute(
-            sql_update,
-            {"source_id": str(source_id), "workspace_id": str(workspace_id)},
-        )
-        await session.commit()
+    config = raw_config if isinstance(raw_config, dict) else {}
+    job_id = str(_uuid.uuid4())
+
+    r = _redis()
+    try:
+        await r.setex(f"job:{job_id}", JOB_TTL, json.dumps({
+            "status": "running", "job_id": job_id,
+            "started_at": datetime.utcnow().isoformat(),
+            "progress": {"logs": [], "current_stage": "starting"},
+        }))
+    except Exception:
+        pass
+
+    body = RegisterSourceRequest(
+        kind=kind,
+        display_name="",
+        config=config,
+        auto_index=True,
+    )
+    asyncio.create_task(_index_source(str(source_id), str(workspace_id), body, job_id))
 
     log.info(
         "Source sync triggered",
         workspace_id=str(workspace_id),
         source_id=str(source_id),
+        job_id=job_id,
     )
-    return {"status": "accepted", "source_id": str(source_id)}
+    return {"status": "accepted", "source_id": str(source_id), "job_id": job_id}

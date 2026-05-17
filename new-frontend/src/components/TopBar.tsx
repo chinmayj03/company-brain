@@ -1,4 +1,7 @@
+import { useEffect, useState } from 'react';
 import { useRepoStore } from '../store/repo_store';
+import { useWorkspaceStore } from '../store/workspace_store';
+import { getMcpAgents } from '../data/brain_client';
 
 interface TopBarProps {
   crumb: string;
@@ -29,6 +32,21 @@ const IconHome = () => (
 
 export default function TopBar({ crumb }: TopBarProps) {
   const { selectedRepo, selectedBranch } = useRepoStore();
+  const workspaceId = useWorkspaceStore((s) => s.workspaceId);
+  const [liveAgents, setLiveAgents] = useState<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    function fetch() {
+      getMcpAgents(workspaceId)
+        .then((agents) => { if (!cancelled) setLiveAgents(agents.filter((a) => a.status === 'live').length); })
+        .catch(() => {});
+    }
+    fetch();
+    const id = setInterval(fetch, 30_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [workspaceId]);
+
   const repoLabel = selectedRepo
     ? `${selectedRepo.display_name} · ${selectedBranch}`
     : 'No repo connected';
@@ -47,10 +65,12 @@ export default function TopBar({ crumb }: TopBarProps) {
         <IconGitBranch />
         <span className="mono" style={{ fontSize: 11 }}>{repoLabel}</span>
       </div>
-      <div className="tb-chip tb-chip--accent">
-        <span className="dot dot--ok" />
-        <span>4 agents live</span>
-      </div>
+      {liveAgents !== null && (
+        <div className="tb-chip tb-chip--accent">
+          <span className="dot dot--ok" />
+          <span>{liveAgents} agent{liveAgents !== 1 ? 's' : ''} live</span>
+        </div>
+      )}
       <button className="icon-btn" title="Share"><IconShare /></button>
       <button className="icon-btn" title="Notes"><IconBook /></button>
     </div>

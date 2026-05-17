@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Sidebar from '../components/Sidebar';
 import TopBar from '../components/TopBar';
 import AddSourceModal from '../components/AddSourceModal';
-import { getSources, triggerSync, type WorkspaceSource } from '../data/brain_client';
+import { getSources, triggerSync, getJobStatus, type WorkspaceSource } from '../data/brain_client';
 import { useWorkspaceStore } from '../store/workspace_store';
 import { sourceKindLabel } from '../utils/sourceKind';
 
@@ -46,7 +46,9 @@ export default function Sources() {
   const [error, setError]     = useState<string | null>(null);
   const [syncing, setSyncing] = useState<Set<string>>(new Set());
   const [syncErr, setSyncErr] = useState<Record<string, string>>({});
+  const [syncStage, setSyncStage] = useState<Record<string, string>>({});
   const [modalOpen, setModalOpen] = useState(false);
+  const pollRefs = useRef<Record<string, ReturnType<typeof setInterval>>>({});
 
   function fetchSources() {
     let cancelled = false;
@@ -65,20 +67,56 @@ export default function Sources() {
 
   useEffect(fetchSources, [workspaceId]);
 
+  function stopPoll(sourceId: string) {
+    if (pollRefs.current[sourceId]) {
+      clearInterval(pollRefs.current[sourceId]);
+      delete pollRefs.current[sourceId];
+    }
+  }
+
   async function handleSync(sourceId: string) {
     setSyncing((prev) => new Set(prev).add(sourceId));
     setSyncErr((prev) => { const n = { ...prev }; delete n[sourceId]; return n; });
+    setSyncStage((prev) => { const n = { ...prev }; delete n[sourceId]; return n; });
     try {
-      await triggerSync(workspaceId, sourceId);
+      const resp = await triggerSync(workspaceId, sourceId);
       setSources((prev) => prev.map((s) =>
         s.id === sourceId ? { ...s, sync_status: 'syncing' } : s
       ));
+      if (resp.job_id) {
+        stopPoll(sourceId);
+        pollRefs.current[sourceId] = setInterval(async () => {
+          try {
+            const job = await getJobStatus(resp.job_id!);
+            setSyncStage((prev) => ({ ...prev, [sourceId]: job.progress?.current_stage ?? '' }));
+            if (job.status === 'completed') {
+              stopPoll(sourceId);
+              setSyncing((prev) => { const n = new Set(prev); n.delete(sourceId); return n; });
+              setSyncStage((prev) => { const n = { ...prev }; delete n[sourceId]; return n; });
+              setSources((prev) => prev.map((s) =>
+                s.id === sourceId
+                  ? { ...s, sync_status: 'ok', entity_count: job.result?.entity_count ?? s.entity_count }
+                  : s
+              ));
+            } else if (job.status === 'failed') {
+              stopPoll(sourceId);
+              setSyncing((prev) => { const n = new Set(prev); n.delete(sourceId); return n; });
+              setSyncStage((prev) => { const n = { ...prev }; delete n[sourceId]; return n; });
+              setSources((prev) => prev.map((s) =>
+                s.id === sourceId ? { ...s, sync_status: 'error', error_message: job.error } : s
+              ));
+              setSyncErr((prev) => ({ ...prev, [sourceId]: job.error ?? 'Sync failed' }));
+            }
+          } catch { /* transient */ }
+        }, 1500);
+      } else {
+        setSyncing((prev) => { const n = new Set(prev); n.delete(sourceId); return n; });
+      }
     } catch (err) {
       setSyncErr((prev) => ({
         ...prev,
         [sourceId]: err instanceof Error ? err.message : 'Sync failed',
       }));
-    } finally {
       setSyncing((prev) => { const n = new Set(prev); n.delete(sourceId); return n; });
     }
   }
@@ -226,18 +264,31 @@ export default function Sources() {
 
                         <HealthDot status={s.sync_status} />
 
+                        {(syncing.has(s.id) || s.sync_status === 'syncing') && syncStage[s.id] && (
+                          <span style={{
+                            fontSize: 11, color: 'var(--text-muted)',
+                            fontFamily: 'var(--font-mono)', flexShrink: 0,
+                          }}>
+                            {syncStage[s.id]}
+                          </span>
+                        )}
+
                         <button
                           onClick={() => handleSync(s.id)}
                           disabled={syncing.has(s.id) || s.sync_status === 'syncing'}
                           style={{
                             height: 28, padding: '0 12px', borderRadius: 4, fontSize: 12,
-                            fontWeight: 500, color: 'var(--text-secondary)', flexShrink: 0,
-                            background: 'transparent', border: '1px solid var(--border-default)',
+                            fontWeight: 500, flexShrink: 0,
+                            color: s.sync_status === 'error' && !syncing.has(s.id) ? 'var(--danger)' : 'var(--text-secondary)',
+                            background: 'transparent',
+                            border: `1px solid ${s.sync_status === 'error' && !syncing.has(s.id) ? 'var(--danger-border)' : 'var(--border-default)'}`,
                             cursor: syncing.has(s.id) || s.sync_status === 'syncing' ? 'not-allowed' : 'pointer',
                             opacity: syncing.has(s.id) || s.sync_status === 'syncing' ? 0.5 : 1,
                           }}
                         >
-                          {syncing.has(s.id) || s.sync_status === 'syncing' ? 'Syncing…' : 'Sync'}
+                          {syncing.has(s.id) || s.sync_status === 'syncing'
+                            ? 'Syncing…'
+                            : s.sync_status === 'error' ? 'Retry' : 'Sync'}
                         </button>
                       </div>
 

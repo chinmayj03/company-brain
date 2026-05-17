@@ -19,6 +19,7 @@ from companybrain.api.routes import pipeline, query, health, repo, feedback, str
 from companybrain.api.routes import me as me_route, workspace as workspace_route
 from companybrain.api.routes import repos as repos_route, owners as owners_route
 from companybrain.api.routes import brain as brain_route
+from companybrain.api.routes import sources as sources_route
 from companybrain.config import settings
 from companybrain.db import init_db_pool, close_db_pool
 
@@ -83,6 +84,7 @@ app.include_router(brain_route.router, prefix="/brain", tags=["brain"])
 app.include_router(me_route.router, tags=["me"])
 app.include_router(workspace_route.router, prefix="/workspaces", tags=["workspaces"])
 app.include_router(repos_route.router, prefix="/workspaces", tags=["repos"])
+app.include_router(sources_route.router, prefix="/workspaces", tags=["sources"])
 app.include_router(owners_route.router, prefix="/entities", tags=["owners"])
 # ADR-0051 P4 — SSE feed of harness TodoList progress for /pipeline/jobs/{id}.
 # Path is fully embedded in the route so no prefix is set here.

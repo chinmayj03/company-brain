@@ -417,6 +417,128 @@ async def query_graph_stream(request: QueryRequest):
     return StreamingResponse(_event_stream(), media_type="text/event-stream")
 
 
+# ── A1.5: enriched SSE endpoint (token + done events) ────────────────────────
+
+@router.post("/stream/v2")
+async def query_graph_stream_v2(
+    request: QueryRequest,
+    stream: bool = Query(default=True),
+):
+    """
+    POST /query/stream/v2 — A1.5 enriched SSE streaming endpoint.
+
+    Emits a richer event set than the legacy /query/stream:
+
+        data: {"type": "token", "text": "<chunk>"}\n\n
+        ...
+        data: {"type": "done", "citations": [...], "confidence": {...},
+               "matched_shape_id": null, "from_cache": false}\n\n
+
+    When ``STREAMING_ENABLED=false`` (or ``?stream=false``), falls back
+    to returning a full JSON QueryResponse identical to POST /query.
+
+    Parallel retrieval
+    ------------------
+    Intent classification and SmartZone assembly run concurrently via
+    ``asyncio.gather``.  BM25 + dense retrieval in HybridSearcher are
+    already parallel (asyncio.to_thread wrappers in HybridSearcher);
+    the orchestrator wires them through ``retrieve_fn``.
+    """
+    from companybrain.config import settings as _s
+
+    # ── STREAMING_ENABLED flag bypass ─────────────────────────────────────────
+    if not _s.streaming_enabled or not stream:
+        # Delegate to the full non-streaming handler unchanged.
+        return await query_graph(request)
+
+    provider = get_provider()
+
+    # ── Parallel: intent classification + SmartZone assembly ─────────────────
+    async def _classify() -> str:
+        if _s.skip_intent_router:
+            return "concept"
+        try:
+            from companybrain.api.intent_router import classify_intent
+            return await classify_intent(
+                request.question,
+                workspace_id=str(request.workspace_id),
+                ttl_sec=_s.brain_query_cache_ttl_sec,
+            )
+        except Exception as exc:
+            log.warning("[stream/v2] Intent router failed (using 'concept')", error=str(exc))
+            return "concept"
+
+    intent, (assembled_context, _meta) = await asyncio.gather(
+        _classify(),
+        _smart_zone_assemble(
+            task=request.question,
+            workspace_id=str(request.workspace_id),
+            repo_path=getattr(request, "repo_path", None),
+            qdrant_index="default",
+        ),
+    )
+
+    qdrant_index = _INTENT_TO_INDEX.get(intent, "default")
+
+    # Hybrid retrieve fallback if SmartZone returned nothing — wrap sync
+    # HybridSearcher in asyncio.to_thread for parallel-safe execution.
+    if not assembled_context:
+        assembled_context = await asyncio.to_thread(
+            _hybrid_retrieve_sync,
+            request.question,
+            str(request.workspace_id),
+            getattr(request, "repo_path", None),
+            qdrant_index,
+        )
+
+    # ── Stream via SSE emitter ────────────────────────────────────────────────
+    from companybrain.streaming.sse_emitter import stream_query_response
+
+    return StreamingResponse(
+        stream_query_response(
+            question=request.question,
+            context=assembled_context,
+            system_prompt=None,
+            provider=provider,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _hybrid_retrieve_sync(
+    question: str,
+    workspace_id: str,
+    repo_path: str | None,
+    index: str,
+) -> str | None:
+    """
+    Synchronous wrapper around _hybrid_retrieve for use with asyncio.to_thread.
+
+    asyncio.to_thread runs this in a thread-pool executor so it does not
+    block the event loop.  Returns None if the retriever is unavailable.
+    """
+    import asyncio as _asyncio
+
+    async def _run():
+        return await _hybrid_retrieve(question, workspace_id, repo_path, index=index)
+
+    try:
+        # If already in an event loop (normal FastAPI path) we cannot call
+        # asyncio.run() — use a new loop in the thread instead.
+        loop = _asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
+    except Exception as exc:
+        log.debug("[stream/v2] _hybrid_retrieve_sync failed", error=str(exc))
+        return None
+
+
 # ── ADR-0061 E1: Exploration Agent post-processor ─────────────────────────────
 
 async def _run_exploration_agent(

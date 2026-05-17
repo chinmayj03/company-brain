@@ -16,6 +16,7 @@ LLM provider switch:
 from __future__ import annotations
 
 from typing import Optional
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -358,6 +359,31 @@ class Settings(BaseSettings):
     # Minimum verifier score to consider an answer verified.
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
+
+    # ── A1.7: Few-shot bank ────────────────────────────────────────────────────
+    # When True, the feedback endpoints capture successful Q&A pairs and the
+    # query path injects the top-k most similar exemplars into the prompt.
+    # Override via env var: FEW_SHOT_ENABLED=false
+    few_shot_enabled: bool = Field(default=True, env="FEW_SHOT_ENABLED")
+    # Root directory for per-(workspace, persona) JSON bucket files.
+    # Override via env var: FEW_SHOT_BANK_PATH=/data/brain/few_shot
+    few_shot_bank_path: str = Field(default=".brain/few_shot", env="FEW_SHOT_BANK_PATH")
+    # Max examples stored per (workspace, persona) bucket before LRU eviction.
+    # Override via env var: FEW_SHOT_MAX_PER_BUCKET=500
+    few_shot_max_per_bucket: int = Field(default=200, env="FEW_SHOT_MAX_PER_BUCKET")
+    # Minimum confidence_score + at least one citation required to persist an example.
+    # Override via env var: FEW_SHOT_MIN_CONFIDENCE=0.7
+    few_shot_min_confidence: float = Field(default=0.6, env="FEW_SHOT_MIN_CONFIDENCE")
+    # Number of similar exemplars injected into the answerer prompt per query.
+    # Override via env var: FEW_SHOT_TOP_K=5
+    few_shot_top_k: int = Field(default=3, env="FEW_SHOT_TOP_K")
+
+    # ── A1.5: Streaming ───────────────────────────────────────────────────────
+    # When False, POST /query/stream/v2 ignores the stream parameter and always
+    # returns a full JSON response (useful for environments that do not support
+    # chunked HTTP or SSE, e.g. some API gateways).
+    # Override via env var: STREAMING_ENABLED=false
+    streaming_enabled: bool = Field(default=True, env="STREAMING_ENABLED")
 
 
 settings = Settings()

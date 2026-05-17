@@ -269,6 +269,19 @@ async def query_graph(request: QueryRequest):
         )
         query_response = _parse_llm_response(response.content, assembled_context)
         _iter_telemetry = {}
+        # ── A1.4: attach deterministic multi-signal confidence (non-iterative path)
+        try:
+            from companybrain.confidence.helpers import build_confidence_from_query_result
+            query_response = query_response.model_copy(update={
+                "confidence": build_confidence_from_query_result(
+                    query_response,
+                    retrieval_score=0.0,  # not available on non-iterative path
+                    source_paths=None,
+                    verifier_score=None,  # verifier not run on single-pass
+                )
+            })
+        except Exception as _conf_exc:
+            log.debug("[query] confidence aggregation skipped (non-fatal)", error=str(_conf_exc))
 
     llm_dur = int((time.monotonic() - t1) * 1000)
 

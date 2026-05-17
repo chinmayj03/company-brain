@@ -6,6 +6,9 @@ Routes to IterativeAnswerer; falls back to single-pass AnswererAgent on error.
 
 The env flag stays False until the acceptance gate in
 tests/acceptance/test_iterative_quality.py passes (see ADR-0061 §acceptance).
+
+A1.4: After the answer is produced the multi-signal aggregator computes a
+deterministic confidence score that replaces the LLM-hallucinated stub.
 """
 from __future__ import annotations
 
@@ -27,12 +30,18 @@ async def orchestrate_query(
     retrieve_fn: RetrieveFn,
     persona: str = "dev",
     system_prompt: str | None = None,
+    # A1.4: optional retrieval metadata for the confidence aggregator
+    retrieval_score: float = 0.0,
+    source_paths: list[str] | None = None,
 ) -> AnswerResult:
     """
     Run an iterative exploration pass and return an AnswerResult.
 
     Falls back to single-pass AnswererAgent if ExplorationLoop raises,
     so a wiring bug never kills the /query endpoint.
+
+    A1.4: ``retrieval_score`` and ``source_paths`` are forwarded to the
+    multi-signal confidence aggregator after the answer is produced.
     """
     from companybrain.config import settings
 
@@ -45,14 +54,57 @@ async def orchestrate_query(
             max_tokens=settings.iterative_max_tokens_per_query,
             verifier_score_threshold=settings.iterative_verifier_score_threshold,
         )
-        return await loop.run(question, context, persona=persona)
-
+        result = await loop.run(question, context, persona=persona)
     except Exception as exc:
         log.warning(
             "[orchestrator] ExplorationLoop failed — falling back to single-pass",
             error=str(exc),
         )
-        return await _single_pass_fallback(question, context, system_prompt)
+        result = await _single_pass_fallback(question, context, system_prompt)
+
+    # ── A1.4: attach deterministic multi-signal confidence ────────────────
+    result = _apply_aggregated_confidence(
+        result,
+        retrieval_score=retrieval_score,
+        source_paths=source_paths,
+    )
+    return result
+
+
+def _apply_aggregated_confidence(
+    result: AnswerResult,
+    *,
+    retrieval_score: float,
+    source_paths: list[str] | None,
+) -> AnswerResult:
+    """
+    Replace the LLM-produced confidence stub with a deterministic score.
+
+    Non-fatal: if the confidence module is unavailable the original result
+    is returned unchanged so /query always has a response.
+    """
+    try:
+        from companybrain.confidence.helpers import build_confidence_from_query_result
+        new_confidence = build_confidence_from_query_result(
+            result.response,
+            retrieval_score=retrieval_score,
+            source_paths=source_paths,
+            verifier_score=result.verifier_score,
+        )
+        result.response = result.response.model_copy(
+            update={"confidence": new_confidence}
+        )
+        log.debug(
+            "[orchestrator] confidence aggregated",
+            value=new_confidence.value,
+            label=new_confidence.level,
+        )
+    except Exception as exc:
+        log.warning(
+            "[orchestrator] confidence aggregation failed (non-fatal)",
+            error=str(exc),
+        )
+    return result
 
 
 async def _single_pass_fallback(

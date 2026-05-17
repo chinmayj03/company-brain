@@ -359,5 +359,17 @@ class Settings(BaseSettings):
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
 
+    # ── A1.4: Verbalized Confidence weights ──────────────────────────────────
+    # These six weights drive MultiSignalAggregator.  They are re-normalised
+    # at runtime so a partial override (e.g. only bumping verifier) never
+    # breaks the sum-to-1 invariant.
+    # Override via env vars (e.g. CONFIDENCE_WEIGHT_RETRIEVAL=0.40).
+    confidence_weight_retrieval:       float = 0.30
+    confidence_weight_entity_match:    float = 0.20
+    confidence_weight_source_diversity: float = 0.15
+    confidence_weight_verifier:        float = 0.20
+    confidence_weight_chain:           float = 0.10
+    confidence_weight_freshness:       float = 0.05
+
 
 settings = Settings()

@@ -1,4 +1,4 @@
-CREATE TABLE workspace_sources (
+CREATE TABLE IF NOT EXISTS workspace_sources (
   id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id   UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   kind           TEXT NOT NULL,

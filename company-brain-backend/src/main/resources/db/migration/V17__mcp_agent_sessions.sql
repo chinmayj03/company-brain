@@ -1,4 +1,4 @@
-CREATE TABLE mcp_agent_sessions (
+CREATE TABLE IF NOT EXISTS mcp_agent_sessions (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id    UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   agent_name      TEXT NOT NULL,

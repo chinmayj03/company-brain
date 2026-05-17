@@ -1,7 +1,7 @@
 -- ADR-0072 A1 (Conversation History) + A2 (Saved Queries) + A5 (Audit Log)
 -- Persists every /query call so the UI can render History, Saved, and Audit tabs.
 
-CREATE TABLE conversations (
+CREATE TABLE IF NOT EXISTS conversations (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   workspace_id UUID NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   question     TEXT NOT NULL,

@@ -359,5 +359,24 @@ class Settings(BaseSettings):
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
 
+    # ── A1.6: Glossary auto-discovery ─────────────────────────────────────────
+    # Master switch. When False, discoverer/promoter are no-ops and the loader
+    # always returns "".
+    # Override via env var: GLOSSARY_ENABLED=false
+    glossary_enabled: bool = True
+    # Directory root for workspace-scoped tuning artifacts (.brain/tuning by
+    # default; relative to the process working directory or absolute).
+    # Override via env var: GLOSSARY_TUNING_STORE_PATH=/path/to/store
+    glossary_tuning_store_path: str = ".brain/tuning"
+    # Minimum number of corpus occurrences before a term is promoted.
+    # Override via env var: GLOSSARY_MIN_OCCURRENCES=20
+    glossary_min_occurrences: int = 20
+    # Minimum number of distinct source types (code/sql/doc/comment) required.
+    # Override via env var: GLOSSARY_MIN_SOURCE_TYPES=2
+    glossary_min_source_types: int = 2
+    # Maximum terms injected into the prompt context block.
+    # Override via env var: GLOSSARY_MAX_TERMS_IN_PROMPT=20
+    glossary_max_terms_in_prompt: int = 20
+
 
 settings = Settings()

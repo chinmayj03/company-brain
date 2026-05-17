@@ -2,12 +2,18 @@ import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import Sidebar from '../components/Sidebar';
 import TopBar from '../components/TopBar';
 import Suggested from '../components/Suggested';
-import BlastRadius from '../components/BlastRadius';
+import BlastRadiusGraph from '../components/BlastRadiusGraph';
+import AffectedBreakdownList from '../components/AffectedBreakdownList';
 import CitationList from '../components/CitationList';
+import AnswerMarkdown from '../components/AnswerMarkdown';
+import CaveatBanner from '../components/CaveatBanner';
+import RiskAlertBanner from '../components/RiskAlertBanner';
+import CallChainTree from '../components/CallChainTree';
+import OnboardingPaths from '../components/OnboardingPaths';
+import { extractCitations, type LiveCitation } from '../data/brain_client';
 import TimeTravel from '../components/TimeTravel';
 import Compare from '../components/Compare';
 import MCP from '../components/MCP';
-import RepoPicker from '../components/RepoPicker';
 import { useFlags } from '../data/feature_flags';
 import {
   queryBrain,
@@ -42,6 +48,14 @@ interface AnswerState {
   followUps?: string[];
   isStreaming: boolean;
   error?: string;
+  // pipeline fields
+  caveats?: string[];
+  riskAlerts?: unknown[];
+  callChain?: unknown[];
+  domainEntities?: unknown[];
+  onboardingPaths?: unknown[];
+  liveCitations?: LiveCitation[];
+  affectedEntities?: AffectedEntity[];
 }
 
 // ── Icons (inline SVG, no external dep) ──────────────────────────────────────
@@ -97,6 +111,26 @@ const IconADR = () => (
   </svg>
 );
 const OWNER_COLORS: Record<string, string> = { JM: '#2E5C8A', PA: '#C8553D', SK: '#588B6F' };
+
+// ── StreamingSkeleton — shown while SSE stream is in-flight ──────────────────
+
+function StreamingSkeleton() {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, padding: '4px 0 12px' }}>
+      {[100, 82, 90, 60].map((w, i) => (
+        <div key={i} style={{
+          height: 14, borderRadius: 4, width: `${w}%`,
+          background: 'var(--warm-line-2)',
+          animation: `blink ${1.2 + i * 0.15}s ease-in-out infinite`,
+        }} />
+      ))}
+      <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+        <span className="streaming"><span /><span /><span /></span>
+        Thinking…
+      </div>
+    </div>
+  );
+}
 
 // ── ScopeChip — dropdown repo picker ─────────────────────────────────────────
 
@@ -164,6 +198,7 @@ export default function Ask() {
   const [query, setQuery]         = useState('If I rename the customer_id column, what breaks?');
   const [submitted, setSubmitted] = useState(false);
   const [position, setPosition]   = useState(1.0);
+  const [vizTab, setVizTab]       = useState<'graph' | 'tree' | 'files'>('graph');
   const [answer, setAnswer]       = useState<AnswerState | null>(null);
   const [liveResp, setLiveResp]   = useState<QueryResponse | null>(null);
   const streamCleanupRef          = useRef<(() => void) | null>(null);
@@ -203,15 +238,22 @@ export default function Ask() {
       : undefined;
 
     return {
-      summary:      resp.summary_md ?? resp.summary,
-      verdictStats: stats,
-      verdictNote:  resp.change_risk ? `${resp.change_risk.affected_count} entities` : undefined,
-      graphNodes:   nodes,
-      confidence:   resp.confidence?.level,
-      followUps:    resp.follow_up_questions,
-      isStreaming:  streaming,
+      summary:         resp.summary_md ?? resp.summary,
+      verdictStats:    stats,
+      verdictNote:     resp.change_risk ? `${resp.change_risk.affected_count} entities` : undefined,
+      graphNodes:      nodes,
+      confidence:      resp.confidence?.level,
+      followUps:       resp.follow_up_questions,
+      isStreaming:     streaming,
+      caveats:          resp.caveats ?? [],
+      riskAlerts:       resp.risk_alerts ?? [],
+      callChain:        resp.call_chain ?? [],
+      domainEntities:   resp.domain_entities ?? [],
+      onboardingPaths:  resp.onboarding_paths ?? [],
+      liveCitations:    f.LIVE_CITATIONS ? extractCitations(resp) : undefined,
+      affectedEntities: resp.affected_entities as AffectedEntity[],
     };
-  }, [f.LIVE_BLAST]);
+  }, [f.LIVE_BLAST, f.LIVE_CITATIONS]);
 
   const ask = useCallback(async (q: string) => {
     // Abort any in-flight stream
@@ -325,9 +367,6 @@ export default function Ask() {
     ? (liveResp ? 'Live · brain' : 'Querying brain…')
     : mockState.label;
 
-  // Effective blast-radius graph nodes (live overrides mock if available)
-  const effectiveGraphNodes = answer?.graphNodes;
-
   // Effective citations (live URNs → future CitationList; for now fall back to mock)
   const showLiveCitations = f.LIVE_CITATIONS && !!liveResp?.cited_entity_urns?.length;
 
@@ -353,7 +392,6 @@ export default function Ask() {
                 onKeyDown={(e) => e.key === 'Enter' && ask(query)}
                 placeholder="What would break if…"
               />
-              <RepoPicker />
               <button className="send" onClick={() => ask(query)} disabled={answer?.isStreaming}>
                 <IconBolt /> Ask
               </button>
@@ -391,11 +429,14 @@ export default function Ask() {
                       </div>
 
                       <div className="ans-body">
-                        {/* Summary — dangerouslySetInnerHTML because brain returns HTML bold tags */}
-                        <p
-                          className="summary"
-                          dangerouslySetInnerHTML={{ __html: answer.summary }}
-                        />
+                        {answer.isStreaming && f.LIVE_STREAM ? (
+                          <StreamingSkeleton />
+                        ) : (
+                          <AnswerMarkdown content={answer.summary} />
+                        )}
+
+                        {/* Risk alerts — above everything else */}
+                        <RiskAlertBanner alerts={(answer.riskAlerts ?? []) as Array<{ level: string; summary?: string }> } />
 
                         {/* Verdict stats */}
                         {answer.verdictStats && (
@@ -422,34 +463,66 @@ export default function Ask() {
                           </div>
                         )}
 
+                        {/* What breaks — human-readable entity breakdown */}
+                        {answer.affectedEntities?.length ? (
+                          <AffectedBreakdownList entities={answer.affectedEntities} />
+                        ) : null}
+
                         {/* Blast radius */}
                         <div className="viz">
                           <div className="viz-head">
                             <h3>Blast radius · 2 hops</h3>
                             <div className="toggle">
-                              <button data-active="true">Graph</button>
-                              <button>Tree</button>
-                              <button>Files</button>
+                              <button data-active={vizTab === 'graph' ? 'true' : undefined} onClick={() => setVizTab('graph')}>Graph</button>
+                              <button data-active={vizTab === 'tree' ? 'true' : undefined} onClick={() => setVizTab('tree')}>Tree</button>
+                              <button data-active={vizTab === 'files' ? 'true' : undefined} onClick={() => setVizTab('files')}>Files</button>
                             </div>
                           </div>
-                          {/* Pass live nodes when available; BlastRadius falls back to MOCK_GRAPH internally */}
-                          <BlastRadius liveNodes={effectiveGraphNodes} />
+                          {vizTab === 'graph' && (
+                            <BlastRadiusGraph
+                              liveEntities={f.LIVE_BLAST && liveResp ? liveResp.affected_entities as AffectedEntity[] : undefined}
+                              centerLabel={query.split(' ').slice(-1)[0]}
+                              compact={false}
+                            />
+                          )}
+                          {vizTab === 'tree' && (
+                            <CallChainTree chain={answer.callChain ?? []} />
+                          )}
+                          {vizTab === 'files' && (
+                            <div style={{ padding: '8px 0', maxHeight: 320, overflowY: 'auto' }}>
+                              {(f.LIVE_BLAST && liveResp?.affected_entities?.length
+                                ? (liveResp.affected_entities as AffectedEntity[]).map((e) => e.id)
+                                : MOCK_GRAPH.nodes.map((n) => n.label)
+                              ).map((file, i) => (
+                                <div key={i} style={{ padding: '4px 0', fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)', borderBottom: '1px solid var(--warm-line)' }}>
+                                  {file}
+                                </div>
+                              ))}
+                            </div>
+                          )}
                           <div className="legend">
                             <span className="l"><span className="s" style={{ background: 'var(--danger)' }} /> high-impact dep</span>
                             <span className="l"><span className="s" style={{ background: 'var(--warning)' }} /> medium</span>
                             <span className="l"><span className="s" style={{ background: 'var(--text-muted)' }} /> low</span>
                             <span className="l" style={{ marginLeft: 'auto' }}>
-                              {effectiveGraphNodes
-                                ? `${effectiveGraphNodes.length} nodes · live`
+                              {f.LIVE_BLAST && liveResp?.affected_entities?.length
+                                ? `${liveResp.affected_entities.length} nodes · live`
                                 : `${MOCK_GRAPH.nodes.length + 1} nodes · 18 edges`}
                             </span>
                           </div>
                         </div>
 
+                        {/* Caveats — below the graph */}
+                        <CaveatBanner caveats={answer.caveats ?? []} />
+
                         {/* Citations */}
                         <CitationList
-                          liveUrns={showLiveCitations ? liveResp?.cited_entity_urns : undefined}
+                          liveCitations={answer.liveCitations}
+                          liveUrns={showLiveCitations && !answer.liveCitations ? liveResp?.cited_entity_urns : undefined}
                         />
+
+                        {/* Onboarding paths — below citations */}
+                        <OnboardingPaths paths={answer.onboardingPaths ?? []} />
                       </div>
 
                       <div className="ans-foot">

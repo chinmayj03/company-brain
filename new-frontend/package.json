@@ -11,13 +11,20 @@
   },
   "dependencies": {
     "@tanstack/react-query": "^5.40.0",
+    "@xyflow/react": "^12.10.2",
+    "d3-force": "^3.0.0",
+    "highlight.js": "^11.11.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
     "react-router-dom": "^6.23.1",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1",
     "zustand": "^5.0.13"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
+    "@types/d3-force": "^3.0.10",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",

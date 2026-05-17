@@ -33,11 +33,17 @@ export interface Confidence {
 }
 
 export interface RiskAssessment {
-  level: 'LOW' | 'MED' | 'HIGH';
-  affected_count: number;
-  dirs_count: number;
-  teams_count: number;
-  summary: string;
+  // normalized (mock / post-processed)
+  level: string; // real API sends lowercase "high"/"med"/"low"; normalise in riskToStats
+  // mock fields
+  affected_count?: number;
+  dirs_count?: number;
+  teams_count?: number;
+  summary?: string;
+  // real API fields
+  blast_radius_count?: number;
+  reason?: string;
+  sample_affected?: AffectedEntity[];
 }
 
 export interface LiveCitation {
@@ -50,10 +56,16 @@ export interface LiveCitation {
 }
 
 export interface AffectedEntity {
-  id: string;
+  // mock / old format
+  id?: string;
+  type?: string;
+  depth?: number;
+  // real API format
+  urn?: string;
+  why_relevant?: string;
+  confidence?: number;
+  // shared
   name: string;
-  type: string;
-  depth: number;
   weight?: 'high' | 'med' | 'low';
   x?: number;
   y?: number;
@@ -352,18 +364,23 @@ export const getEntityOwners = (urn: string): Promise<OwnersResponse> =>
 export function entitiesToGraphNodes(
   entities: AffectedEntity[],
 ): import('./mock_fallback').GraphNode[] {
-  // Simple radial layout when x/y aren't provided by the server.
   return entities.map((e, i) => {
+    const id    = e.urn ?? e.id ?? e.name;
+    const depth = e.depth ?? (i < Math.ceil(entities.length * 0.5) ? 1 : 2);
     const angle = (i / Math.max(entities.length, 1)) * 2 * Math.PI;
-    const r = e.depth === 1 ? 30 : 50; // radius % units
+    const r     = depth === 1 ? 30 : 50;
+    const weight: 'high' | 'med' | 'low' =
+      e.weight ?? (e.confidence != null
+        ? (e.confidence >= 0.78 ? 'high' : e.confidence >= 0.60 ? 'med' : 'low')
+        : depth === 1 ? 'high' : 'med');
     return {
-      id: e.id,
+      id,
       label: e.name,
-      sub: e.type,
-      weight: (e.weight ?? (e.depth === 1 ? 'high' : 'med')) as 'high' | 'med' | 'low',
-      ring: (e.depth <= 1 ? 1 : 2) as 1 | 2,
-      x: 50 + r * Math.cos(angle),
-      y: 50 + r * Math.sin(angle),
+      sub:   e.type ?? '',
+      weight,
+      ring:  (depth <= 1 ? 1 : 2) as 1 | 2,
+      x:     50 + r * Math.cos(angle),
+      y:     50 + r * Math.sin(angle),
     };
   });
 }
@@ -410,9 +427,37 @@ export const getJobStatus = (jobId: string): Promise<JobStatus> =>
  */
 export function riskToStats(risk: RiskAssessment) {
   return {
-    affected: risk.affected_count,
-    dirs:     risk.dirs_count,
-    teams:    risk.teams_count,
-    risk:     risk.level as 'LOW' | 'MED' | 'HIGH',
+    affected: risk.affected_count ?? risk.blast_radius_count ?? 0,
+    dirs:     risk.dirs_count ?? 0,
+    teams:    risk.teams_count ?? 0,
+    risk:     risk.level.toUpperCase() as 'LOW' | 'MED' | 'HIGH',
   };
+}
+
+/**
+ * Extract a unified LiveCitation[] from a QueryResponse.
+ * Merges cited_entity_urns (with file/snippet from domain_entities if available),
+ * sql_quotes, and note-type entries with kind=adr/notion.
+ */
+export function extractCitations(resp: QueryResponse): LiveCitation[] {
+  const result: LiveCitation[] = [];
+
+  // Primary: cited_entity_urns
+  (resp.cited_entity_urns ?? []).forEach((urn) => {
+    result.push({ urn, kind: urn.includes(':sql:') ? 'sql' : urn.includes(':adr:') ? 'adr' : 'ts' });
+  });
+
+  // SQL quotes
+  (resp.sql_quotes as Array<{ urn?: string; sql?: string; table?: string }> ?? []).forEach((q) => {
+    result.push({ urn: q.urn ?? 'sql', snippet: q.sql, label: q.table, kind: 'sql' });
+  });
+
+  // Notes (adr / notion docs)
+  (resp.notes as Array<{ urn?: string; label?: string; kind?: string }> ?? [])
+    .filter((n) => ['adr', 'notion', 'doc'].includes(n.kind ?? ''))
+    .forEach((n) => {
+      result.push({ urn: n.urn ?? '', label: n.label, kind: n.kind ?? 'adr' });
+    });
+
+  return result;
 }

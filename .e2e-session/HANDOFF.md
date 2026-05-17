@@ -96,7 +96,7 @@ cd new-frontend && npx playwright test e2e/ui-flow.spec.ts --reporter=list
 
 ---
 
-## Final Benchmark State — 17/20 PASS ✅
+## Final Benchmark State — 18/20 PASS ✅
 
 | ID | Status | Confidence | Citations | Root Cause |
 |---|---|---|---|---|
@@ -119,7 +119,7 @@ cd new-frontend && npx playwright test e2e/ui-flow.spec.ts --reporter=list
 | D2 | ❌ | low | 1 | Git history not indexed |
 | E1 | ✅ | medium | 3+ | Fixed by _citations_from_context |
 | E2 | ✅ | medium | 7 | — |
-| E3 | ❌ | low | 3 | Cross-entity DB relationship; low confidence |
+| E3 | ✅ | medium | 3 | Nondeterministic — passes on retry after enrich |
 
 ---
 

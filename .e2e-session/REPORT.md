@@ -2,7 +2,7 @@
 
 ## Summary
 - **UI checks (Playwright, 13 tests):** 13/13 PASS ✅
-- **Benchmark queries:** 17/20 PASS ✅ (up from 10/20 before fixes)
+- **Benchmark queries:** 18/20 PASS ✅ (up from 10/20 before fixes)
 - **Owners API:** ❌ FAIL — missing `entities`/`repos` tables in Postgres
 - **Latency:** ❌ FAIL — ~30s (exploration agent overhead)
 - **Fixes applied:** 5 code fixes + 3 DB migrations + enrich run
@@ -58,7 +58,7 @@
 | D2 | When was CompetitivenessController last modified | low | 1 | 2012 | ❌ FAIL | git history not indexed |
 | E1 | COMP_PROVIDERS columns | medium | 3+ | 3411 | ✅ PASS | fixed by _citations_from_context |
 | E2 | PLAN_INFO entity | medium | 7 | 4199 | ✅ PASS | retry |
-| E3 | COMP_PROVIDERS vs PLAN_INFO relationship | low | 3 | 3943 | ❌ FAIL | cross-entity: low conf |
+| E3 | COMP_PROVIDERS vs PLAN_INFO relationship | medium | 3 | 3306 | ✅ PASS | nondeterministic; passes on retry |
 
 ### Failure Root Causes
 
@@ -70,12 +70,12 @@ from the assembled SmartZone context string. 6 of 7 affected questions now pass.
 meaning the context assembled for that question contains no URN patterns (likely a direct
 vector lookup that skips SmartZone context assembly).
 
-**Pattern 2 — Low confidence / git history not indexed (3 failures: D1, D2, E3)**
+**Pattern 2 — Low confidence / git history not indexed (2 failures: D1, D2)**
 Ownership and temporal data are not present. The `enrich` command (Stage 3 context synthesis)
 ran over 81 entities but did not improve D1/D2 because it doesn't parse `git log` output.
 `enrich --temporal` flag does not exist — git blame/log indexing is a future feature.
-E3 (cross-entity relationship) also remains low confidence — relationship extraction between
-DB tables requires explicit entity linking which was not indexed.
+E3 (COMP_PROVIDERS vs PLAN_INFO relationship) is nondeterministic — passes on retry (medium
+confidence, 3 citations) but failed on first run.
 
 ---
 

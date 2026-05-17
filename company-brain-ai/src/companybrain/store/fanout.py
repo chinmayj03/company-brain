@@ -3,6 +3,9 @@ Fanout — primary store + N mirrors.
 
 Writes go to `primary` first (JSON SOT). On success, mirrors are written
 in parallel; mirror failures log but do not roll back the primary.
+
+ADR-0090 side-effect: every write() fires an event via the event-stream
+emitter (fire-and-forget, never blocks the main path).
 """
 from __future__ import annotations
 import asyncio
@@ -25,6 +28,19 @@ class FanoutBrainStore(BrainStore):
         await asyncio.gather(*[
             self._safe_write(m, entity, run_id, workspace_id) for m in self.mirrors
         ])
+        # ADR-0090 — emit HumanFactWritten event as a fire-and-forget side-effect.
+        # Never blocks the write path; failures are logged as warnings.
+        try:
+            from companybrain.events.emitter import emit_entity_written
+            emit_entity_written(
+                entity_id=entity.id,
+                entity_type=entity.entity_type,
+                repo=entity.repo,
+                workspace_id=workspace_id,
+                run_id=run_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("event emit skipped (event-store not available)", error=str(exc))
 
     async def read(self, entity_id: str) -> Optional[BrainEntity]:
         return await self.primary.read(entity_id)

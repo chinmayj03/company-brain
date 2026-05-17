@@ -359,5 +359,9 @@ class Settings(BaseSettings):
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
 
+    # ── ADR-0090 P1: Event-stream memory substrate ────────────────────────────
+    event_store_enabled: bool = True
+    event_freshness_seconds: int = 60
+
 
 settings = Settings()

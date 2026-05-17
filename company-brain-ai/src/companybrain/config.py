@@ -377,5 +377,12 @@ class Settings(BaseSettings):
     drift_age_inflection_days: float = 90.0
     drift_default_waive_days: int = 90
 
+    # ── ADR-0093: Cross-Source Entity Resolution ──────────────────────────────
+    resolution_store_path: str = ".resolution"
+    resolution_embed_threshold: float = 0.80
+    resolution_embed_model: str = "all-MiniLM-L6-v2"
+    resolution_auto_resolve_threshold: float = 0.80
+    resolution_suggest_threshold: float = 0.60
+
 
 settings = Settings()

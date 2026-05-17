@@ -359,5 +359,26 @@ class Settings(BaseSettings):
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
 
+    # ── ADR-0082 P1: Drift entity tunables ───────────────────────────────────
+    # Cron expression for nightly drift snapshot. Default: 02:00 UTC.
+    # Standard 5-field format: "minute hour day-of-month month day-of-week"
+    # Override via env var: DRIFT_SNAPSHOT_CRON="0 3 * * *"
+    drift_snapshot_cron: str = "0 2 * * *"
+
+    # Severity thresholds for dashboard alerting. Items at or above these
+    # thresholds trigger a warning/critical visual indicator in the Drift Dashboard.
+    # Override via env var: DRIFT_WARNING_THRESHOLD=5
+    drift_warning_threshold: int = 5       # open items at severity>=high before "warning" state
+    drift_critical_threshold: int = 1      # open items at severity==critical before "critical" state
+
+    # Age (days) at which drift items start compounding in the score formula.
+    # Matches the age_factor inflection point in drift/scorer.py.
+    # Override via env var: DRIFT_AGE_INFLECTION_DAYS=90
+    drift_age_inflection_days: float = 90.0
+
+    # Default waive duration in days before auto-reactivation.
+    # Override via env var: DRIFT_DEFAULT_WAIVE_DAYS=90
+    drift_default_waive_days: int = 90
+
 
 settings = Settings()

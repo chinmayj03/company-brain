@@ -1,0 +1,87 @@
+# ADR-0082 P1 — REST API curl examples
+# Run against: uvicorn companybrain.api.main:app --port 8000
+
+# ── Trigger on-demand snapshot ────────────────────────────────────────────────
+$ curl -s -X POST http://localhost:8000/drift/snapshot/run | jq .
+{
+  "snapshot_id": "a01ad041-47e8-49e3-9d90-c2e61a059d4c",
+  "snapshot_at": "2026-05-17T13:39:38.068633+00:00",
+  "items_open": 4,
+  "items_acknowledged": 0,
+  "items_in_flight": 0,
+  "new_items": 4,
+  "resolved_items": 0,
+  "elapsed_seconds": 0.07
+}
+
+# ── Latest snapshot ───────────────────────────────────────────────────────────
+$ curl -s http://localhost:8000/drift/snapshot/latest | jq .
+{
+  "snapshot_id": "a01ad041-47e8-49e3-9d90-c2e61a059d4c",
+  "snapshot_at": "2026-05-17T13:39:38.068633+00:00",
+  "workspace": "network-iq-backend-java",
+  "items_open": 4,
+  "items_acknowledged": 0,
+  "items_in_flight": 0,
+  "items_by_domain": { "unattributed": 4 },
+  "items_by_severity": { "critical": 2, "high": 1, "low": 1 },
+  "new_since_last": ["0c6b663f3d8e93b9", "14954e49b271ea10", "6ca97bfe60117af2", "26a2b4c1b860a283"],
+  "resolved_since_last": [],
+  "delta_score": 21.0
+}
+
+# ── List open items ───────────────────────────────────────────────────────────
+$ curl -s "http://localhost:8000/drift/items?state=open" | jq '.items | length'
+4
+
+# ── Single item detail ────────────────────────────────────────────────────────
+$ curl -s http://localhost:8000/drift/items/0c6b663f3d8e93b9 | jq .
+{
+  "id": "0c6b663f3d8e93b9",
+  "rule_id": "adr-0007-payer-amount",
+  "rule_source": "adr",
+  "kind": "schema",
+  "scope_urn": "urn:cb:api:PaymentController",
+  "domain_areas": [],
+  "severity": "critical",
+  "detected_at": "2026-05-17T13:39:38.068633+00:00",
+  "last_seen_at": "2026-05-17T13:39:38.068633+00:00",
+  "age_days": 0.0,
+  "state": "open",
+  "resolution": null,
+  "related_prs": [],
+  "estimated_remediation_days": null,
+  "description": "PaymentController /v1/payments response missing required field amount"
+}
+
+# ── Acknowledge item ──────────────────────────────────────────────────────────
+$ curl -s -X POST http://localhost:8000/drift/items/0c6b663f3d8e93b9/ack \
+    -H "Content-Type: application/json" \
+    -d '{"actor": "alice@company.com"}' | jq '.item.state'
+"acknowledged"
+
+# ── Waive item ────────────────────────────────────────────────────────────────
+$ curl -s -X POST http://localhost:8000/drift/items/14954e49b271ea10/waive \
+    -H "Content-Type: application/json" \
+    -d '{"justification": "Accepted technical debt — scheduled for Q4 remediation", "duration_days": 90}' | jq '.item.state'
+"waived"
+
+# ── Per-domain scores ─────────────────────────────────────────────────────────
+$ curl -s http://localhost:8000/drift/scores/by-domain | jq .
+{
+  "scores": [
+    {
+      "domain": "unattributed",
+      "item_count": 3,
+      "weighted_score": 21.0,
+      "critical_count": 2,
+      "oldest_item_age_days": 0.0,
+      "in_flight_remediation_days": 0.0
+    }
+  ],
+  "total_domains": 1
+}
+
+# Note: Once the .brain/ entity graph is populated by the pipeline, domain_areas
+# will be inferred from scope_urn → entity metadata, and per-domain scores will
+# show Payer, ClaimSubmission, Auth etc. instead of "unattributed".

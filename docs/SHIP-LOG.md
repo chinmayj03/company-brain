@@ -16,16 +16,16 @@ All items targeting `release/v2-seed-window` → `main` at Gate 1 (week 9).
 | T1.10 | ADR-0082 P1 Drift Entity | 0082 | `feature/adr-0082-p1-drift-entity` | `579a07cf6` | [#83](https://github.com/chinmayj03/company-brain/pull/83) | **PR OPEN** |
 | T1.11 | ADR-0090 P1 Event-Stream M1+M2 | 0090 | `feature/adr-0090-p1-event-stream` | `b8b274542` | [#88](https://github.com/chinmayj03/company-brain/pull/88) | **PR OPEN** |
 | A1.1 | SQL Deep Extractor | — | `feature/v2-sql-deep-extractor` | `3a8e6c1ac` | [#82](https://github.com/chinmayj03/company-brain/pull/82) | **PR OPEN** |
-| A1.2 | Hybrid Retrieval V2 | — | `feature/v2-hybrid-retrieval` | — | — | **RUNNING** |
-| A1.3 | Prompt Caching | — | `feature/v2-prompt-caching` | — | — | **RUNNING** |
+| A1.2 | Hybrid Retrieval V2 | — | `feature/v2-hybrid-retrieval` | `741be2860` | [#92](https://github.com/chinmayj03/company-brain/pull/92) | **PR OPEN** |
+| A1.3 | Prompt Caching | — | `feature/v2-prompt-caching` | `66e9e8215` | [#90](https://github.com/chinmayj03/company-brain/pull/90) | **PR OPEN** |
 | A1.4 | Verbalized Confidence | — | `feature/v2-verbalized-confidence` | `5ceb2c792` | [#85](https://github.com/chinmayj03/company-brain/pull/85) | **PR OPEN** |
-| A1.5 | Streaming + Parallel Retrieval | — | — | — | — | Pending |
+| A1.5 | Streaming + Parallel Retrieval | — | `feature/v2-streaming-parallel` | — | — | **RUNNING** |
 | A1.6 | Glossary Auto-Discovery | — | — | — | — | Pending (blocked on T1.8) |
-| A1.7 | Few-Shot Bank | — | — | — | — | Pending |
-| A1.8 | Quality Regression Harness | — | — | — | — | Pending (blocked on A1.1 ✓, A1.2, A1.4) |
+| A1.7 | Few-Shot Bank | — | `feature/v2-few-shot-bank` | — | — | **RUNNING** |
+| A1.8 | Quality Regression Harness | — | `feature/v2-quality-harness` | — | — | **RUNNING** |
 | B1.1 | ADR-0091 Domain-Entity-First | 0091 | `feature/adr-0091-domain-entity-first` | — | [#84](https://github.com/chinmayj03/company-brain/pull/84) | **PR OPEN** |
-| B1.2 | ADR-0092 Connector Framework | 0092 | `feature/adr-0092-connector-framework` | `3bc879945` | — | **COMMITTED** (PR pending) |
-| B1.3 | ADR-0093 Entity Resolution P1 | 0093 | `feature/adr-0093-entity-resolution` | — | — | **RUNNING** |
+| B1.2 | ADR-0092 Connector Framework | 0092 | `feature/adr-0092-connector-framework` | `3bc879945` | [#89](https://github.com/chinmayj03/company-brain/pull/89) | **PR OPEN** |
+| B1.3 | ADR-0093 Entity Resolution P1 | 0093 | `feature/adr-0093-entity-resolution` | `f5c4a6473` | [#91](https://github.com/chinmayj03/company-brain/pull/91) | **PR OPEN** |
 | B1.4 | Notion Connector | — | — | — | — | Pending (blocked on B1.2) |
 
 ## Key docs (now committed to main)
@@ -35,7 +35,7 @@ All items targeting `release/v2-seed-window` → `main` at Gate 1 (week 9).
 
 ## Gate 1 quality criteria (week 9)
 - SQL coverage > 75% ✅ (A1.1 shipped)
-- P50 query latency < 3s (A1.2 in progress)
-- Citations ≥ 1 per answer (A1.4 shipped)
+- P50 query latency < 3s ✅ (A1.2 PR open, A1.3 caching PR open, A1.5 streaming running)
+- Citations ≥ 1 per answer ✅ (A1.4 shipped)
 - PII detection ≥ 90% (T1.8 PR open)
-- ≥ 1 non-code source live (B1.2/B1.4 in progress)
+- ≥ 1 non-code source live (B1.2 PR open; B1.4 pending B1.2 merge)

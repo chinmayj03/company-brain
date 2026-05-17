@@ -1,0 +1,117 @@
+# Healthcare RCM vertical binding — ADR-0079 M2
+# Maps shape slots to concrete healthcare-RCM entity seeds and domain callouts.
+# Used with network-iq-backend-java as the demo repository.
+
+vertical: healthcare-rcm
+description: Revenue Cycle Management (RCM) software — payer/provider/claim workflows
+
+pm.feature_progress:
+  feature_entity_seeds: [PriorAuth, EligibilityCheck, ClaimSubmission, PayerIntegration]
+  feature_entity_inference_hint: >
+    Anything tagged as 'feature' in PRDs or Linear, or any code module under
+    src/features/, or any noun-phrase in a Confluence page titled 'Feature: ...'
+  domain_callouts:
+    - "Payer-specific behavior matters; flag if feature has per-Payer divergence"
+    - "Surface integration test status per Payer separately"
+    - "Check if feature has HIPAA or PHI data handling implications"
+
+pm.entities_affected_by_feature:
+  feature_entity_seeds: [PriorAuth, EligibilityCheck, ClaimSubmission]
+  domain_callouts:
+    - "Payer-specific behavior matters; feature may differ per Payer"
+    - "Highlight Payer integration count and per-Payer test status"
+    - "Surface any EDI transaction sets (270/271, 837, 835) that the feature affects"
+
+pm.open_decisions_for_feature:
+  feature_entity_seeds: [PriorAuth, EligibilityCheck, ClaimSubmission]
+  domain_callouts:
+    - "Flag decisions affecting Payer compliance or clearinghouse integration"
+    - "Escalate any open decisions about PHI data handling"
+
+pm.roadmap_status:
+  domain_callouts:
+    - "Group shipped features by Payer integration impact"
+    - "Flag any features delayed due to Payer-side API changes"
+
+pm.customer_promise_lookup:
+  customer_entity_seeds: [Provider, Member, PracticeGroup]
+  domain_callouts:
+    - "Check Salesforce for payer-specific commitments"
+    - "Surface any promise about claim acceptance rate SLAs"
+
+dev.blast_radius:
+  entity_seeds: [PayerClient, EligibilityService, ClaimProcessor, PriorAuthService]
+  domain_callouts:
+    - "Pay attention to Payer-specific branches in the blast radius"
+    - "Check if the change affects EDI parsing or clearinghouse routing"
+
+dev.similar_implementations:
+  entity_seeds: [PayerClient, EligibilityService, ClaimProcessor]
+  domain_callouts:
+    - "Prior implementations often have per-Payer special cases; surface those"
+    - "Note which implementations use the EDI adapter vs direct API"
+
+dev.domain_meaning_of_entity:
+  entity_seeds:
+    - name: Payer
+      description: Insurance company that adjudicates claims (e.g., Aetna, BCBS, UHC)
+      aliases: [insurance, insurer, carrier, plan_admin, payer_id]
+    - name: Provider
+      description: Healthcare provider (doctor, hospital) submitting claims
+      aliases: [doctor, hospital, clinic, facility, billing_provider, npi]
+    - name: Plan
+      description: Insurance plan product (e.g., HMO, PPO, EPO)
+      aliases: [insurance_plan, coverage, benefit_plan]
+    - name: Claim
+      description: A request for payment for services rendered
+      aliases: [claim_number, encounter_claim, professional_claim, 837]
+    - name: Member
+      description: Insured individual enrolled in a plan
+      aliases: [patient, insured, subscriber, dependent, member_id]
+    - name: EligibilityCheck
+      description: Real-time check to verify if a member has active coverage
+      aliases: [eligibility, verification, 270, 271]
+    - name: PriorAuth
+      description: Pre-authorization required before certain procedures
+      aliases: [prior_authorization, preauth, pa, authorization, utilization_review]
+    - name: ClaimSubmission
+      description: The process of electronically submitting a claim to a payer
+      aliases: [claim_submission, 837p, 837i, professional_claim, institutional_claim]
+  domain_callouts:
+    - "Always note if the entity has payer-specific behavior"
+    - "Surface the relevant EDI transaction code if applicable"
+
+dev.why_was_this_decided:
+  domain_callouts:
+    - "Look for payer API constraints that drove the decision"
+    - "Check if HIPAA or clearinghouse requirements influenced the design"
+
+dev.who_owns_this_area:
+  domain_callouts:
+    - "Note if ownership is shared between payer-integration and core-claims teams"
+
+vp.drift_trend:
+  domain_callouts:
+    - "Per-payer deviation from standard EDI flows is a common drift source"
+    - "Flag if drift is concentrated in clearinghouse integration code"
+
+vp.debt_hotspots:
+  domain_callouts:
+    - "Payer-specific workarounds are a primary debt source in RCM codebases"
+    - "Hardcoded payer IDs or special-case branches are high-priority debt targets"
+
+vp.area_health_summary:
+  area_seeds: [payer_integration, eligibility, claims_processing, prior_auth]
+  domain_callouts:
+    - "Flag any area with payer-specific workarounds as elevated technical risk"
+    - "Include EDI parser coverage in health assessment"
+
+vp.bus_factor_per_area:
+  domain_callouts:
+    - "Prior auth and payer-specific integration are common single-person knowledge areas"
+    - "EDI parsing knowledge is often concentrated in 1-2 engineers"
+
+vp.recent_changes_to_area:
+  domain_callouts:
+    - "Surface any changes to payer integration adapters or EDI parsing"
+    - "Flag changes to clearinghouse routing logic as high-risk"

@@ -384,5 +384,11 @@ class Settings(BaseSettings):
     resolution_auto_resolve_threshold: float = 0.80
     resolution_suggest_threshold: float = 0.60
 
+    # ── ADR-0079 P1: Persona-Aware Query Template Framework ───────────────────
+    persona_templates_enabled: bool = True
+    persona_vertical: str = "healthcare-rcm"
+    persona_default: str = "dev"
+    persona_match_threshold: float = 0.5
+
 
 settings = Settings()

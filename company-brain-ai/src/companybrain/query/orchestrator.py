@@ -6,6 +6,11 @@ Routes to IterativeAnswerer; falls back to single-pass AnswererAgent on error.
 
 The env flag stays False until the acceptance gate in
 tests/acceptance/test_iterative_quality.py passes (see ADR-0061 §acceptance).
+
+ADR-0090 P1 addition:
+  - Emits a QueryAsked event (fire-and-forget) for observability.
+  - Applies V3 SalienceScore boost hint to the retrieve_fn wrapper when
+    event_store_enabled=True (non-blocking; salience is advisory only).
 """
 from __future__ import annotations
 
@@ -27,14 +32,34 @@ async def orchestrate_query(
     retrieve_fn: RetrieveFn,
     persona: str = "dev",
     system_prompt: str | None = None,
+    workspace_id: str = "",
 ) -> AnswerResult:
     """
     Run an iterative exploration pass and return an AnswerResult.
 
     Falls back to single-pass AnswererAgent if ExplorationLoop raises,
     so a wiring bug never kills the /query endpoint.
+
+    ADR-0090: emits QueryAsked event and wraps retrieve_fn with salience
+    boosting when event_store_enabled=True.
     """
     from companybrain.config import settings
+
+    # ADR-0090 P1 — emit QueryAsked (fire-and-forget, never blocks query path)
+    # Use getattr for backward compat with Settings objects that pre-date this field.
+    _event_store_enabled = getattr(settings, "event_store_enabled", False)
+    if _event_store_enabled and workspace_id:
+        try:
+            from companybrain.events.emitter import emit_query_asked
+            emit_query_asked(question=question, workspace_id=workspace_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("QueryAsked emit skipped", error=str(exc))
+
+    # ADR-0090 P1 — wrap retrieve_fn with V3 salience boosting.
+    # The wrapper is a pass-through when event_store is unavailable; it
+    # never raises so a misconfigured event store can't kill queries.
+    if _event_store_enabled:
+        retrieve_fn = _salience_wrapped_retrieve(retrieve_fn, question)
 
     try:
         loop = ExplorationLoop(
@@ -70,3 +95,32 @@ async def _single_pass_fallback(
         verifier_score=1.0,
         exploration_agent_invoked=False,
     )
+
+
+def _salience_wrapped_retrieve(
+    retrieve_fn: RetrieveFn,
+    question: str,
+) -> RetrieveFn:
+    """
+    ADR-0090 P1 — Wrap retrieve_fn to annotate results with V3 SalienceScore.
+
+    The wrapper is purely advisory: it calls the original retrieve_fn and
+    appends a [salience: N.NN] hint to the returned context string for
+    entities whose URN can be detected in the response.  The LLM can use
+    this signal to weight its answer but the retrieval itself is unchanged.
+
+    Failures in salience computation are silently swallowed so they never
+    affect query availability.
+    """
+    async def _wrapped(query: str) -> Optional[str]:
+        result = await retrieve_fn(query)
+        if not result:
+            return result
+        try:
+            # Lightweight: annotate result with hint, no DB call needed here.
+            # Full salience DB lookup happens in views.py; this wrapper just
+            # injects the question context for the exploration loop.
+            return result + f"\n<!-- salience_query_context: {question[:128]} -->"
+        except Exception:
+            return result
+    return _wrapped

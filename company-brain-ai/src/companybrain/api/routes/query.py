@@ -50,6 +50,21 @@ log = structlog.get_logger(__name__)
 BACKEND_URL  = os.environ.get("BACKEND_URL", "http://localhost:8080")
 INTERNAL_KEY = os.environ.get("AI_INTERNAL_KEY", "dev-internal-key")
 
+# ── A1.3: LRU query result cache ──────────────────────────────────────────────
+# Module-level singleton; lazily initialised on first request so config.py
+# values (including env-var overrides) are available at that point.
+# Import is deferred to avoid a circular-import at module load time.
+_query_result_cache = None
+
+
+def _get_query_cache():
+    """Return the process-level QueryResultCache singleton (lazy init)."""
+    global _query_result_cache
+    if _query_result_cache is None:
+        from companybrain.cache.query_cache import get_query_cache
+        _query_result_cache = get_query_cache()
+    return _query_result_cache
+
 # Intent → Qdrant index mapping for intent-aware retrieval (ADR-0043 WS2)
 _INTENT_TO_INDEX: dict[str, str] = {
     "call_chain":  "default",   # per-entity BM25+dense RRF; needs full graph
@@ -136,6 +151,15 @@ async def query_graph(request: QueryRequest):
         except Exception as exc:
             log.debug("[query] Ambiguity detector failed (non-fatal)",
                       error=str(exc))
+
+    # ── A1.3: LRU query result cache lookup ───────────────────────────────────
+    # Check before t0 so cache hits don't appear in latency telemetry.
+    if settings.query_cache_enabled:
+        _cached = _get_query_cache().get(request.question, str(request.workspace_id))
+        if _cached is not None:
+            log.info("[query] Cache hit — returning cached result",
+                     workspace_id=str(request.workspace_id))
+            return _cached
 
     t0 = time.monotonic()
     provider = get_provider()
@@ -327,6 +351,16 @@ async def query_graph(request: QueryRequest):
     # ADR-0049 O5a-5: expose raw markdown without double-encoding.
     if query_response.summary_md is None:
         query_response.summary_md = query_response.raw_markdown or query_response.summary
+
+    # ── A1.3: Store result in LRU cache ───────────────────────────────────────
+    # Only cache high/medium confidence results — low-confidence answers may
+    # improve on the next call once more context is indexed.
+    if settings.query_cache_enabled:
+        _conf_level = getattr(query_response.confidence, "level", "low")
+        if _conf_level in ("high", "medium"):
+            _get_query_cache().put(
+                request.question, str(request.workspace_id), query_response
+            )
 
     # ── Step 6: Persist conversation (ADR-0072 A1/A2/A5) ─────────────────────
     await _persist_conversation(

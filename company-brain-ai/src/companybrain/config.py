@@ -359,5 +359,25 @@ class Settings(BaseSettings):
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
 
+    # ── A1.3: Prompt + query cache ────────────────────────────────────────────
+    # anthropic_cache_enabled: add cache_control headers to Anthropic calls so
+    # the system prompt and large context blocks are served from Anthropic's
+    # server-side cache (~10× cheaper cache-read vs full input tokens).
+    # Override via env var: ANTHROPIC_CACHE_ENABLED=false
+    anthropic_cache_enabled: bool = True
+    # query_cache_enabled: LRU in-memory cache for complete /query responses.
+    # Identical (question, workspace_id) pairs within the TTL are served from
+    # cache without any LLM call.  Set to False to always call the LLM.
+    # Override via env var: QUERY_CACHE_ENABLED=false
+    query_cache_enabled: bool = True
+    # query_cache_ttl_seconds: how long a cached query result is considered
+    # fresh.  After this window the next request re-runs the full LLM pipeline.
+    # Override via env var: QUERY_CACHE_TTL_SECONDS=300
+    query_cache_ttl_seconds: int = 300
+    # query_cache_maxsize: maximum number of (question, workspace_id) entries
+    # held in the in-process LRU cache.  Oldest entry is evicted when full.
+    # Override via env var: QUERY_CACHE_MAXSIZE=256
+    query_cache_maxsize: int = 256
+
 
 settings = Settings()

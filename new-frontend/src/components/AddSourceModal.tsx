@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { registerSource, triggerSync, getJobStatus } from '../data/brain_client';
 import { sourceKindLabel, KIND_AVAILABLE } from '../utils/sourceKind';
 

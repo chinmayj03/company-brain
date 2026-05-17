@@ -204,18 +204,29 @@ async def query_graph(request: QueryRequest):
                 max_hops=request.max_hops,
             )
 
-    # ── Step 1c: Hybrid retrieval fallback (ADR-0015) ─────────────────────────
+    # ── Step 1c: Hybrid retrieval fallback (ADR-0015 / A1.2 pipeline) ──────────
+    retrieval_score: float = 0.0
     if not assembled_context:
-        assembled_context = await _hybrid_retrieve(
+        # ADR-0015 A1.2: try the full BM25+dense+RRF+BGE pipeline first.
+        assembled_context, retrieval_score = await _hybrid_retrieve_v2(
             request.question,
-            request.workspace_id,
+            str(request.workspace_id),
             getattr(request, "repo_path", None),
             index=qdrant_index,
             include_unverified=getattr(request, "include_unverified", False),
         )
+        if not assembled_context:
+            # Fall back to legacy path when v2 pipeline is unavailable.
+            assembled_context = await _hybrid_retrieve(
+                request.question,
+                request.workspace_id,
+                getattr(request, "repo_path", None),
+                index=qdrant_index,
+                include_unverified=getattr(request, "include_unverified", False),
+            )
         if assembled_context:
             log.info("[query] Using hybrid retrieval context (SmartZone + Java unavailable)",
-                     intent=intent, index=qdrant_index)
+                     intent=intent, index=qdrant_index, retrieval_score=round(retrieval_score, 4))
 
     # ── Step 2: Build per-intent user message (ADR-0043 WS2) ─────────────────
     try:
@@ -271,6 +282,13 @@ async def query_graph(request: QueryRequest):
         _iter_telemetry = {}
 
     llm_dur = int((time.monotonic() - t1) * 1000)
+
+    # ── Step 3b: propagate retrieval_score into telemetry (ADR-0015 A1.2) ────
+    # Downstream systems (dashboards, evaluation harness) can read this from
+    # the telemetry dict without needing to re-run retrieval.
+    if retrieval_score > 0.0:
+        query_response.telemetry = dict(query_response.telemetry or {})
+        query_response.telemetry["retrieval_score"] = round(retrieval_score, 4)
 
     # ── Step 4: (response already typed) ─────────────────────────────────────
 
@@ -1083,6 +1101,84 @@ async def _persist_conversation(
 
     except Exception as exc:
         log.debug("[query] Conversation persistence skipped (non-fatal)", error=str(exc))
+
+
+# ── ADR-0015 A1.2: RetrievalPipeline wrapper ─────────────────────────────────
+
+async def _hybrid_retrieve_v2(
+    question: str,
+    workspace_id: str,
+    repo_path: str | None = None,
+    index: str = "default",
+    include_unverified: bool = False,
+    top_k: int = 10,
+) -> tuple[str | None, float]:
+    """Retrieve entities via RetrievalPipeline (BM25+dense+RRF+BGE reranker).
+
+    Extends ``_hybrid_retrieve()`` with full A1.2 pipeline support and returns
+    a ``(context_str, top_score)`` tuple so callers can propagate the retrieval
+    score into confidence aggregation.
+
+    The ``top_score`` can be used by the confidence aggregator to determine
+    whether the retrieval was strong enough to boost confidence from "low" to
+    "medium" without needing an extra LLM call.
+
+    Returns (None, 0.0) on any failure — callers fall through to the existing
+    non-v2 hybrid path automatically.
+    """
+    try:
+        from companybrain.retrieval.factory import make_retrieval_pipeline
+        from companybrain.store.identity import workspace_slug_for
+        from companybrain.config import settings as _s
+
+        effective_root = repo_path or os.environ.get("BRAIN_ROOT", "")
+        if not effective_root:
+            return None, 0.0
+
+        workspace_slug = workspace_slug_for(workspace_id)
+        pipeline = make_retrieval_pipeline(
+            _s,
+            brain_root=Path(effective_root),
+            workspace_slug=workspace_slug,
+        )
+
+        result = await pipeline.retrieve(
+            question,
+            workspace_id=workspace_slug,
+            top_k=top_k,
+            index=index,
+        )
+
+        if not result.hits:
+            return None, 0.0
+
+        filtered = _filter_verified(result.hits, include_unverified=include_unverified)
+        if not filtered:
+            return None, 0.0
+
+        lines = ["## Hybrid Retrieval Results\n"]
+        for hit in filtered:
+            payload = hit.payload
+            name = payload.get("qualified_name") or hit.urn.split(":")[-1]
+            summary = payload.get("t1_summary", "")
+            lines.append(
+                f"- **{name}** ({payload.get('entity_type', '')}): {summary}"
+            )
+
+        log.info(
+            "[query] hybrid_retrieve_v2 OK",
+            hits=len(filtered),
+            reranked=result.reranked,
+            top_score=round(result.top_score, 4),
+            reranker_model=result.reranker_model,
+            index=index,
+        )
+
+        return "\n".join(lines), result.top_score
+
+    except Exception as exc:
+        log.debug("[query] hybrid_retrieve_v2 failed (non-fatal)", error=str(exc))
+        return None, 0.0
 
 
 def _load_brain_subdir(brain_root: Path, subdir: str, *, limit: int) -> list[dict]:

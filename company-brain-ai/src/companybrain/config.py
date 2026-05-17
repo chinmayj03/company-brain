@@ -135,6 +135,10 @@ class Settings(BaseSettings):
     rerank_top_k:      int  = 10                    # final reranked results
     hybrid_search_enabled: bool = True             # feature flag
 
+    # ── ADR-0015 A1.2: Retrieval pipeline tunables ───────────────────────────
+    retrieval_rerank_enabled: bool = True           # master toggle for BGE reranking
+    retrieval_rerank_top_candidates: int = 50       # RRF candidates fed into reranker
+
     # ── Observability ──────────────────────────────────────────────────────
     langfuse_public_key:  str  = ""                # LANGFUSE_PUBLIC_KEY env var
     langfuse_secret_key:  str  = ""                # LANGFUSE_SECRET_KEY env var

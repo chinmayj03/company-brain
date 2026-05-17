@@ -100,7 +100,7 @@ async def register_source(workspace_id: UUID, body: RegisterSourceRequest) -> Re
         INSERT INTO workspace_sources
           (id, workspace_id, kind, display_name, url, sync_status, config)
         VALUES
-          (:id, :workspace_id, :kind, :display_name, :url, 'pending', :config::jsonb)
+          (:id, :workspace_id, :kind, :display_name, :url, 'pending', CAST(:config AS jsonb))
         RETURNING id, workspace_id, kind, display_name, url, last_synced_at,
                   sync_status, error_message, meta,
                   COALESCE(config, '{}') AS config,

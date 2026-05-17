@@ -1,4 +1,4 @@
-from companybrain.store.base import BrainStore, BrainEntity, BrainEvent
+from companybrain.store.base import BrainStore, BrainEntity, StoreEvent, BrainEvent  # BrainEvent is compat alias
 from companybrain.store.json_store import JsonFileBrainStore
 from companybrain.store.fanout import FanoutBrainStore
 
@@ -25,7 +25,7 @@ except ImportError:
 
 
 __all__ = [
-    "BrainStore", "BrainEntity", "BrainEvent",
+    "BrainStore", "BrainEntity", "StoreEvent", "BrainEvent",
     "JsonFileBrainStore", "PostgresBrainStore", "Neo4jBrainStore",
     "FanoutBrainStore",
 ]

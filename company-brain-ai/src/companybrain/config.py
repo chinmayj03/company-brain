@@ -359,5 +359,12 @@ class Settings(BaseSettings):
     # Below this triggers a revision pass; still below → surface issues.
     iterative_verifier_score_threshold: float = 0.6
 
+    # ── ADR-0064: Privacy + Audit layer ──────────────────────────────────────
+    privacy_enabled: bool = True
+    privacy_llm_judge_enabled: bool = False
+    audit_log_path: str = "./audit/audit.jsonl"
+    audit_enabled: bool = True
+    audit_default_actor: str = "pipeline"
+
 
 settings = Settings()

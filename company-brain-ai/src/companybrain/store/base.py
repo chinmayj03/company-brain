@@ -30,6 +30,11 @@ class BrainEntity:
     Legacy ids of the form `{repo}::{entity_type}::{qualified_name}` are still
     accepted by the JSON store for backward compatibility but new code must
     produce canonical URNs via `companybrain.store.identity.to_urn()`.
+
+    ADR-0064 additions (optional; None/empty means not yet scanned):
+      ttl_class      — one of TTLClass values; stamped at ingest
+      pii_findings   — list of PIIFinding dicts from the privacy scanner
+      pii_scrubbed   — True once PII spans have been redacted
     """
     id: str
     entity_type: str           # component | screen | api_contract | data_model | assumption | business_context | function_node
@@ -44,6 +49,10 @@ class BrainEntity:
     version_hash: str = ""     # sha256 of the entity's structural fingerprint
     last_updated: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
     last_updated_by: str = "harness/extractor"
+    # ADR-0064: privacy fields (append-only; do not remove)
+    ttl_class: Optional[str] = None          # TTLClass value; None = not yet classified
+    pii_findings: list[dict] = field(default_factory=list)   # serialised PIIFinding dicts
+    pii_scrubbed: bool = False               # True once PII has been redacted by TTL evaluator
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -57,13 +66,22 @@ class BrainEntity:
 # ── Events ────────────────────────────────────────────────────────────────────
 
 @dataclass
-class BrainEvent:
+class StoreEvent:
+    """Internal store-layer event envelope (upsert/invalidate/delete).
+
+    Not to be confused with companybrain.events.models.BrainEvent which is the
+    ADR-0073 event-stream record for the event-sourced memory substrate.
+    """
     kind: str                  # "upsert" | "invalidate" | "delete"
     entity: Optional[BrainEntity] = None    # set for upsert
     entity_id: Optional[str] = None         # set for invalidate / delete
     run_id: str = ""
     workspace_id: str = ""
     occurred_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+
+
+# Backward-compat alias — remove after all callers are migrated.
+BrainEvent = StoreEvent
 
 
 # ── Interface ─────────────────────────────────────────────────────────────────

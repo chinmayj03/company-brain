@@ -370,5 +370,12 @@ class Settings(BaseSettings):
     event_store_enabled: bool = True
     event_freshness_seconds: int = 60
 
+    # ── ADR-0082 P1: Drift entity tunables ───────────────────────────────────
+    drift_snapshot_cron: str = "0 2 * * *"
+    drift_warning_threshold: int = 5
+    drift_critical_threshold: int = 1
+    drift_age_inflection_days: float = 90.0
+    drift_default_waive_days: int = 90
+
 
 settings = Settings()

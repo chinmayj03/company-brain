@@ -135,14 +135,18 @@ export function queryBrainStream(
   const ctrl = new AbortController();
   let full = '';
 
-  const params = new URLSearchParams({
-    question: req.question,
+  const body = JSON.stringify({
     workspace_id: req.workspace_id ?? DEV_WORKSPACE,
-    ...(req.as_of_date ? { as_of_date: req.as_of_date } : {}),
-    ...(req.repo_path  ? { repo_path:  req.repo_path  } : {}),
+    max_hops: 3,
+    ...req,
   });
 
-  fetch(`/ai/query/stream?${params}`, { signal: ctrl.signal })
+  fetch('/ai/query/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    signal: ctrl.signal,
+  })
     .then(async (res) => {
       if (!res.ok || !res.body) throw new Error(`${res.status} /ai/query/stream`);
       const reader = res.body.getReader();

@@ -25,11 +25,30 @@ from companybrain.db import init_db_pool, close_db_pool
 log = structlog.get_logger(__name__)
 
 
+async def _ensure_dev_workspace() -> None:
+    """Upsert the well-known dev workspace row so conversations FK is satisfied."""
+    from companybrain.db import get_session
+    from sqlalchemy import text
+    dev_id = "00000000-0000-0000-0000-000000000001"
+    try:
+        async with get_session() as session:
+            await session.execute(text("""
+                INSERT INTO workspaces (id, name, slug)
+                VALUES (:id, 'Development', 'dev')
+                ON CONFLICT (id) DO NOTHING
+            """), {"id": dev_id})
+            await session.commit()
+        log.info("Dev workspace ensured", workspace_id=dev_id)
+    except Exception as exc:
+        log.warning("Could not upsert dev workspace (non-fatal)", error=str(exc))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
     log.info("Starting Company Brain AI service", version="0.1.0")
     await init_db_pool()
+    await _ensure_dev_workspace()
     yield
     await close_db_pool()
     log.info("Company Brain AI service stopped")

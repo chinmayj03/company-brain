@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import Sidebar from '../components/Sidebar';
 import TopBar from '../components/TopBar';
 import { getSources, triggerSync, type WorkspaceSource } from '../data/brain_client';
+import { useWorkspaceStore } from '../store/workspace_store';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -57,7 +58,7 @@ function KindBadge({ kind }: { kind: string }) {
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function Sources() {
-  const workspaceId = (window as unknown as { __WORKSPACE_ID__?: string }).__WORKSPACE_ID__ ?? 'default';
+  const workspaceId = useWorkspaceStore((s) => s.workspaceId);
 
   const [sources, setSources]   = useState<WorkspaceSource[]>([]);
   const [loading, setLoading]   = useState(true);

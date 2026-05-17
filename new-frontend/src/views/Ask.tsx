@@ -348,19 +348,16 @@ export default function Ask() {
                             <div className="cell">
                               <span className="k">Directories</span>
                               <span className="v"><span>{answer.verdictStats.dirs}</span></span>
-                              <span className="sub">src · docs · tests</span>
                             </div>
                             <div className="cell">
                               <span className="k">Teams</span>
                               <span className="v"><span>{answer.verdictStats.teams}</span></span>
-                              <span className="sub">Payments · API · Webhooks</span>
                             </div>
                             <div className="cell">
                               <span className="k">Rollout risk</span>
                               <span className={`v risk-${answer.verdictStats.risk.toLowerCase()}`}>
                                 <span>{answer.verdictStats.risk}</span>
                               </span>
-                              <span className="sub">breaking SDK change</span>
                             </div>
                           </div>
                         )}

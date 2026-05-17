@@ -1053,7 +1053,6 @@ async def _persist_conversation(
         answer_md = getattr(query_response, "raw_markdown", None) or getattr(
             query_response, "summary_md", None
         )
-        # Serialize QueryResponse to a plain dict for the JSONB column.
         try:
             summary_json = query_response.model_dump()
         except AttributeError:
@@ -1062,15 +1061,14 @@ async def _persist_conversation(
         import json as _json
         summary_json_str = _json.dumps(summary_json)
 
-        sql = _text("""
-            INSERT INTO conversations
-                (workspace_id, question, answer_md, summary_json, title, actor_id, actor_kind)
-            VALUES
-                (:workspace_id, :question, :answer_md, :summary_json::jsonb,
-                 :title, :actor_id, :actor_kind)
-        """)
         async with get_session() as session:
-            await session.execute(sql, {
+            await session.execute(_text("""
+                INSERT INTO conversations
+                    (workspace_id, question, answer_md, summary_json, title, actor_id, actor_kind)
+                VALUES
+                    (:workspace_id, :question, :answer_md, :summary_json::jsonb,
+                     :title, :actor_id, :actor_kind)
+            """), {
                 "workspace_id": workspace_id,
                 "question":     question,
                 "answer_md":    answer_md,

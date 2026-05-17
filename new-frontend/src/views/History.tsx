@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import Sidebar from '../components/Sidebar';
 import TopBar from '../components/TopBar';
 import { getConversations, type ConversationSummary, type ConversationDetail } from '../data/brain_client';
+import { useWorkspaceStore } from '../store/workspace_store';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -170,7 +171,7 @@ interface HistoryViewProps {
 }
 
 export function HistoryView({ savedOnly = false, title = 'History', emptyMessage }: HistoryViewProps) {
-  const workspaceId = (window as unknown as { __WORKSPACE_ID__?: string }).__WORKSPACE_ID__ ?? 'default';
+  const workspaceId = useWorkspaceStore((s) => s.workspaceId);
 
   const [convs, setConvs]       = useState<ConversationSummary[]>([]);
   const [loading, setLoading]   = useState(true);

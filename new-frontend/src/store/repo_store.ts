@@ -17,8 +17,8 @@ export const useRepoStore = create<RepoState>((set) => ({
   setRepos: (repos) => set({
     repos,
     selectedRepo: repos[0] ?? null,
-    selectedBranch: repos[0]?.current_branch ?? 'main',
+    selectedBranch: repos[0]?.default_branch ?? 'main',
   }),
-  selectRepo: (repo) => set({ selectedRepo: repo, selectedBranch: repo.current_branch }),
+  selectRepo: (repo) => set({ selectedRepo: repo, selectedBranch: repo.default_branch }),
   selectBranch: (branch) => set({ selectedBranch: branch }),
 }));

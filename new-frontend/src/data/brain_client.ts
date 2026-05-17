@@ -306,17 +306,18 @@ export async function getMcpAgents(workspaceId: string): Promise<McpAgent[]> {
 }
 
 export async function getSources(workspaceId: string): Promise<WorkspaceSource[]> {
-  return get<WorkspaceSource[]>(`/ai/workspaces/${workspaceId}/sources`);
+  return get<WorkspaceSource[]>(`/api/v1/workspaces/${workspaceId}/sources`);
 }
 
-export async function triggerSync(workspaceId: string, sourceId: string): Promise<void> {
-  const res = await fetch(`/ai/workspaces/${workspaceId}/sources/${sourceId}/sync`, {
+export async function triggerSync(workspaceId: string, sourceId: string): Promise<{ job_id?: string }> {
+  const res = await fetch(`/api/v1/workspaces/${workspaceId}/sources/${sourceId}/sync`, {
     method: 'POST',
   });
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${res.status} POST sync: ${text}`);
   }
+  return res.json().catch(() => ({}));
 }
 
 export async function getSuggestions(workspaceId: string, repoPath?: string): Promise<Suggestion[]> {
@@ -385,10 +386,10 @@ export const registerSource = (
   workspaceId: string,
   body: RegisterSourceRequest,
 ): Promise<RegisterSourceResponse> =>
-  post<RegisterSourceResponse>(`/ai/workspaces/${workspaceId}/sources`, body);
+  post<RegisterSourceResponse>(`/api/v1/workspaces/${workspaceId}/sources`, body);
 
 export const deleteSource = (workspaceId: string, sourceId: string): Promise<void> =>
-  fetch(`/ai/workspaces/${workspaceId}/sources/${sourceId}`, { method: 'DELETE' })
+  fetch(`/api/v1/workspaces/${workspaceId}/sources/${sourceId}`, { method: 'DELETE' })
     .then((r) => { if (!r.ok && r.status !== 204) throw new Error(`${r.status}`); });
 
 export interface JobStatus {
@@ -400,7 +401,7 @@ export interface JobStatus {
 }
 
 export const getJobStatus = (jobId: string): Promise<JobStatus> =>
-  get<JobStatus>(`/ai/pipeline/jobs/${jobId}`);
+  get<JobStatus>(`/api/v1/pipeline/jobs/${jobId}`);
 
 // ─────────────────────────────────────────────────────────────────────────────
 

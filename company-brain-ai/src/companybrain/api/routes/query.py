@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -510,6 +511,36 @@ async def _run_exploration_agent(
 
 # ── LLM response parsing ──────────────────────────────────────────────────────
 
+_URN_RE = re.compile(r'urn:cb:[a-zA-Z0-9:._\-]{5,120}')
+
+
+def _citations_from_context(context: str | None, raw: str) -> list[Citation]:
+    """Extract Citation objects from the assembled context and the LLM's raw text.
+
+    When _parse_llm_response falls back to a free-form envelope it calls this to
+    recover entity references so cited_entity_urns is never silently empty.
+    """
+    if not context:
+        return []
+    seen: set[str] = set()
+    out: list[Citation] = []
+    # Mine URNs from assembled context (authoritative — these were retrieved)
+    for m in _URN_RE.finditer(context):
+        urn = m.group(0).rstrip(".,;)\"'")
+        if urn not in seen:
+            seen.add(urn)
+            name = urn.rsplit(":", 1)[-1]
+            out.append(Citation(urn=urn, name=name, why_relevant="in retrieved context", confidence=0.7))
+    # Also mine URNs the LLM cited inline in its prose response
+    for m in _URN_RE.finditer(raw):
+        urn = m.group(0).rstrip(".,;)\"'")
+        if urn not in seen:
+            seen.add(urn)
+            name = urn.rsplit(":", 1)[-1]
+            out.append(Citation(urn=urn, name=name, why_relevant="cited inline", confidence=0.9))
+    return out[:20]
+
+
 def _parse_llm_response(raw: str, context: str | None) -> QueryResponse:
     """
     Parse the LLM's JSON output into a typed QueryResponse.
@@ -531,12 +562,14 @@ def _parse_llm_response(raw: str, context: str | None) -> QueryResponse:
     except Exception as exc:
         log.warning("[query] LLM output was not valid QueryResponse JSON — wrapping",
                     error=str(exc), preview=raw[:200])
+        citations = _citations_from_context(context, raw)
         return QueryResponse(
             summary=raw,
             confidence=Confidence(
                 level="medium" if context else "low",
                 rationale="LLM returned free-form text rather than structured JSON",
             ),
+            affected_entities=citations,
         )
 
 

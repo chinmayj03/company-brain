@@ -58,6 +58,19 @@ from companybrain.graph.java_client import JavaGraphClient, ArtifactFreshnessRes
 from companybrain.models.entities import PipelineStartRequest, ExtractedEntity
 from companybrain.store.base import BrainEntity as _BrainEntity  # ADR-0017
 from companybrain.store.identity import to_urn as _to_urn, workspace_slug_for as _ws_slug_for  # ADR-0017
+
+# ADR-0064: privacy + audit — imported lazily to keep startup cost zero when disabled
+def _get_privacy_scanner():
+    """Return (scan_fn, ttl_classify_fn) or (None, None) if privacy is disabled."""
+    try:
+        from companybrain.config import settings as _cfg
+        if not _cfg.privacy_enabled:
+            return None, None
+        from companybrain.privacy.pii_detector import scan as _scan
+        from companybrain.privacy.ttl_classifier import ttl_classify as _classify
+        return _scan, _classify
+    except Exception:
+        return None, None
 from companybrain.pipeline.concurrency import (
     get_extraction_concurrency,
     get_extraction_semaphore,
@@ -2383,6 +2396,31 @@ def _to_brain_entity(
         if r.from_entity == ee.external_id or r.from_entity == entity_id
     ]
 
+    # ADR-0064: PII scan + TTL classification at ingest
+    # Runs synchronously on the chunk text before persistence. < 50ms P50.
+    _pii_findings_list: list = []
+    _ttl_class: str | None = None
+    try:
+        _scan_fn, _classify_fn = _get_privacy_scanner()
+        if _scan_fn is not None and _classify_fn is not None:
+            # Build chunk text from available fields
+            _chunk_text = " ".join(filter(None, [
+                ee.query_text or "",
+                ee.code_snippet or "",
+                t1_summary or "",
+            ]))
+            if _chunk_text.strip():
+                _findings = _scan_fn(_chunk_text)
+                _pii_findings_list = [f.to_dict() for f in _findings]
+                _source_type = (
+                    "test" if (ee.file or "").startswith("test")
+                    else "config" if (ee.entity_type or "").lower() == "configkey"
+                    else "production"
+                )
+                _ttl_class = _classify_fn(_chunk_text, _source_type, _findings).value
+    except Exception as _pii_err:
+        log.warning("ADR-0064: PII scan failed (non-fatal)", error=str(_pii_err))
+
     return BrainEntity(
         id=entity_id,
         entity_type=entity_type,
@@ -2395,6 +2433,10 @@ def _to_brain_entity(
         metadata=meta,
         relationships=rels,
         version_hash="",  # structural hash set by ADR-0013; empty for now
+        # ADR-0064 privacy fields
+        ttl_class=_ttl_class,
+        pii_findings=_pii_findings_list,
+        pii_scrubbed=False,
     )
 
 

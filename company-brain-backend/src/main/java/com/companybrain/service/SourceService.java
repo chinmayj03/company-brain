@@ -84,6 +84,19 @@ public class SourceService {
         return jobId;
     }
 
+    // ── Cancel ────────────────────────────────────────────────────────────────
+
+    @Transactional
+    public void cancelSync(UUID workspaceId, UUID sourceId) {
+        WorkspaceSource source = sourceRepository.findByIdAndWorkspaceId(sourceId, workspaceId)
+                .orElseThrow(() -> new NoSuchElementException("Source not found: " + sourceId));
+        if (!"syncing".equals(source.getSyncStatus())) {
+            return; // nothing to cancel
+        }
+        sourceRepository.updateSyncStatus(sourceId, "error", "Sync cancelled");
+        log.info("[sources] Sync cancelled  source={}  workspace={}", sourceId, workspaceId);
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     private UUID dispatchIndexJob(WorkspaceSource source, UUID workspaceId) {
@@ -107,6 +120,7 @@ public class SourceService {
         sourceRepository.updateSyncStatus(source.getId(), "syncing", null);
 
         PipelineJob job = pipelineService.createJob(workspaceId, req);
+        sourceRepository.updateLastJobId(source.getId(), job.getId());
         pipelineService.dispatchToAi(job.getId(), workspaceId, req);
         return job.getId();
     }

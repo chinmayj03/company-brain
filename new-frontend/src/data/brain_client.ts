@@ -332,6 +332,16 @@ export async function triggerSync(workspaceId: string, sourceId: string): Promis
   return res.json().catch(() => ({}));
 }
 
+export async function cancelSync(workspaceId: string, sourceId: string): Promise<void> {
+  const res = await fetch(`/api/v1/workspaces/${workspaceId}/sources/${sourceId}/sync/cancel`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText);
+    throw new Error(`${res.status} POST cancel: ${text}`);
+  }
+}
+
 export async function getSuggestions(workspaceId: string, repoPath?: string): Promise<Suggestion[]> {
   const params = new URLSearchParams({ workspace_id: workspaceId });
   if (repoPath) params.set('repo_path', repoPath);

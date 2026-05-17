@@ -84,6 +84,20 @@ public class SourceController {
         }
     }
 
+    @PostMapping("/v1/workspaces/{workspaceId}/sources/{sourceId}/sync/cancel")
+    public ResponseEntity<Void> cancelSync(
+            @PathVariable UUID workspaceId,
+            @PathVariable UUID sourceId) {
+        assertWorkspace(workspaceId);
+        try {
+            sourceService.cancelSync(workspaceId, sourceId);
+            log.info("[sources] POST cancel  workspace={}  source={}", workspaceId, sourceId);
+            return ResponseEntity.ok().build();
+        } catch (NoSuchElementException e) {
+            return ResponseEntity.notFound().build();
+        }
+    }
+
     private void assertWorkspace(UUID pathWorkspaceId) {
         UUID tokenWorkspaceId = workspaceContext.getWorkspaceId();
         if (tokenWorkspaceId != null && !tokenWorkspaceId.equals(pathWorkspaceId)) {

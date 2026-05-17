@@ -25,4 +25,10 @@ public interface WorkspaceSourceRepository extends JpaRepository<WorkspaceSource
     @Modifying
     @Query("UPDATE WorkspaceSource s SET s.syncStatus = 'ok', s.lastSyncedAt = CURRENT_TIMESTAMP, s.entityCount = :count, s.errorMessage = null WHERE s.id = :id")
     void markSyncOk(@Param("id") UUID id, @Param("count") int entityCount);
+
+    @Modifying
+    @Query("UPDATE WorkspaceSource s SET s.lastJobId = :jobId WHERE s.id = :id")
+    void updateLastJobId(@Param("id") UUID id, @Param("jobId") UUID jobId);
+
+    Optional<WorkspaceSource> findByLastJobId(UUID lastJobId);
 }

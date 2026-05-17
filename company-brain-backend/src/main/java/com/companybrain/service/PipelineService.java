@@ -6,6 +6,7 @@ import com.companybrain.model.Artifact;
 import com.companybrain.model.PipelineJob;
 import com.companybrain.repository.NodeRepository;
 import com.companybrain.repository.PipelineJobRepository;
+import com.companybrain.repository.WorkspaceSourceRepository;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
@@ -49,11 +50,12 @@ import java.util.stream.Collectors;
 @Slf4j
 public class PipelineService {
 
-    private final PipelineJobRepository  jobRepository;
-    private final NodeRepository         nodeRepository;
-    private final ArtifactWriterService  artifactWriterService;
-    private final JdbcTemplate           jdbc;
-    private final ObjectMapper           objectMapper;
+    private final PipelineJobRepository      jobRepository;
+    private final WorkspaceSourceRepository  sourceRepository;
+    private final NodeRepository             nodeRepository;
+    private final ArtifactWriterService      artifactWriterService;
+    private final JdbcTemplate               jdbc;
+    private final ObjectMapper               objectMapper;
 
     @Value("${app.ai-service.url:http://localhost:8000}")
     private String aiServiceUrl;
@@ -726,6 +728,12 @@ public class PipelineService {
             jobRepository.markCompleted(jobId, entityCount, edgeCount, 0, null, null, "[]", "[]", "[]");
         }
 
+        // Update the linked workspace source so the DB reflects 'ok' status.
+        // Without this, sync_status stays 'syncing' after a page reload.
+        final int finalEntityCount = entityCount;
+        sourceRepository.findByLastJobId(jobId).ifPresent(source ->
+                sourceRepository.markSyncOk(source.getId(), finalEntityCount));
+
         log.info("[pipeline] ✅ Job complete  jobId={}  entities={}  edges={}  contexts={}",
                 jobId, entityCount, edgeCount, contextCount);
     }
@@ -756,6 +764,10 @@ public class PipelineService {
             log.warn("[pipeline] Failed to serialize failure logs  jobId={}  error={}", jobId, e.getMessage());
             jobRepository.markFailed(jobId, error != null ? error : "Unknown error", "[]");
         }
+        // Update the linked workspace source so a page reload shows 'error', not 'syncing'.
+        sourceRepository.findByLastJobId(jobId).ifPresent(source ->
+                sourceRepository.updateSyncStatus(source.getId(), "error", error != null ? error : "Sync failed"));
+
         log.warn("[pipeline] Job marked failed  jobId={}  workspace={}  error={}", jobId, workspaceId, error);
     }
 

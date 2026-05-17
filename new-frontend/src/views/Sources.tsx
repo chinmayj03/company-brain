@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import Sidebar from '../components/Sidebar';
 import TopBar from '../components/TopBar';
 import AddSourceModal from '../components/AddSourceModal';
-import { getSources, triggerSync, getJobStatus, type WorkspaceSource } from '../data/brain_client';
+import { getSources, triggerSync, cancelSync, getJobStatus, type WorkspaceSource } from '../data/brain_client';
 import { useWorkspaceStore } from '../store/workspace_store';
 import { sourceKindLabel } from '../utils/sourceKind';
 
@@ -72,6 +72,19 @@ export default function Sources() {
       clearInterval(pollRefs.current[sourceId]);
       delete pollRefs.current[sourceId];
     }
+  }
+
+  async function handleCancel(sourceId: string) {
+    stopPoll(sourceId);
+    setSyncing((prev) => { const n = new Set(prev); n.delete(sourceId); return n; });
+    setSyncStage((prev) => { const n = { ...prev }; delete n[sourceId]; return n; });
+    setSources((prev) => prev.map((s) =>
+      s.id === sourceId ? { ...s, sync_status: 'error', error_message: 'Sync cancelled' } : s
+    ));
+    setSyncErr((prev) => ({ ...prev, [sourceId]: 'Sync cancelled' }));
+    try {
+      await cancelSync(workspaceId, sourceId);
+    } catch { /* best-effort — local state already reset */ }
   }
 
   async function handleSync(sourceId: string) {
@@ -211,6 +224,7 @@ export default function Sources() {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {sources.map((s) => {
                   const count = entityCount(s);
+                  const isSyncing = syncing.has(s.id) || s.sync_status === 'syncing';
                   return (
                     <div key={s.id}>
                       <div style={{
@@ -264,7 +278,7 @@ export default function Sources() {
 
                         <HealthDot status={s.sync_status} />
 
-                        {(syncing.has(s.id) || s.sync_status === 'syncing') && syncStage[s.id] && (
+                        {isSyncing && syncStage[s.id] && (
                           <span style={{
                             fontSize: 11, color: 'var(--text-muted)',
                             fontFamily: 'var(--font-mono)', flexShrink: 0,
@@ -273,23 +287,35 @@ export default function Sources() {
                           </span>
                         )}
 
-                        <button
-                          onClick={() => handleSync(s.id)}
-                          disabled={syncing.has(s.id) || s.sync_status === 'syncing'}
-                          style={{
-                            height: 28, padding: '0 12px', borderRadius: 4, fontSize: 12,
-                            fontWeight: 500, flexShrink: 0,
-                            color: s.sync_status === 'error' && !syncing.has(s.id) ? 'var(--danger)' : 'var(--text-secondary)',
-                            background: 'transparent',
-                            border: `1px solid ${s.sync_status === 'error' && !syncing.has(s.id) ? 'var(--danger-border)' : 'var(--border-default)'}`,
-                            cursor: syncing.has(s.id) || s.sync_status === 'syncing' ? 'not-allowed' : 'pointer',
-                            opacity: syncing.has(s.id) || s.sync_status === 'syncing' ? 0.5 : 1,
-                          }}
-                        >
-                          {syncing.has(s.id) || s.sync_status === 'syncing'
-                            ? 'Syncing…'
-                            : s.sync_status === 'error' ? 'Retry' : 'Sync'}
-                        </button>
+                        {isSyncing ? (
+                          <button
+                            onClick={() => handleCancel(s.id)}
+                            style={{
+                              height: 28, padding: '0 12px', borderRadius: 4, fontSize: 12,
+                              fontWeight: 500, flexShrink: 0,
+                              color: 'var(--danger)',
+                              background: 'transparent',
+                              border: '1px solid var(--danger-border)',
+                              cursor: 'pointer',
+                            }}
+                          >
+                            Cancel
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => handleSync(s.id)}
+                            style={{
+                              height: 28, padding: '0 12px', borderRadius: 4, fontSize: 12,
+                              fontWeight: 500, flexShrink: 0,
+                              color: s.sync_status === 'error' ? 'var(--danger)' : 'var(--text-secondary)',
+                              background: 'transparent',
+                              border: `1px solid ${s.sync_status === 'error' ? 'var(--danger-border)' : 'var(--border-default)'}`,
+                              cursor: 'pointer',
+                            }}
+                          >
+                            {s.sync_status === 'error' ? 'Retry' : 'Resync'}
+                          </button>
+                        )}
                       </div>
 
                       {(s.sync_status === 'error' || syncErr[s.id]) && (

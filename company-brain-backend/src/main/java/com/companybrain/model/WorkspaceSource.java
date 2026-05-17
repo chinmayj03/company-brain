@@ -54,4 +54,7 @@ public class WorkspaceSource {
     @Column(name = "entity_count")
     @Builder.Default
     private int entityCount = 0;
+
+    @Column(name = "last_job_id")
+    private UUID lastJobId;
 }

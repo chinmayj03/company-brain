@@ -394,5 +394,11 @@ class Settings(BaseSettings):
     persona_default: str = "dev"
     persona_match_threshold: float = 0.5
 
+    # ── A1.3: Prompt + query cache ────────────────────────────────────────────
+    anthropic_cache_enabled: bool = True
+    query_cache_enabled: bool = True
+    query_cache_ttl_seconds: int = 300
+    query_cache_maxsize: int = 256
+
 
 settings = Settings()

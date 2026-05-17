@@ -73,6 +73,14 @@ class RiskAssessment(BaseModel):
 class Confidence(BaseModel):
     level: Literal["high", "medium", "low"]
     rationale: str
+    # ── A1.4: Verbalized Confidence additions ─────────────────────────────
+    # value: the raw weighted-average scalar (0.0–1.0) from MultiSignalAggregator.
+    # Absent on responses produced by the legacy LLM-only path (pre-A1.4).
+    value: Optional[float] = None
+    # signals: raw per-signal values for UI/debugging.
+    # Keys: retrieval_score, entity_match_count, source_diversity,
+    #       verifier_agreement, chain_length, freshness_score.
+    signals: Optional[dict] = None
 
 
 class QueryResponse(BaseModel):

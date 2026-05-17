@@ -400,5 +400,13 @@ class Settings(BaseSettings):
     query_cache_ttl_seconds: int = 300
     query_cache_maxsize: int = 256
 
+    # ── A1.4: Verbalized Confidence weights ──────────────────────────────────
+    confidence_weight_retrieval:        float = 0.30
+    confidence_weight_entity_match:     float = 0.20
+    confidence_weight_source_diversity: float = 0.15
+    confidence_weight_verifier:         float = 0.20
+    confidence_weight_chain:            float = 0.10
+    confidence_weight_freshness:        float = 0.05
+
 
 settings = Settings()
